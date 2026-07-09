@@ -1,0 +1,18 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "agentic-preset-composer",
+      "devDependencies": {
+        "lumiverse-spindle-types": "0.5.31",
+        "typescript": "^6.0.2",
+      },
+    },
+  },
+  "packages": {
+    "lumiverse-spindle-types": ["lumiverse-spindle-types@0.5.31", "", {}, "sha512-Vu4ppfIskGKiK9BGqEPaBMqqdpSFCXgWDq6cgBExWV0Edb+90rD9/5iWuZ2Zi/zoqPwZKgfr62onhmjEjR7odQ=="],
+
+    "typescript": ["typescript@6.0.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="],
+  }
+}

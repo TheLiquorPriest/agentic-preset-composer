@@ -1,0 +1,12 @@
+{
+  "version": "0.1.0",
+  "name": "Agentic Preset Composer",
+  "identifier": "agentic_preset_composer",
+  "author": "TheLiquorPriest",
+  "github": "https://github.com/TheLiquorPriest/agentic-preset-composer",
+  "homepage": "https://github.com/TheLiquorPriest/agentic-preset-composer",
+  "description": "Design/run presets as a distributed agent graph composed at generation time.",
+  "permissions": ["interceptor", "generation", "presets"],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js"
+}
