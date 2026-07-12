@@ -1,7 +1,9 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types'
 
 export function setup(_ctx: SpindleFrontendContext) {
-  /* No-op until all six prerequisite host PRs merge into staging and their
-     matching lumiverse-spindle-types patches publish — see DESIGN.md. */
+  // Staging's native tab/draft and assembly/generation primitives are reusable only after
+  // six complementary gates merge and every matching type release publishes. Deliberately
+  // perform no registration, UI mount, storage access, or APC work while those gates remain
+  // pending; local bundle preparation grants no APC runtime authority. See DESIGN.md and AUTHOR_BRIEF.md.
   return () => {}
 }
