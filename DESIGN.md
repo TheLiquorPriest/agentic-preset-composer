@@ -1,23 +1,34 @@
 # Agentic Preset Composer (APC) — Canonical Design
 
-> **Gate 0 decision recorded; local-only preparation authorized.** This is the
-> canonical APC contract, not permission to make a core change, type package,
-> branch, PR, remote, or release externally available. The full companion set
-> remains private until it is review-ready and the user directs publication.
-> Each eventual core PR receives ordinary upstream review; no preauthorization
-> or written acknowledgment matrix is required.
+> **Gate 0 decision recorded; local consolidated D–F implementation/evidence and one host PR are authorized.** This is
+> the canonical APC contract, not permission to make APC runtime behavior, publish
+> a type package, or make a remote/release externally available. PR 0 and host
+> Gates A/B are historical records; current staging retains only the surviving
+> controlled Loom foundation relevant to Gate C. The broader historical Gate C
+> hardening is not current staging capability.
+> Gates D–F are internal, separately testable slices of one APC-only host PR;
+> they must remain strictly ordered D→E→F and retain their full scope. Existing
+> aggregate types PR #32 is the cumulative D–F contract targeted at exactly
+> `0.6.5`; package publication is owned by its upstream author, not this
+> extension. The host candidate may exact-pin it only after upstream merges PR
+> #32 and the author publishes `0.6.5`; no host draft/publication is authorized
+> before that dependency and final evidence/red-team review.
 >
-> **Current basis.** The capability assessment was made against
-> `origin/staging` `737b9995f994dbc60d5e130c2314e85fca864365`, including
-> upstream commit `390be052410e57405f5ac813da02d9d019e6298e` and the later
-> relevant PR #231 changes. A bounded revalidation through current
-> `origin/staging` `5c23a259efe902f86303599585e0e46c9511d471` found changes
-> only in disk-health, Operator-panel, and install documentation/scripts; it
-> changed no Spindle, preset, Loom, generation, or types surface. The capability
-> verdict below is therefore unchanged.
+> The earlier blanket publication hold is superseded for this authorized local
+> path; it is not an active hold on local implementation/evidence. The upstream
+> publication dependency remains.
+> APC compatibility source/manifest alignment targets Lumiverse `1.0.8`; the
+> capability validator still rejects any `1.0.8` host lacking the required Gate
+> D–F capabilities. The candidate `0.6.5` types release also remains
+> unpublished, and the consolidated host PR remains blocked.
+>
+> **Current basis.** Public `origin/staging` authority is
+> `ab64f1601592ec95707ea79e68da8f537089bf3e`. It retains generic Spindle
+> foundations and the controlled Loom editor/frontend/type surface only; local
+> D–F prototypes and tests are evidence inputs, not current host capabilities.
 >
 > This document is the canonical APC product and security contract.
-> `AUTHOR_BRIEF.md` is the authoritative local core-PR review and release
+> `AUTHOR_BRIEF.md` is the authoritative consolidated host-PR review and release
 > protocol; `README.md` records the scaffold status. Neither may weaken this
 > contract, and this contract may not weaken the release protocol.
 
@@ -52,8 +63,9 @@ them rather than recreate parallel generic surfaces:
    APC shape. This is the persistence foundation for APC's portable bag.
 2. **Native preset-editor tab and draft helper.**
    `ctx.ui.registerPresetEditorTab` and
-   `ctx.ui.presetEditor.{getState,onChange,updatePreset,flush}` provide the
-   Agent Graph tab's native editor integration and draft lifecycle.
+   `ctx.ui.presetEditor.{getState,onChange,updatePreset,flush}` provide a
+   generic tab root and draft lifecycle. APC later registers and renders its
+   Agent Graph view through that root.
 3. **Native arbitrary-block assembly.**
    `spindle.assemble({ blocks, chatId, connectionId?, personaId?,
    generationType?, promptVariables?, signal? })` creates a transient Loom
@@ -77,18 +89,32 @@ These are foundations, not reduced substitutes for the canonical contract.
 `spindle.assemble` is not parent-bound APC assembly; quiet generation is not
 revision-bound tracked dispatch; the context contract is not callback-bound
 nested cancellation; and ordinary post-assembly mutation is not authenticated
-terminal placement. The six gates below add only the complementary host behavior
-that those foundations do not provide.
+terminal placement. The remaining three gates add only the complementary host
+behavior that those foundations do not provide.
+
+## Core/extension presentation boundary
+
+Across every gate, absent an APC extension registration or use of a new generic
+mount/API, steady-state baseline Lumiverse controls, layout, DOM, and baseline
+strings remain unchanged apart from generic conditional diagnostics. Any new host
+diagnostic string is added to all six Lumiverse core locales.
+Core exposes generic, inert placement, lifecycle, bridge, compatibility, locale,
+and finalization roots only; it never adds APC-specific visuals, literals, or
+catalogs. The APC frontend later registers the toolbar item and Agent Graph tab
+through the generic host roots, then renders the **Single | Sequential |
+Parallel** radiogroup, Agent Graph content, labels, disabled reasons, and
+accessibility behavior there. No APC-specific locale catalog belongs in core.
 
 ## Execution modes
 
-The `presets`-gated toolbar renders **Single | Sequential | Parallel** above
-LoomBuilder's list/edit branch as an accessible radiogroup. A preset declares
-unique `supportedModes`; `single` is mandatory.
+The APC frontend registers a mode-toolbar item through the generic host toolbar
+root and renders **Single | Sequential | Parallel** above LoomBuilder's list/edit
+branch as an accessible radiogroup. A preset declares unique `supportedModes`;
+`single` is mandatory.
 
 - **Single** — today's behavior. APC is bypassed; native assembly and provider
-  dispatch proceed unchanged. Selecting Single activates the built-in
-  **Blocks** tab.
+  dispatch proceed unchanged. Selecting Single asks the generic host API to
+  activate the built-in preset editor (`blocks` API ID; current visible label **Preset**).
 - **Sequential** — runs one thread per ordered stage. Every call uses the
   authoritative Main connection. Each stage feeds the next in configured order.
 - **Parallel** — runs ordered stages whose distinct threads may overlap within a
@@ -97,12 +123,13 @@ unique `supportedModes`; `single` is mandatory.
   `allSettled`, and output order remains configured order rather than completion
   order.
 
-All three choices remain visible. Unsupported, invalid, unresolved, or
-permission-blocked choices are disabled with associated reasons. A valid
-non-Single selection activates APC's registered **Agent Graph** tab. Mode
-activation is a namespace-scoped draft update followed by the shared save
-coordinator's generation flush; a failed flush restores the last persisted mode
-and announces the failure without touching either pipeline.
+APC keeps all three choices visible. Unsupported, invalid, unresolved, or
+permission-blocked choices are disabled by the APC frontend with APC-rendered
+reasons. A valid non-Single selection asks the generic host tab root to mount
+APC's registered **Agent Graph** view, whose content and accessibility behavior
+remain APC-owned. Mode activation is a namespace-scoped draft update followed by
+the shared save coordinator's generation flush; a failed flush restores the last
+persisted mode and announces the failure without touching either pipeline.
 
 ## Portable graph data
 
@@ -172,7 +199,7 @@ Privacy requires an opaque effective dispatch revision:
 `base64url(SHA-256(...))` over every mutable database input to the call:
 connection base token, dispatch-affecting columns, the distinct
 missing/present encrypted-secret tuple, preset parameters, and reasoning
-settings. The PR 4 assembly and tracked-dispatch paths check it atomically.
+settings. The Gate D assembly and tracked-dispatch paths check it atomically.
 List-then-call fingerprints and roulette parents cannot authorize a destination:
 every run requires a concrete, nonnull dispatch revision or fails before assembly
 or provider work.
@@ -193,12 +220,11 @@ The backend is the sole local-state writer. Binding and consent intents serializ
 under `(authoritativeCallbackUserId, presetId)` queues, read-latest/derive/
 temp-and-move, and a volatile monotonic `mutationEpoch` aborts only matching
 executions. The frontend sends neither a user ID nor whole documents.
-
 ## Invocation, cancellation, and non-commit invariants
 
 An interceptor request crosses `postMessage`; cancellation is therefore an
 explicit **`intercept_abort` protocol**, never a serialized host
-`AbortSignal`. PR 5 binds each authoritative callback to a host-created
+`AbortSignal`. Gate E binds each authoritative callback to a host-created
 invocation identity and worker-local signal. Each run composes
 `AbortSignal.any([interceptorSignal, graphSignal, runDeadline])` for cloning,
 assembly, and tracked quiet dispatch.
@@ -274,7 +300,7 @@ assembly/dispatch, APC-bound calls, retries, continuations, and later inline
 rounds use those snapshots. Earlier Sidecar calls receive no retroactive APC
 attestation, receipt, or rollback promise.
 
-Later provider routes remain subject to APC's terminal validation. PR 5 must
+Later provider routes remain subject to APC's terminal validation. Gate E must
 enumerate and protect the initial Main dispatch, retries, continuations, inline
 Council/tool rounds, and any other provider path: each must revalidate the
 host-owned guidance carrier, provenance, budget, Breakdown, dispatch revision,
@@ -306,62 +332,71 @@ Graph-fallback. An optional typed failure follows the run's omit/skip policy and
 continues. Final settlement rechecks host signal, live permissions/revisions,
 receipt containment, and selected-final state.
 
-## Prerequisite host capabilities — six ordered core PRs
+## Prerequisite host capabilities — surviving foundations and three ordered D–F gates
 
-APC remains design-only until six **independently testable, serial-unstacked**
-host capability gates land. They are first prepared as a private local review
-bundle, with the separate lock-alignment baseline change before the six gates.
-That local sequence may exercise combined behavior, but it is never an external
-stack of PRs. Upstream's foundations reduce the work inside these gates; they do
-not collapse, reorder, or replace any gate. PRs 2–6 publish the matching additive
-`lumiverse-spindle-types` release required by their public surface only when the
-user later authorizes the external review sequence.
+The surviving A/B/C foundations remain independently testable and available in
+staging; the three remaining capabilities retain strict internal dependency
+order D→E→F. Current staging retains only the surviving controlled Loom
+editor/frontend/type foundation relevant to Gate C; the broader historical
+hardening is not current capability. APC remains runtime-inert until the single
+APC-only host PR carrying Gates D, E, and F lands in staging with the exact
+author-published aggregate types contract. The local D→E→F slices preserve
+full scope and separate evidence; consolidating them into one external host PR
+is administrative, not a collapse or reorder. Existing types PR #32 is that
+aggregate D–F contract and must be exactly `0.6.5`. Its upstream author owns
+merge and package publication; this project cannot publish it. The host
+candidate exact-pins only that author-published artifact after final evidence
+and red-team review pass.
 
-### PR 1 — passthrough integrity and LumiHub
+### PR 1 — passthrough integrity and LumiHub (complete in staging; Gate A)
 
 **Branch:** `feat/preset-extension-metadata`  
 **Depends on:** nothing
 
-Reuse `LoomPreset.passthroughMetadata`; do not invent a second metadata
-container. Verify lossless preservation of every passthrough sibling through
-normal Loom persistence, duplication, and internal import/export, and make
+The merged Gate A preserves `LoomPreset.passthroughMetadata` losslessly through
+normal Loom persistence, duplication, and internal import/export, and makes
 LumiHub create/update preserve those fields rather than rebuilding fixed
-metadata. Validate the clean top-level APC shape. This gate is generic
-passthrough integrity and LumiHub only.
+metadata. It validates the clean top-level APC shape. This gate is generic
+passthrough integrity and LumiHub only; no second metadata container is added.
 
-### PR 2 — preset-editor integration and safe persistence
+### PR 2 — preset-editor integration and safe persistence (complete in staging; Gate B host capability)
 
 **Branch:** `feat/spindle-preset-editor-surface`  
 **Depends on:** PR 1
 
-Reuse the native preset-editor tab and draft helper. Add only the canonical
-complement:
+Reuse the native preset-editor tab and draft helper. The merged Gate B host
+capability is complete as a generic, inert surface. Core owns only:
 
-- the persistent **Single | Sequential | Parallel** toolbar;
-- built-in **Blocks**-tab activation for Single;
-- an APC-namespace-scoped mutator and cloned read-only Main fields;
+- generic toolbar placement and a registration root, with no APC-specific item
+  or default mode UI;
+- generic preset-editor tab/helper lifecycle and mount roots;
+- activation of the host's built-in preset editor through the generic `blocks` API ID;
+- namespace-scoped extension mutation and cloned read-only Main fields;
 - synchronous permission-revocation teardown of mounted tabs and draft
   subscriptions;
 - one module-global, per-preset save coordinator shared by every preset writer;
-- a generation-flush barrier that prevents dispatch against an unpersisted graph
-  revision.
+- serialization and a generation-flush barrier that prevents dispatch against an
+  unpersisted graph revision.
 
-### PR 3 — shared controlled native Loom editor
+APC later registers its toolbar item through the generic toolbar root and renders
+the **Single | Sequential | Parallel** radiogroup and **Agent Graph** view
+through the generic roots. APC owns those controls' labels, disabled reasons,
+accessibility behavior, and all APC-specific view content; core does not ship or
+render them.
 
-**Branch:** `feat/spindle-loom-block-editor`  
-**Depends on:** PR 2
+### Gate C — surviving controlled native Loom editor foundation
 
-Extract one controlled native Loom block editor that Main itself uses and that an
-extension can mount for a thread workspace. The bridge operates on cloned values
-and seals host-only fields; it must not expose active
-chat/character/persona/connection/preset state or turn extension-controlled
-values into host authority. APC uses this shared editor for native-block threads,
-not a parallel hand-written editor.
+The controlled native Loom block editor and its generic frontend bridge/placement
+surface survive in current staging as an extension-requested, visually inert
+foundation. Default output remains visually identical to Lumiverse's existing
+editor; the bridge operates on cloned controlled values and seals host-only
+fields. APC-specific thread UI and runtime mounting remain future work after the
+implementation halt lifts. Core adds no APC-specific editor markup.
 
-### PR 4 — host-internal parent-bound assembly and dispatch substrate
+### Gate D — host-internal parent-bound assembly and dispatch substrate
 
-**Branch:** `feat/spindle-generate-assemble`  
-**Depends on:** PR 3
+**Internal slice:** `feat/spindle-generate-assemble`  
+**Depends on:** Gate C foundation
 
 Reuse `spindle.assemble` and quiet-generation internals to build an independently
 testable **host-internal** substrate:
@@ -376,18 +411,18 @@ testable **host-internal** substrate:
 - typed tracked dispatch outcomes, immutable source revisions, and trustworthy
   receipts.
 
-PR 4 defines and tests the substrate, including the no-fresh-retrieval
+Gate D defines and tests the substrate, including the no-fresh-retrieval
 invariant. It does **not** bind ordinary interceptor callbacks, issue APC
 callback tokens, register APC runtime behavior, or claim that callback lifecycle
-is solved. It is the prerequisite internal substrate for PR 5, not an
-extension-only APC engine.
+is solved. It is the prerequisite internal substrate for Gate E within the
+consolidated host PR, not an extension-only APC engine.
 
-### PR 5 — authoritative callback lifecycle and terminal placement
+### Gate E — authoritative callback lifecycle and terminal placement
 
-**Branch:** `feat/spindle-interceptor-context`  
-**Depends on:** PR 4
+**Internal slice:** `feat/spindle-interceptor-context`  
+**Depends on:** Gate D
 
-For every authoritative callback, the host creates the PR 4
+For every authoritative callback, the host creates the Gate D
 `WorkerInvocationBinding` and host-only `TerminalFinalizationLease`, installs the
 worker binding, and exposes only the bound effective context, work deadline, and
 worker-local signal. User/chat/generation scope derives exclusively from that
@@ -397,97 +432,102 @@ an idempotent registration disposer owns teardown.
 Handler settlement ends worker RPC authority. Accepted directive/final
 provenance moves to the host-only terminal lease, which survives only until
 parent completion, cancellation, permission loss, unload, disable/update, or a
-confirmed containment fatal. Using PR 4's snapshots, tracked outcome, parent
-attestation, and containment channel, PR 5 implements deferred host-owned
+confirmed containment fatal. Using Gate D's snapshots, tracked outcome, parent
+attestation, and containment channel, Gate E implements deferred host-owned
 guidance placement.
 Immediately before every provider dispatch it mints and consumes a fresh purpose/request-
 bound terminal child, authenticates or restores the prefill carrier,
 rebuilds/reclips budget and Breakdown, and revalidates terminal provenance.
 Existing post-assembly message, parameter, and Breakdown mutation remains the
-foundation; PR 5 adds terminal enforcement rather than recreating that surface.
+foundation; Gate E adds terminal enforcement rather than recreating that surface.
 
-### PR 6 — thread-final finalization, compatibility, and locale
+### Gate F — thread-final finalization, compatibility, and locale
 
-**Branch:** `feat/spindle-interceptor-final-response`  
-**Depends on:** PR 5
+**Internal slice:** `feat/spindle-interceptor-final-response`  
+**Depends on:** Gate E
 
 Add privileged, provenance-validated thread-final finalization so a graph may
 route its final response through Main or a designated thread. Define one
 immutable shared backend/frontend host descriptor and enforce generic manifest
 minimum/capability requirements before incompatible extension source loads.
-After a compatible APC source load, the only pre-readiness operations are
-immutable synchronous descriptor reads and one bounded nonce/digest
-backend/frontend handshake; they perform no storage or domain work and remove
-their listeners on mismatch or timeout. Mount, storage, registration, preset,
-interceptor, generation, and other domain calls remain blocked until readiness.
-Add a host locale getter/change subscription plus complete live-switching
-catalogs for `en`, `zh`, `zh-TW`, `ja`, `fr`, and `it`.
-
-The six PRs may be administratively renamed or reshaped only if their ordering,
-scope, and independently testable capability gates remain equivalent. Replacing
-them with reduced workstreams is a Gate 0 product-contract change.
+After the host's generic pre-bundle nonce/digest handshake, the only
+pre-readiness extension operation is an immutable synchronous descriptor read.
+The extension installs no transport hello, listener, or digest exchange.
+Mount, storage, registration, preset, interceptor, generation, and other domain
+calls remain blocked until readiness.
+Expose a host locale getter/change subscription so extensions can live-switch
+their own catalogs. APC ships and renders its own complete catalogs for `en`,
+`zh`, `zh-TW`, `ja`, `fr`, and `it` through its registered views. Core may show
+only generic conditional permission/compatibility/error diagnostics when
+applicable; any new host diagnostic string is added to all six Lumiverse core
+locales. No APC-specific labels, views, literals, or catalogs belong in core.
+The three internal D–F capabilities may be administratively grouped into the
+one APC-only host PR only if their ordering, full scope, and independently
+testable evidence remain equivalent. The consolidated host PR must retain strict
+D→E→F dependency order; replacing the gates with reduced workstreams is a Gate
+0 product-contract change.
 
 ## Local bundle and later release discipline
 
-Prepare the upstream lock-alignment correction as private **PR 0**, then record
-six separately testable capability patchsets. Compose those immutable patchsets
-only in a separate disposable local integration clone. Remove every remote from
-that clone, leave its integration branch without an upstream, and install a
-clone-local `pre-push` guard that rejects every destination. The local workflow
-forbids bypassing or replacing that guard, adding a remote/push URL, or using
-`--no-verify`. The integration clone is never an external PR source. The local
-bundle must contain each eventual PR's focused tests, documentation, locale
-changes, types source where applicable, and independent review record before any
-component is made externally available.
+Current staging retains the surviving controlled Loom editor/frontend/type
+foundation relevant to Gate C; no ready-PR or current-hardening claim is made.
+The authorized local bundle records D, E, and F as separately testable
+capability slices and composes them sequentially in the separately claimed
+consolidated feature worktree. That worktree follows the normal fork PR controls
+and becomes the one external host PR source only after every evidence and
+publication blocker clears. The preserved no-remote prototype clone remains a
+read-only evidence input, not an implementation base or PR source.
+Each gate includes focused tests, generic host documentation, six Lumiverse
+core locale updates only when generic host strings are added, and cumulative
+types source for PR #32. Local prototype commits and tests are evidence inputs,
+not current staging capabilities or release authority. One independent
+cross-gate red-team review runs after all D–F verification passes. APC's six
+locale catalogs remain post-host extension work.
 
-When the user authorizes publication, reconstruct and reverify the sequence as
-serial, unstacked upstream PRs: merge PR 0 first; after every predecessor
-merges, fetch current `origin/staging`, perform the bounded drift check, and
-branch the next PR fresh from that base. Never push a stacked branch, transfer
-an integration commit, or publish a type candidate before its matching external
-PR is ready. The maintainer reviews each PR through the normal upstream process.
+After D→E→F evidence and the final independent cross-gate red-team review pass,
+the one consolidated APC-only host PR carries all three internal gates in that
+order. This is one external host PR, not three D/E/F host PRs and not a scope
+reduction. Existing aggregate types PR #32 must be merged upstream and its
+author must publish exactly `0.6.5` before the host candidate exact-pins it or
+opens its draft/publication. This project cannot publish the package. The
+earlier blanket publication stop is superseded only for this authorized
+local implementation/evidence path; external publication blockers remain active.
 
-Before preparing the local PR 1 patchset, they must:
+For local D–F implementation/evidence, preserve unrelated work and use only the
+separately claimed consolidated feature worktree. Do not treat preserved
+prototype commits, tests, or historical Gate C hardening as current staging
+capability. Snapshots `45acd748` and `e4bbe6c` remain historical reference, not
+implementation bases.
 
-1. verify that local-only commit `45acd748` contains the preserved current WIP,
-   including the formerly untracked material;
-2. rename the old local branch to a clearly named archive branch, unset its
-   upstream and `pushRemote`, and verify no remote ref contains it; and only then
-3. derive the patchset from the latest `origin/staging`. Create the fresh
-   `feat/preset-extension-metadata` branch only after external publication is
-   authorized and PR 0 has merged.
-
-The earlier APC design is preserved in extension-repository commit `e4bbe6c`.
-Both commits are recovery history, not an implementation base: transplant only
-changes independently justified by the approved gate scope.
-
-There is a separate upstream baseline defect: the root and frontend manifests
-declare `lumiverse-spindle-types` `0.6.2`, while both corresponding lockfiles
-resolve `0.6.1`. Published `0.6.2` contains the upstream foundations described
-above. Prepare a discrete local **PR 0** to synchronize those locks; it must merge
-before any frozen-install/type-surface parity claim and is not folded into an APC
-capability gate.
+The published `lumiverse-spindle-types@0.6.4` remains the current staging type
+foundation. PR #32 is the unpublished cumulative D–F contract targeted at
+exactly `0.6.5`; it has no release authority until its upstream author merges
+and publishes it. No package publication occurs in this extension.
 
 ## Gate 0 decision and halt condition
 
-The user has approved this contract for local-only preparation. The upstream
-author will review each later core PR normally; no separate authorization,
-ownership matrix, or external handoff blocks private work. A review request,
-rejection, or material reshape of a later PR reopens the affected contract
-boundary before that PR proceeds.
+The user has authorized local consolidated D–F implementation/evidence and one
+APC-only host PR. The upstream author will review that single host PR normally
+after its prerequisites; no separate D/E/F host PR sequence is required. A
+review request, rejection, or material reshape reopens the affected contract
+boundary before that host PR proceeds.
 
-**No APC runtime implementation begins until all six core PRs merge into
-`staging` and every matching type release is published.** Before that point the
-extension performs no APC registration, mount, storage, or subcall work. There
-are no fallback paths: no DOM hacks, duplicated prompt assembly, event-only
-cancellation, unsafe metadata writes, or compatibility shims.
+**No APC runtime implementation begins until the consolidated APC-only host PR
+lands in `staging` and the upstream author has merged PR #32 and published
+exactly `0.6.5`, which the host contract exact-pins.** Final D–F evidence and
+the independent red-team review must pass before that exact pin or draft/public
+host publication. Before those conditions the extension performs no APC
+registration, mount, storage, or subcall work. There are no fallback paths: no
+DOM hacks, duplicated prompt assembly, event-only cancellation, unsafe
+metadata writes, or compatibility shims.
 
-After the six gates lift the implementation halt, compatibility bootstrap is the
-only exception to the pre-readiness no-work rule: immutable `spindle.host` /
-`ctx.host` descriptor reads plus one bounded nonce/digest message exchange.
-Everything else stays inert until that bootstrap succeeds.
+After those prerequisites lift the implementation halt, compatibility bootstrap
+is the only exception to the pre-readiness no-work rule: the host owns any
+generic pre-bundle nonce/digest handshake, while the extension performs only
+immutable `spindle.host` / `ctx.host` descriptor reads. Everything else stays
+inert until future APC runtime work is authorized.
 
 ## Companion documents
 
-- `AUTHOR_BRIEF.md` — local core-PR review guide for this Gate 0 contract.
+- `AUTHOR_BRIEF.md` — consolidated host-PR review guide for this Gate 0 contract.
 - `README.md` — design-only scaffold status and implementation halt.
