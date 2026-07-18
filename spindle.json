@@ -5,7 +5,7 @@
   "author": "TheLiquorPriest",
   "github": "https://github.com/TheLiquorPriest/agentic-preset-composer",
   "homepage": "https://github.com/TheLiquorPriest/agentic-preset-composer",
-  "description": "Inert design-only scaffold for a future distributed agent-graph preset composer; APC runtime remains blocked until consolidated host Gates D-F ship and exact package version 0.6.5 publishes.",
+  "description": "Inert design-only scaffold for a future distributed agent-graph preset composer; APC runtime remains blocked until required host capabilities and exact types 0.6.6 are published and available in staging.",
   "permissions": ["interceptor", "generation", "presets", "final_response"],
   "minimum_lumiverse_version": "1.0.8",
   "interceptorTimeoutMs": 300000,

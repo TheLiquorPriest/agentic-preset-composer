@@ -3,10 +3,8 @@ import type { SpindleHostDescriptorV1 } from "lumiverse-spindle-types"
 /** Stable machine-readable code for local host compatibility failures. */
 export const SPINDLE_COMPATIBILITY_ERROR_CODE = "SPINDLE_COMPATIBILITY_ERROR" as const
 
-/** Host/API boundaries required by the consolidated Gate D–F contract. */
+/** Generic required host boundaries for the Spindle host descriptor. */
 export const MIN_LUMIVERSE_VERSION = "1.0.8" as const
-export const MIN_SPINDLE_API_VERSION = "0.9.0" as const
-export const NEXT_SPINDLE_API_MAJOR_VERSION = "1.0.0" as const
 
 /**
  * APC's required generic host capabilities. This local copy is deliberately
@@ -123,24 +121,10 @@ function assertCanonicalUuid(value: unknown): asserts value is string {
   }
 }
 
-function assertSupportedVersions(
-  lumiverseVersion: string,
-  spindleApiVersion: string,
-): void {
+function assertSupportedLumiverseVersion(lumiverseVersion: string): void {
   if (compareCanonicalSemver(lumiverseVersion, MIN_LUMIVERSE_VERSION) < 0) {
     fail(
       `Lumiverse version ${lumiverseVersion} is too old; APC requires ${MIN_LUMIVERSE_VERSION} or newer`,
-    )
-  }
-
-  if (compareCanonicalSemver(spindleApiVersion, MIN_SPINDLE_API_VERSION) < 0) {
-    fail(
-      `Spindle API version ${spindleApiVersion} is below the supported range (>=${MIN_SPINDLE_API_VERSION} <${NEXT_SPINDLE_API_MAJOR_VERSION})`,
-    )
-  }
-  if (compareCanonicalSemver(spindleApiVersion, NEXT_SPINDLE_API_MAJOR_VERSION) >= 0) {
-    fail(
-      `Spindle API version ${spindleApiVersion} is outside the supported range (>=${MIN_SPINDLE_API_VERSION} <${NEXT_SPINDLE_API_MAJOR_VERSION})`,
     )
   }
 }
@@ -158,11 +142,7 @@ export function validateSpindleHostDescriptor(value: unknown): SpindleHostDescri
     value.lumiverseVersion,
     "Lumiverse version",
   ).source
-  const spindleApiVersion = parseCanonicalSemver(
-    value.spindleApiVersion,
-    "Spindle API version",
-  ).source
-  assertSupportedVersions(lumiverseVersion, spindleApiVersion)
+  assertSupportedLumiverseVersion(lumiverseVersion)
   assertCanonicalUuid(value.extensionInstallationId)
 
   if (!isRecord(value.capabilities)) {
@@ -191,7 +171,6 @@ export function validateSpindleHostDescriptor(value: unknown): SpindleHostDescri
   return Object.freeze({
     descriptorVersion: 1,
     lumiverseVersion,
-    spindleApiVersion,
     capabilities: Object.freeze(capabilities),
     extensionInstallationId: value.extensionInstallationId,
   })

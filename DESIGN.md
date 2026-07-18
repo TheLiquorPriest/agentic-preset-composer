@@ -8,24 +8,35 @@
 > hardening is not current staging capability.
 > Gates D–F are internal, separately testable slices of one APC-only host PR;
 > they must remain strictly ordered D→E→F and retain their full scope. Existing
-> aggregate types PR #32 is the cumulative D–F contract targeted at exactly
-> `0.6.5`; package publication is owned by its upstream author, not this
-> extension. The host candidate may exact-pin it only after upstream merges PR
-> #32 and the author publishes `0.6.5`; no host draft/publication is authorized
-> before that dependency and final evidence/red-team review.
+> aggregate types PR #32 is the corrected cumulative D–F contract targeted at
+> exactly `0.6.6`; upstream `lumiverse-spindle-types@0.6.5` is published, but it
+> is not this corrected contract. The `0.6.6` draft removes the invented global
+> API-version axis. Compatibility instead uses the minimum Lumiverse application
+> version (`1.0.8`), descriptor schema (`descriptorVersion: 1`), and named
+> capability versions; the descriptor fields are exactly `descriptorVersion`,
+> `lumiverseVersion`, `capabilities`, and `extensionInstallationId`. The
+> corrected `0.6.6` remains unpublished. Its upstream author owns merge and
+> package publication, not this extension. The host candidate may exact-pin it
+> only after upstream merges PR #32 and the author publishes `0.6.6`; no host
+> draft PR exists or may open before that dependency and final evidence/red-team
+> review.
 >
 > The earlier blanket publication hold is superseded for this authorized local
 > path; it is not an active hold on local implementation/evidence. The upstream
-> publication dependency remains.
+> publication dependency remains, and host/APC package pins, clean frozen
+> installation, and external publication remain blocked until `0.6.6` is merged
+> and published.
 > APC compatibility source/manifest alignment targets Lumiverse `1.0.8`; the
-> capability validator still rejects any `1.0.8` host lacking the required Gate
-> D–F capabilities. The candidate `0.6.5` types release also remains
-> unpublished, and the consolidated host PR remains blocked.
+> capability validator rejects any host lacking the six required named capability
+> versions. Both inert entrypoints validate this descriptor synchronously before
+> any extension work.
 >
 > **Current basis.** Public `origin/staging` authority is
-> `ab64f1601592ec95707ea79e68da8f537089bf3e`. It retains generic Spindle
-> foundations and the controlled Loom editor/frontend/type surface only; local
-> D–F prototypes and tests are evidence inputs, not current host capabilities.
+> `cef256f340220a41b948553120f1833f009752a9`. It includes upstream
+> `lumiverse-spindle-types@0.6.5`, the generic Spindle foundations, and the
+> controlled Loom editor/frontend surface, but not the local D–F contracts.
+> The rebased consolidated candidate `c53ee50db5366ffc5a0d65be7b92fe89b38b9e5d`
+> remains local evidence, not current staging behavior or an open host PR.
 >
 > This document is the canonical APC product and security contract.
 > `AUTHOR_BRIEF.md` is the authoritative consolidated host-PR review and release
@@ -340,13 +351,17 @@ order D→E→F. Current staging retains only the surviving controlled Loom
 editor/frontend/type foundation relevant to Gate C; the broader historical
 hardening is not current capability. APC remains runtime-inert until the single
 APC-only host PR carrying Gates D, E, and F lands in staging with the exact
-author-published aggregate types contract. The local D→E→F slices preserve
-full scope and separate evidence; consolidating them into one external host PR
-is administrative, not a collapse or reorder. Existing types PR #32 is that
-aggregate D–F contract and must be exactly `0.6.5`. Its upstream author owns
-merge and package publication; this project cannot publish it. The host
+author-published `lumiverse-spindle-types@0.6.6` contract. The local D→E→F
+slices preserve full scope and separate evidence; consolidating them into one
+external host PR is administrative, not a collapse or reorder. Upstream
+`lumiverse-spindle-types@0.6.5` is already published, but corrected draft PR
+#32 targets `0.6.6` and removes the invented global API-version axis. Its
+compatibility contract uses the minimum Lumiverse application version `1.0.8`,
+descriptor schema `descriptorVersion: 1`, and the six named capability
+versions. The corrected `0.6.6` remains unpublished; its upstream author owns
+merge and package publication, and this project cannot publish it. The host
 candidate exact-pins only that author-published artifact after final evidence
-and red-team review pass.
+and red-team review pass; no host draft PR exists yet.
 
 ### PR 1 — passthrough integrity and LumiHub (complete in staging; Gate A)
 
@@ -448,13 +463,19 @@ foundation; Gate E adds terminal enforcement rather than recreating that surface
 
 Add privileged, provenance-validated thread-final finalization so a graph may
 route its final response through Main or a designated thread. Define one
-immutable shared backend/frontend host descriptor and enforce generic manifest
-minimum/capability requirements before incompatible extension source loads.
+immutable shared backend/frontend host descriptor with exactly the fields
+`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
+`extensionInstallationId`. Both inert entrypoints synchronously validate it
+before incompatible extension source loads or any registration, mount, storage,
+generation, interceptor callback, or other domain call. Compatibility requires
+descriptor schema `descriptorVersion: 1`, minimum Lumiverse application version
+`1.0.8`, and version `1` for each named capability:
+`preset-extension-data-v1`, `preset-editor-v1`, `loom-block-editor-v1`,
+`generation-assembly-v1`, `interceptor-context-v1`, and
+`interceptor-final-response-v1`.
 After the host's generic pre-bundle nonce/digest handshake, the only
 pre-readiness extension operation is an immutable synchronous descriptor read.
 The extension installs no transport hello, listener, or digest exchange.
-Mount, storage, registration, preset, interceptor, generation, and other domain
-calls remain blocked until readiness.
 Expose a host locale getter/change subscription so extensions can live-switch
 their own catalogs. APC ships and renders its own complete catalogs for `en`,
 `zh`, `zh-TW`, `ja`, `fr`, and `it` through its registered views. Core may show
@@ -485,13 +506,13 @@ cross-gate red-team review runs after all D–F verification passes. APC's six
 locale catalogs remain post-host extension work.
 
 After D→E→F evidence and the final independent cross-gate red-team review pass,
-the one consolidated APC-only host PR carries all three internal gates in that
-order. This is one external host PR, not three D/E/F host PRs and not a scope
-reduction. Existing aggregate types PR #32 must be merged upstream and its
-author must publish exactly `0.6.5` before the host candidate exact-pins it or
-opens its draft/publication. This project cannot publish the package. The
-earlier blanket publication stop is superseded only for this authorized
-local implementation/evidence path; external publication blockers remain active.
+the one consolidated APC-only host PR may carry all three internal gates in that
+order. This is one future external host PR, not three D/E/F host PRs and not a
+scope reduction. Upstream has published `lumiverse-spindle-types@0.6.5`, but
+corrected draft PR #32 targets `0.6.6` and must be merged upstream before its
+author publishes that exact version. This project cannot publish the package;
+host/APC exact pins, a clean frozen install, and external publication remain
+blocked until then. No host draft PR exists yet.
 
 For local D–F implementation/evidence, preserve unrelated work and use only the
 separately claimed consolidated feature worktree. Do not treat preserved
@@ -499,10 +520,11 @@ prototype commits, tests, or historical Gate C hardening as current staging
 capability. Snapshots `45acd748` and `e4bbe6c` remain historical reference, not
 implementation bases.
 
-The published `lumiverse-spindle-types@0.6.4` remains the current staging type
-foundation. PR #32 is the unpublished cumulative D–F contract targeted at
-exactly `0.6.5`; it has no release authority until its upstream author merges
-and publishes it. No package publication occurs in this extension.
+The published `lumiverse-spindle-types@0.6.5` remains the current staging type
+foundation. Corrected draft PR #32 is the cumulative D–F contract targeted at
+exactly `0.6.6`; it remains unpublished and has no release authority until its
+upstream author merges and publishes it. No package publication occurs in this
+extension.
 
 ## Gate 0 decision and halt condition
 
@@ -513,19 +535,31 @@ review request, rejection, or material reshape reopens the affected contract
 boundary before that host PR proceeds.
 
 **No APC runtime implementation begins until the consolidated APC-only host PR
-lands in `staging` and the upstream author has merged PR #32 and published
-exactly `0.6.5`, which the host contract exact-pins.** Final D–F evidence and
-the independent red-team review must pass before that exact pin or draft/public
-host publication. Before those conditions the extension performs no APC
-registration, mount, storage, or subcall work. There are no fallback paths: no
-DOM hacks, duplicated prompt assembly, event-only cancellation, unsafe
-metadata writes, or compatibility shims.
+lands in `staging` and the upstream author has merged corrected PR #32 and
+published exactly `0.6.6`.** Upstream `lumiverse-spindle-types@0.6.5` is
+published, but it is not the corrected contract. Final D–F evidence and the
+independent red-team review must pass before the host/APC exact pin or any host
+draft/publication. No host draft PR exists yet; clean frozen installation and
+external publication remain blocked until `0.6.6` is published. Before those
+conditions the extension performs no registration, mount, storage, generation,
+interceptor callback, or subcall work. There are no fallback paths: no DOM
+hacks, duplicated prompt assembly, event-only cancellation, unsafe metadata
+writes, or compatibility shims.
 
 After those prerequisites lift the implementation halt, compatibility bootstrap
 is the only exception to the pre-readiness no-work rule: the host owns any
 generic pre-bundle nonce/digest handshake, while the extension performs only
 immutable `spindle.host` / `ctx.host` descriptor reads. Everything else stays
 inert until future APC runtime work is authorized.
+
+## Gate G boundary — inert APC implementation and release
+
+Gate G remains blocked until the corrected `0.6.6` contract is published,
+the exact host/APC pins and clean frozen installation are verified, the single
+consolidated host PR lands in `staging`, and the user separately authorizes
+APC runtime/release work. Until then, this independent extension remains an
+inert scaffold: no APC registration, mount, storage, generation, interceptor
+callback, subcall, or publication work may begin.
 
 ## Companion documents
 

@@ -2,8 +2,6 @@
 import { describe, expect, test } from "bun:test"
 import {
   MIN_LUMIVERSE_VERSION,
-  MIN_SPINDLE_API_VERSION,
-  NEXT_SPINDLE_API_MAJOR_VERSION,
   REQUIRED_HOST_CAPABILITIES,
   SPINDLE_COMPATIBILITY_ERROR_CODE,
   SpindleCompatibilityError,
@@ -18,7 +16,6 @@ function descriptor(overrides: DescriptorInput = {}): DescriptorInput {
   return {
     descriptorVersion: 1,
     lumiverseVersion: MIN_LUMIVERSE_VERSION,
-    spindleApiVersion: MIN_SPINDLE_API_VERSION,
     capabilities: { ...REQUIRED_HOST_CAPABILITIES },
     extensionInstallationId: INSTALLATION_ID,
     ...overrides,
@@ -40,11 +37,12 @@ describe("APC host compatibility scaffold", () => {
   test("accepts the exact descriptor and freezes the normalized result", () => {
     const result = validateSpindleHostDescriptor(descriptor())
 
-    expect(result.descriptorVersion).toBe(1)
-    expect(result.lumiverseVersion).toBe(MIN_LUMIVERSE_VERSION)
-    expect(result.spindleApiVersion).toBe(MIN_SPINDLE_API_VERSION)
-    expect(result.extensionInstallationId).toBe(INSTALLATION_ID)
-    expect(result.capabilities).toEqual(REQUIRED_HOST_CAPABILITIES)
+    expect(result).toEqual({
+      descriptorVersion: 1,
+      lumiverseVersion: MIN_LUMIVERSE_VERSION,
+      capabilities: REQUIRED_HOST_CAPABILITIES,
+      extensionInstallationId: INSTALLATION_ID,
+    })
     expect(Object.isFrozen(result)).toBe(true)
     expect(Object.isFrozen(result.capabilities)).toBe(true)
   })
@@ -120,19 +118,22 @@ describe("APC host compatibility scaffold", () => {
     )
   })
 
-  test("accepts the lower API boundary and rejects the upper boundary", () => {
-    expect(
-      validateSpindleHostDescriptor(
-        descriptor({ spindleApiVersion: MIN_SPINDLE_API_VERSION }),
-      ).spindleApiVersion,
-    ).toBe(MIN_SPINDLE_API_VERSION)
+  test("accepts the minimum and newer canonical Lumiverse versions", () => {
+    for (const lumiverseVersion of [
+      MIN_LUMIVERSE_VERSION,
+      "1.0.9",
+      "1.0.10",
+      "1.1.0",
+      "2.0.0",
+    ]) {
+      expect(
+        validateSpindleHostDescriptor(descriptor({ lumiverseVersion })).lumiverseVersion,
+      ).toBe(lumiverseVersion)
+    }
+
     expectCompatibilityError(
-      descriptor({ spindleApiVersion: NEXT_SPINDLE_API_MAJOR_VERSION }),
-      "outside the supported range",
-    )
-    expectCompatibilityError(
-      descriptor({ spindleApiVersion: "0.8.9" }),
-      "below the supported range",
+      descriptor({ lumiverseVersion: "1.0.8-rc.1" }),
+      "too old",
     )
   })
 

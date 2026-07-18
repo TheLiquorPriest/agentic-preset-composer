@@ -57,25 +57,34 @@ accessibility behavior, and its six locale catalogs. No APC-specific locale
 catalog belongs in core.
 
 No APC runtime work begins until one consolidated APC-only host PR carrying
-internal Gates D→E→F lands in `staging` and upstream has merged PR #32. Its
-author must publish exact `0.6.5` before the host candidate exact-pins it or
-opens its draft/publication. Final D–F evidence and the independent red-team
-review must pass before exact pinning or draft/public host publication. PR 0 and
-Gates A/B are historical; the controlled Loom foundation relevant to Gate C
-survives in current staging. The existing PR #32 aggregate contract is
-unpublished, and this extension cannot publish it. Committed dependency metadata
-remains pinned to published `0.5.31`; local checks against the unpublished
-`0.6.5` candidate use an uncommitted local link only. The publication hold
-remains active: update the package dependency and `bun.lock` together to exact
-`0.6.5` only after upstream publishes that version.
+internal Gates D→E→F lands in `staging`, upstream has merged corrected PR #32,
+and its author has published exact `0.6.6`. Upstream
+`lumiverse-spindle-types@0.6.5` is published, but it is not the corrected
+D–F contract. Corrected draft PR #32 targets `0.6.6`, removes the invented
+global API-version axis, and defines compatibility from the minimum Lumiverse
+application version (`1.0.8`), descriptor schema (`descriptorVersion: 1`), and
+the six named capability versions. Its descriptor fields are exactly
+`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
+`extensionInstallationId`. The corrected `0.6.6` remains unpublished, and
+this extension cannot publish it. Final D–F evidence and the independent
+red-team review must pass before exact pinning or any host draft/publication.
+No host draft PR exists yet. Committed APC dependency metadata remains pinned
+to published `0.5.31`; local checks against the unpublished `0.6.6` candidate
+use an uncommitted local link only. Do not update the package dependency or
+`bun.lock`, run a clean frozen install, or publish the host/APC artifacts until
+upstream merges and publishes `0.6.6`.
 APC compatibility source/manifest alignment targets Lumiverse `1.0.8`; the
-capability validator still rejects any `1.0.8` host lacking the required Gate
-D–F capabilities. The candidate `0.6.5` types release also remains
-unpublished, and the consolidated host PR remains blocked.
+validator rejects any host lacking the required six named capability versions.
 
-The `src/` entrypoints synchronously validate only the immutable public host
+Both `src/` entrypoints synchronously validate only the immutable public host
 descriptor (`spindle.host` or `ctx.host`) before any registration, UI mount,
-storage, network, or APC API work; valid descriptors leave the backend inert and
+storage, network, or APC API work. The descriptor contains exactly
+`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
+`extensionInstallationId`; compatibility requires `descriptorVersion: 1`,
+Lumiverse `1.0.8` or newer, and version `1` for each of
+`preset-extension-data-v1`, `preset-editor-v1`, `loom-block-editor-v1`,
+`generation-assembly-v1`, `interceptor-context-v1`, and
+`interceptor-final-response-v1`. Valid descriptors leave the backend inert and
 return a frontend cleanup no-op, while invalid descriptors throw. The manifest
 records exactly the four contract permissions; it does not claim or enable APC
 runtime behavior.
@@ -136,15 +145,14 @@ D/E/F host PRs.
    APC-specific labels, views, literals, or catalogs belong in core.
 
 These are the post-gate canonical requirements; **none of this APC behavior
-exists or runs while the consolidated host PR and the author-published,
-exact-pinned `0.6.5` types contract remain pending.** After those prerequisites
-land, the APC frontend registers the persistent toolbar item and Agent Graph
-tab through the generic roots, then renders the **Single | Sequential |
-Parallel** radiogroup and Agent Graph content. That extension-owned flow
-retains native **Blocks** activation; native-block threads must reuse the frozen
-parent retrieval snapshot with no new retrieval effects; final routing must
-remain Main-or-thread; and dispatch must remain bound to immutable source
-revisions and receipts.
+exists or runs while the consolidated host PR and the corrected, exact-pinned
+`0.6.6` types contract remain pending.** After those prerequisites land, the
+APC frontend registers the persistent toolbar item and Agent Graph tab through
+the generic roots, then renders the **Single | Sequential | Parallel** radiogroup
+and Agent Graph content. That extension-owned flow retains native **Blocks**
+activation; native-block threads must reuse the frozen parent retrieval snapshot
+with no new retrieval effects; final routing must remain Main-or-thread; and
+dispatch must remain bound to immutable source revisions and receipts.
 Callback-bound user and cancellation, fail-closed containment, and terminal
 guidance immediately before every provider call remain required.
 Council remains enabled in that future runtime. Sidecar provider/tool effects
@@ -165,14 +173,18 @@ prior plan, or unlisted local artifact may amend either document.
 ## Development
 
 This independent extension repository remains inert while the consolidated
-APC-only host PR and the author-published, exact-pinned `0.6.5` types contract
-remain pending. Committed dependency metadata remains pinned to published
-`0.5.31`; local candidate checks may use an uncommitted local link only. Local
+APC-only host PR and the corrected, exact-pinned `0.6.6` types contract remain
+pending. Committed dependency metadata remains pinned to published `0.5.31`;
+local candidate checks may use an uncommitted local `0.6.6` link only. Local
 design and no-op scaffold maintenance are permitted; do not commit that local
 link or add runtime behavior, future permissions, package versions, lockfile
 changes, or build output to this extension. Update the package dependency and
-`bun.lock` together to exact `0.6.5` only after upstream publishes it. This
+`bun.lock` together to exact `0.6.6` only after upstream publishes it; until
+then, clean frozen-install and publication readiness remain blocked. This
 project cannot publish the types package.
+Gate G—the future APC implementation/release boundary—remains blocked and
+inert: no registration, mount, storage, generation, interceptor callback, or
+other APC runtime work is permitted.
 
 The authorized D–F candidate is reconstructed in the separately claimed
 consolidated feature worktree. Preserve unrelated work and treat the stopped
