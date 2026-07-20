@@ -45,6 +45,10 @@ export type ApcCatalogKey =
   | "validation.limit"
   | "consent.title"
   | "consent.required"
+  | "consent.impactRequired"
+  | "consent.impactOptional"
+  | "consent.impactMixed"
+  | "consent.impactUnscheduled"
   | "consent.acknowledgeDisclosure"
   | "consent.disclosureSummary"
   | "consent.granted"
@@ -173,6 +177,7 @@ export type ApcCatalogKey =
   | "graph.threadDetailHint"
   | "graph.selectedRunHeading"
   | "graph.runStagePosition"
+  | "graph.runPositionBindingImpact"
   | "graph.inputCount"
   | "graph.runDetailHint"
   | "graph.selectionTitle"
@@ -229,6 +234,7 @@ export type ApcCatalogKey =
   | "action.unbindConnection"
   | "action.confirmRemove"
   | "action.cancelConfirmation"
+  | "action.backToConfiguration"
   | "action.createParallelGraph"
   | "action.createSequentialGraph"
   | "validation.timeoutRange"
@@ -459,6 +465,10 @@ export const APC_CATALOG_KEYS = [
   "validation.limit",
   "consent.title",
   "consent.required",
+  "consent.impactRequired",
+  "consent.impactOptional",
+  "consent.impactMixed",
+  "consent.impactUnscheduled",
   "consent.acknowledgeDisclosure",
   "consent.disclosureSummary",
   "consent.granted",
@@ -586,6 +596,7 @@ export const APC_CATALOG_KEYS = [
   "graph.threadDetailHint",
   "graph.selectedRunHeading",
   "graph.runStagePosition",
+  "graph.runPositionBindingImpact",
   "graph.inputCount",
   "graph.runDetailHint",
   "graph.selectionTitle",
@@ -642,6 +653,7 @@ export const APC_CATALOG_KEYS = [
   "action.unbindConnection",
   "action.confirmRemove",
   "action.cancelConfirmation",
+  "action.backToConfiguration",
   "action.createParallelGraph",
   "action.createSequentialGraph",
   "validation.timeoutRange",
@@ -869,6 +881,10 @@ const EN_CATALOG = Object.freeze({
   "validation.limit": "The configured limit was exceeded.",
   "consent.title": "Privacy consent",
   "consent.required": "Consent is required before this connection can run.",
+  "consent.impactRequired": "Without consent, {{requiredCount}} required run(s) use Main fallback.",
+  "consent.impactOptional": "Without consent, {{optionalCount}} optional run(s) follow their configured optional policy.",
+  "consent.impactMixed": "Without consent, {{requiredCount}} required run(s) use Main fallback and {{optionalCount}} optional run(s) follow their configured optional policy.",
+  "consent.impactUnscheduled": "Without consent, there is no execution impact because this thread has no scheduled runs.",
   "consent.acknowledgeDisclosure": "I have reviewed the disclosure above and approve this destination.",
   "consent.disclosureSummary": "The selected {{workspace}} content will be sent to {{destination}}.",
   "consent.granted": "Consent granted",
@@ -996,6 +1012,7 @@ const EN_CATALOG = Object.freeze({
   "graph.threadDetailHint": "Thread workspace settings open in the thread pane.",
   "graph.selectedRunHeading": "Selected run · {{thread}}",
   "graph.runStagePosition": "Run {{run}} · Stage {{stage}}",
+  "graph.runPositionBindingImpact": "Some move targets are unavailable because earlier-output bindings must preserve order.",
   "graph.inputCount": "Input bindings: {{count}}",
   "graph.runDetailHint": "Run settings and earlier-stage bindings open in the selected-run pane.",
   "graph.selectionTitle": "Selection",
@@ -1052,6 +1069,7 @@ const EN_CATALOG = Object.freeze({
   "action.unbindConnection": "Unbind connection",
   "action.confirmRemove": "Remove",
   "action.cancelConfirmation": "Cancel",
+  "action.backToConfiguration": "Back to configuration",
   "action.createParallelGraph": "Create Parallel graph",
   "action.createSequentialGraph": "Create Sequential graph",
   "validation.timeoutRange": "Timeout must be between {{min}} and {{max}} milliseconds.",
@@ -1279,6 +1297,10 @@ const ZH_CATALOG = Object.freeze({
   "validation.limit": "已超过配置上限。",
   "consent.title": "隐私同意",
   "consent.required": "运行此连接前必须同意隐私要求。",
+  "consent.impactRequired": "未获得同意时，{{requiredCount}} 个必需运行将使用主线程回退。",
+  "consent.impactOptional": "未获得同意时，{{optionalCount}} 个可选运行将遵循其配置的可选策略。",
+  "consent.impactMixed": "未获得同意时，{{requiredCount}} 个必需运行将使用主线程回退，{{optionalCount}} 个可选运行将遵循其配置的可选策略。",
+  "consent.impactUnscheduled": "未获得同意时不会影响执行，因为此线程没有已安排的运行。",
   "consent.acknowledgeDisclosure": "我已阅读上述披露内容，并同意使用此目的地。",
   "consent.disclosureSummary": "选定的{{workspace}}内容将发送至{{destination}}。",
   "consent.granted": "已同意",
@@ -1406,6 +1428,7 @@ const ZH_CATALOG = Object.freeze({
   "graph.threadDetailHint": "线程工作区设置在右侧线程窗格中打开。",
   "graph.selectedRunHeading": "已选择运行 · {{thread}}",
   "graph.runStagePosition": "运行{{run}} · 阶段{{stage}}",
+  "graph.runPositionBindingImpact": "部分移动目标不可用，因为较早输出绑定必须保持顺序。",
   "graph.inputCount": "输入绑定：{{count}}",
   "graph.runDetailHint": "运行设置和较早阶段的绑定在选定运行窗格中打开。",
   "graph.selectionTitle": "选择",
@@ -1462,6 +1485,7 @@ const ZH_CATALOG = Object.freeze({
   "action.unbindConnection": "解除连接绑定",
   "action.confirmRemove": "移除",
   "action.cancelConfirmation": "取消",
+  "action.backToConfiguration": "返回配置",
   "action.createParallelGraph": "创建并行图",
   "action.createSequentialGraph": "创建顺序图",
   "validation.timeoutRange": "超时必须介于{{min}}和{{max}}毫秒之间。",
@@ -1689,6 +1713,10 @@ const ZH_TW_CATALOG = Object.freeze({
   "validation.limit": "已超過設定上限。",
   "consent.title": "隱私同意",
   "consent.required": "執行此連線前必須同意隱私要求。",
+  "consent.impactRequired": "未取得同意時，{{requiredCount}} 個必要執行將採用主執行緒回退。",
+  "consent.impactOptional": "未取得同意時，{{optionalCount}} 個選用執行將遵循其設定的選用原則。",
+  "consent.impactMixed": "未取得同意時，{{requiredCount}} 個必要執行將採用主執行緒回退，{{optionalCount}} 個選用執行將遵循其設定的選用原則。",
+  "consent.impactUnscheduled": "未取得同意時不會影響執行，因為此執行緒沒有已排程的執行。",
   "consent.acknowledgeDisclosure": "我已閱讀上述揭露內容，並同意使用此目的地。",
   "consent.disclosureSummary": "選取的{{workspace}}內容將傳送至{{destination}}。",
   "consent.granted": "已同意",
@@ -1816,6 +1844,7 @@ const ZH_TW_CATALOG = Object.freeze({
   "graph.threadDetailHint": "執行緒工作區設定會在執行緒窗格中開啟。",
   "graph.selectedRunHeading": "已選取執行 · {{thread}}",
   "graph.runStagePosition": "執行{{run}} · 階段{{stage}}",
+  "graph.runPositionBindingImpact": "部分移動目標無法使用，因為較早輸出繫結必須維持順序。",
   "graph.inputCount": "輸入繫結：{{count}}",
   "graph.runDetailHint": "執行設定與較早階段繫結會在選取的執行窗格中開啟。",
   "graph.selectionTitle": "選取項目",
@@ -1872,6 +1901,7 @@ const ZH_TW_CATALOG = Object.freeze({
   "action.unbindConnection": "解除連線繫結",
   "action.confirmRemove": "移除",
   "action.cancelConfirmation": "取消",
+  "action.backToConfiguration": "返回設定",
   "action.createParallelGraph": "建立平行圖",
   "action.createSequentialGraph": "建立順序圖",
   "validation.timeoutRange": "逾時必須介於{{min}}與{{max}}毫秒之間。",
@@ -2099,6 +2129,10 @@ const JA_CATALOG = Object.freeze({
   "validation.limit": "設定された上限を超えています。",
   "consent.title": "プライバシー同意",
   "consent.required": "この接続を実行するには同意が必要です。",
+  "consent.impactRequired": "同意がない場合、{{requiredCount}}件の必須実行はメインへのフォールバックになります。",
+  "consent.impactOptional": "同意がない場合、{{optionalCount}}件の任意実行は設定された任意ポリシーに従います。",
+  "consent.impactMixed": "同意がない場合、{{requiredCount}}件の必須実行はメインへのフォールバックとなり、{{optionalCount}}件の任意実行は設定された任意ポリシーに従います。",
+  "consent.impactUnscheduled": "同意がない場合、このスレッドには予定された実行がないため実行への影響はありません。",
   "consent.acknowledgeDisclosure": "上記の開示内容を確認し、この送信先を承認します。",
   "consent.disclosureSummary": "選択した{{workspace}}の内容は{{destination}}に送信されます。",
   "consent.granted": "同意済み",
@@ -2226,6 +2260,7 @@ const JA_CATALOG = Object.freeze({
   "graph.threadDetailHint": "スレッドワークスペースの設定はスレッドペインで開きます。",
   "graph.selectedRunHeading": "選択した実行・{{thread}}",
   "graph.runStagePosition": "実行{{run}}・ステージ{{stage}}",
+  "graph.runPositionBindingImpact": "前段出力バインドの順序を維持するため、一部の移動先は利用できません。",
   "graph.inputCount": "入力バインド：{{count}}",
   "graph.runDetailHint": "実行設定と前段階のバインドは選択した実行ペインで開きます。",
   "graph.selectionTitle": "選択",
@@ -2282,6 +2317,7 @@ const JA_CATALOG = Object.freeze({
   "action.unbindConnection": "接続のバインドを解除",
   "action.confirmRemove": "削除",
   "action.cancelConfirmation": "キャンセル",
+  "action.backToConfiguration": "設定に戻る",
   "action.createParallelGraph": "並列グラフを作成",
   "action.createSequentialGraph": "順次グラフを作成",
   "validation.timeoutRange": "タイムアウトは{{min}}～{{max}}ミリ秒で指定してください。",
@@ -2509,6 +2545,10 @@ const FR_CATALOG = Object.freeze({
   "validation.limit": "La limite configurée a été dépassée.",
   "consent.title": "Consentement relatif à la confidentialité",
   "consent.required": "Un consentement est requis avant d’utiliser cette connexion.",
+  "consent.impactRequired": "Sans consentement, {{requiredCount}} exécution(s) obligatoire(s) utilisent le repli vers Principal.",
+  "consent.impactOptional": "Sans consentement, {{optionalCount}} exécution(s) facultative(s) suivent leur politique facultative configurée.",
+  "consent.impactMixed": "Sans consentement, {{requiredCount}} exécution(s) obligatoire(s) utilisent le repli vers Principal et {{optionalCount}} exécution(s) facultative(s) suivent leur politique facultative configurée.",
+  "consent.impactUnscheduled": "Sans consentement, l’exécution n’est pas affectée, car ce thread ne comporte aucune exécution planifiée.",
   "consent.acknowledgeDisclosure": "J’ai lu la divulgation ci-dessus et j’autorise cette destination.",
   "consent.disclosureSummary": "Le contenu de {{workspace}} sélectionné sera envoyé à {{destination}}.",
   "consent.granted": "Consentement accordé",
@@ -2636,6 +2676,7 @@ const FR_CATALOG = Object.freeze({
   "graph.threadDetailHint": "Les paramètres de l’espace de travail du thread s’ouvrent dans le volet des threads.",
   "graph.selectedRunHeading": "Exécution sélectionnée · {{thread}}",
   "graph.runStagePosition": "Exécution {{run}} · Étape {{stage}}",
+  "graph.runPositionBindingImpact": "Certaines cibles de déplacement sont indisponibles, car les liaisons de sorties précédentes doivent conserver leur ordre.",
   "graph.inputCount": "Liaisons d’entrée : {{count}}",
   "graph.runDetailHint": "Les paramètres de l’exécution et les liaisons des étapes précédentes s’ouvrent dans le volet de l’exécution sélectionnée.",
   "graph.selectionTitle": "Sélection",
@@ -2692,6 +2733,7 @@ const FR_CATALOG = Object.freeze({
   "action.unbindConnection": "Délier la connexion",
   "action.confirmRemove": "Supprimer",
   "action.cancelConfirmation": "Annuler",
+  "action.backToConfiguration": "Retour à la configuration",
   "action.createParallelGraph": "Créer un graphe parallèle",
   "action.createSequentialGraph": "Créer un graphe séquentiel",
   "validation.timeoutRange": "Le délai doit être compris entre {{min}} et {{max}} millisecondes.",
@@ -2919,6 +2961,10 @@ const IT_CATALOG = Object.freeze({
   "validation.limit": "È stato superato il limite configurato.",
   "consent.title": "Consenso per la privacy",
   "consent.required": "Il consenso è necessario prima di eseguire questa connessione.",
+  "consent.impactRequired": "Senza consenso, le esecuzioni obbligatorie ({{requiredCount}}) usano il fallback su Principale.",
+  "consent.impactOptional": "Senza consenso, le esecuzioni facoltative ({{optionalCount}}) seguono il criterio facoltativo configurato.",
+  "consent.impactMixed": "Senza consenso, le esecuzioni obbligatorie ({{requiredCount}}) usano il fallback su Principale e le esecuzioni facoltative ({{optionalCount}}) seguono il criterio facoltativo configurato.",
+  "consent.impactUnscheduled": "Senza consenso, l’esecuzione non è influenzata perché questo thread non contiene esecuzioni pianificate.",
   "consent.acknowledgeDisclosure": "Ho esaminato l’informativa sopra e approvo questa destinazione.",
   "consent.disclosureSummary": "Il contenuto di {{workspace}} selezionato sarà inviato a {{destination}}.",
   "consent.granted": "Consenso concesso",
@@ -3046,6 +3092,7 @@ const IT_CATALOG = Object.freeze({
   "graph.threadDetailHint": "Le impostazioni dell’area di lavoro thread si aprono nel pannello thread.",
   "graph.selectedRunHeading": "Esecuzione selezionata · {{thread}}",
   "graph.runStagePosition": "Esecuzione {{run}} · Fase {{stage}}",
+  "graph.runPositionBindingImpact": "Alcune destinazioni di spostamento non sono disponibili perché i collegamenti agli output precedenti devono mantenere l’ordine.",
   "graph.inputCount": "Collegamenti di input: {{count}}",
   "graph.runDetailHint": "Le impostazioni dell’esecuzione e i collegamenti delle fasi precedenti si aprono nel pannello dell’esecuzione selezionata.",
   "graph.selectionTitle": "Selezione",
@@ -3102,6 +3149,7 @@ const IT_CATALOG = Object.freeze({
   "action.unbindConnection": "Scollega connessione",
   "action.confirmRemove": "Rimuovi",
   "action.cancelConfirmation": "Annulla",
+  "action.backToConfiguration": "Torna alla configurazione",
   "action.createParallelGraph": "Crea grafo parallelo",
   "action.createSequentialGraph": "Crea grafo sequenziale",
   "validation.timeoutRange": "Il timeout deve essere compreso tra {{min}} e {{max}} millisecondi.",

@@ -618,7 +618,7 @@ async function rememberSlotDisclosure(
   const slotId = selector.connectionSourceKey.slice(5)
   let resolved: unknown
   try {
-    resolved = await resolveSlot({ userId, presetId: selector.presetId, slotId })
+    resolved = await resolveSlot.call(bindings, { userId, presetId: selector.presetId, slotId })
   } catch (error) {
     const code = error !== null && typeof error === "object" && "code" in error && typeof error.code === "string"
       ? error.code
@@ -901,7 +901,7 @@ async function normalizeBindingViews(
         : Object.freeze({ slotId: binding.slotId, bound: true, status: "bound" as const, descriptor: destination })
     }
     try {
-      const resolved = await resolveSlot({ userId, presetId, slotId: binding.slotId })
+      const resolved = await resolveSlot.call(bindings, { userId, presetId, slotId: binding.slotId })
       ensureSameIdentity(userId, resolved.userId, "resolved user")
       ensureSameIdentity(presetId, resolved.presetId, "resolved preset")
       ensureSameIdentity(binding.slotId, resolved.slotId, "resolved slot")
@@ -935,14 +935,13 @@ async function normalizeBindingViews(
   })))
 }
 
-function normalizeConsent(
+function normalizeConsentView(
   snapshot: ConsentSnapshot,
   selector: ProtocolConsentSelector,
   install: BackendInstallPair,
   status: "approved" | "revoked" | "required",
-  _connections: readonly ConnectionSummary[],
   disclosure: ConsentDisclosure | undefined,
-): BackendConsentResponse["payload"] {
+): SafeConsentView {
   validateConsentSnapshot(snapshot, install, selector.presetId)
   if (disclosure !== undefined) validateConsentDisclosure(disclosure, snapshot.userId, selector)
   ensureSameIdentity(selector.presetId, snapshot.presetId, "preset")
@@ -974,7 +973,6 @@ function normalizeConsent(
     disclosureView = disclosureProjection(selector.workspaceSource, selector.connectionSourceKey, destination, version)
   }
   return Object.freeze({
-    presetId: selector.presetId,
     threadId: selector.threadId,
     workspaceSource: selector.workspaceSource,
     connectionSourceKey: selector.connectionSourceKey,
@@ -984,11 +982,23 @@ function normalizeConsent(
   })
 }
 
+function normalizeConsent(
+  snapshot: ConsentSnapshot,
+  selector: ProtocolConsentSelector,
+  install: BackendInstallPair,
+  status: "approved" | "revoked" | "required",
+  disclosure: ConsentDisclosure | undefined,
+): BackendConsentResponse["payload"] {
+  return Object.freeze({
+    presetId: selector.presetId,
+    ...normalizeConsentView(snapshot, selector, install, status, disclosure),
+  })
+}
+
 function normalizeConsentViews(
   snapshot: ConsentSnapshot,
   presetId: string,
   install: BackendInstallPair,
-  connections: readonly ConnectionSummary[],
   resolveDisclosure: (selector: ProtocolConsentSelector) => ConsentDisclosure | undefined,
 ): readonly SafeConsentView[] {
   validateConsentSnapshot(snapshot, install, presetId)
@@ -1005,7 +1015,7 @@ function normalizeConsentViews(
       record.connectionId === disclosure.connectionId &&
       record.dispatchRevision === disclosure.descriptor.connectionDispatchRevision &&
       record.disclosureVersion === disclosure.disclosureVersion
-    return normalizeConsent(snapshot, selector, install, current ? "approved" : "required", connections, disclosure)
+    return normalizeConsentView(snapshot, selector, install, current ? "approved" : "required", disclosure)
   }))
 }
 
@@ -1109,7 +1119,6 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
             consentSnapshot,
             intent.payload.presetId,
             install,
-            connections,
             selector => deps.consent.resolveDisclosure(userId, selector),
           ),
           ...(execution === undefined ? {} : { execution }),
@@ -1183,13 +1192,11 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
           deps.onAuthorizedMutation?.(userId, intent.payload.presetId)
         }
         ensureSameIdentity(userId, snapshot.userId, "user")
-        const profiles = await deps.bindings.listConnections(userId)
         const payload = normalizeConsent(
           snapshot,
           intent.payload,
           install,
           "approved",
-          connectionSummaries(profiles),
           disclosure,
         )
         return Object.freeze({ version: 1 as const, type: "consent" as const, correlationId: intent.correlationId, sequence: sequence(), payload })
@@ -1207,13 +1214,11 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
         }
         disclosure = deps.consent.resolveDisclosure(userId, intent.payload)
         ensureSameIdentity(userId, snapshot.userId, "user")
-        const profiles = await deps.bindings.listConnections(userId)
         const payload = normalizeConsent(
           snapshot,
           intent.payload,
           install,
           "revoked",
-          connectionSummaries(profiles),
           disclosure,
         )
         return Object.freeze({ version: 1 as const, type: "consent" as const, correlationId: intent.correlationId, sequence: sequence(), payload })
@@ -1223,7 +1228,6 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
         const snapshot = await deps.consent.listConsents(userId, intent.payload.presetId)
         ensureSameIdentity(userId, snapshot.userId, "user")
         validateConsentSnapshot(snapshot, install, intent.payload.presetId)
-        const profiles = connectionSummaries(await deps.bindings.listConnections(userId))
         const disclosure = await rememberSlotDisclosure(userId, intent.payload, install, deps.bindings, deps.consent)
         if (disclosure !== undefined) validateConsentDisclosure(disclosure, userId, intent.payload)
         const approved = disclosure !== undefined && snapshot.consents.some(record =>
@@ -1239,7 +1243,6 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
           intent.payload,
           install,
           approved ? "approved" : "required",
-          profiles,
           disclosure,
         )
         return Object.freeze({ version: 1 as const, type: "consent" as const, correlationId: intent.correlationId, sequence: sequence(), payload })

@@ -123,6 +123,8 @@ export type ApcExecutionState = Readonly<{
   errorMessageKey?: string
   cancellationSource?: ActivityCancellationSource
   activity: readonly ApcExecutionActivity[]
+  topologyActivity: readonly ApcExecutionActivity[]
+  topologyApplicable: boolean
 }>
 
 export type ApcTraceEventSurface = Readonly<Pick<TraceEvent, "kind" | "sequence" | "timestamp" | "status" | "preview">>
@@ -157,6 +159,7 @@ export interface ApcFrontendSnapshot {
   readonly connectionBindings: Readonly<Record<string, ApcConnectionBinding>>
   readonly consent: Readonly<Record<string, ApcConsent>>
   readonly execution: ApcExecutionState
+  readonly executionMutationLocked: boolean
   readonly traces: ApcTraceState
   readonly busy: boolean
   readonly busyReason: ApcBusyReason | null
@@ -187,14 +190,14 @@ export interface ApcFrontendStore {
     limit?: number
     cursor?: string
   }>): Promise<ApcTraceState>
-  loadTrace(traceKey: string): Promise<ApcTraceDetailSurface>
+  loadTrace(traceKey: string, options?: Readonly<{ executionKey?: string }>): Promise<ApcTraceDetailSurface>
   cancelExecution(executionKey: string, reason?: "user" | "stop" | "replacement"): Promise<void>
   flush(): Promise<void>
   dispose(): void
 }
 
 export class ApcFrontendStateError extends Error {
-  readonly code: "DISPOSED" | "NO_PRESET" | "NO_CONFIG" | "STALE_OPERATION" | "INVALID_HYDRATION"
+  readonly code: "DISPOSED" | "NO_PRESET" | "NO_CONFIG" | "STALE_OPERATION" | "INVALID_HYDRATION" | "EXECUTION_LOCKED"
 
   constructor(code: ApcFrontendStateError["code"], message: string) {
     super(message)
@@ -206,8 +209,10 @@ export class ApcFrontendStateError extends Error {
 
 const MODES = ["single", "sequential", "parallel"] as const
 const MAX_EXECUTION_ACTIVITY = 32
+const MAX_TOPOLOGY_ACTIVITY = 64
 const SAFE_ACTIVITY_CODE = /^[A-Z][A-Z0-9_:-]{0,63}$/
 const ACTIVITY_RUN_STATUSES: readonly ApcRunActivityStatus[] = ["pending", "running", "completed", "failed", "cancelled", "timed-out", "skipped"]
+const TERMINAL_ACTIVITY_STATUSES: readonly ApcRunActivityStatus[] = ["completed", "failed", "cancelled", "timed-out", "skipped"]
 const ACTIVITY_OUTCOMES = ["integrity-fatal", "parent-cancel", "selected-final-failure", "graph-fallback", "optional-local", "success"] as const
 const ACTIVITY_ERROR_CATEGORIES = ["integrity", "dispatch", "consent", "capacity", "config", "assembly", "provider", "tool", "timeout", "unknown"] as const
 const ACTIVITY_CANCELLATION_SOURCES = ["user", "stop", "replacement", "permission-revoked", "disable", "update", "disposed", "timeout"] as const
@@ -411,14 +416,75 @@ function saveErrorSurface(error: unknown): ApcSaveErrorSurface {
   return { code, message: uiMessage(key), reloadRequired: false }
 }
 
+function topologyActivityFromEvent(
+  event: ApcExecutionActivity,
+  previousActivity: readonly ApcExecutionActivity[] = [],
+): readonly ApcExecutionActivity[] {
+  if (event.stageIndex === undefined || event.runIndex === undefined) return previousActivity
+  const existingIndex = previousActivity.findIndex((entry) => entry.stageIndex === event.stageIndex && entry.runIndex === event.runIndex)
+  if (existingIndex >= 0) {
+    const previous = previousActivity[existingIndex]
+    if (previous !== undefined && (
+      TERMINAL_ACTIVITY_STATUSES.includes(previous.status) ||
+      (previous.status === "running" && event.status === "pending")
+    )) return previousActivity
+  }
+  const next = [...previousActivity]
+  if (existingIndex >= 0) next[existingIndex] = event
+  else next.push(event)
+  return deepFreeze(next.slice(-MAX_TOPOLOGY_ACTIVITY))
+}
+function terminalActivityWithContext(
+  event: ApcExecutionActivity,
+  previousActivity: readonly ApcExecutionActivity[],
+): ApcExecutionActivity {
+  if (!event.terminal) return event
+  const latest = <K extends keyof ApcExecutionActivity>(key: K): ApcExecutionActivity[K] | undefined => {
+    const current = event[key]
+    if (current !== undefined) return current
+    for (let index = previousActivity.length - 1; index >= 0; index -= 1) {
+      const value = previousActivity[index]?.[key]
+      if (value !== undefined) return value
+    }
+    return undefined
+  }
+  const kind = latest("kind")
+  const provider = latest("provider")
+  const model = latest("model")
+  const stageIndex = latest("stageIndex")
+  const stageCount = latest("stageCount")
+  const runIndex = latest("runIndex")
+  const runCount = latest("runCount")
+  const completedRuns = latest("completedRuns")
+  const totalRuns = latest("totalRuns")
+  const remainingBudgetMs = latest("remainingBudgetMs")
+  const usage = latest("usage")
+  return deepFreeze({
+    ...event,
+    ...(event.kind === undefined && kind !== undefined ? { kind } : {}),
+    ...(event.provider === undefined && provider !== undefined ? { provider } : {}),
+    ...(event.model === undefined && model !== undefined ? { model } : {}),
+    ...(event.stageIndex === undefined && stageIndex !== undefined ? { stageIndex } : {}),
+    ...(event.stageCount === undefined && stageCount !== undefined ? { stageCount } : {}),
+    ...(event.runIndex === undefined && runIndex !== undefined ? { runIndex } : {}),
+    ...(event.runCount === undefined && runCount !== undefined ? { runCount } : {}),
+    ...(event.completedRuns === undefined && completedRuns !== undefined ? { completedRuns } : {}),
+    ...(event.totalRuns === undefined && totalRuns !== undefined ? { totalRuns } : {}),
+    ...(event.remainingBudgetMs === undefined && remainingBudgetMs !== undefined ? { remainingBudgetMs } : {}),
+    ...(event.usage === undefined && usage !== undefined ? { usage } : {}),
+  })
+}
 function executionFromActivity(
   activity: BackendActivityResponse["payload"],
   executionKey: string,
   previousActivity: readonly ApcExecutionActivity[] = [],
   previousUsage?: ApcExecutionUsage,
+  previousTopologyActivity: readonly ApcExecutionActivity[] = [],
 ): ApcExecutionState {
-  const event = executionActivityFromPayload(activity)
+  const sanitizedEvent = executionActivityFromPayload(activity)
+  const event = terminalActivityWithContext(sanitizedEvent, previousActivity)
   const history = deepFreeze([...previousActivity, event].slice(-MAX_EXECUTION_ACTIVITY))
+  const topologyActivity = topologyActivityFromEvent(sanitizedEvent, previousTopologyActivity)
   const usage = event.usage ?? previousUsage ?? previousActivity.at(-1)?.usage
   return deepFreeze({
     executionKey,
@@ -426,6 +492,8 @@ function executionFromActivity(
     status: executionStatusFromPhase(activity.phase),
     ...(usage === undefined ? {} : { usage }),
     activity: history,
+    topologyActivity,
+    topologyApplicable: true,
   })
 }
 type ApcOperationToken = Readonly<{
@@ -436,6 +504,7 @@ type ApcOperationToken = Readonly<{
   executionId?: string | null
   traceGeneration?: number
 }>
+
 
 function staleOperationError(operation: string): ApcFrontendStateError {
   return new ApcFrontendStateError("STALE_OPERATION", `APC ${operation} result is no longer current`)
@@ -466,10 +535,11 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
   #executionBusy = false
   #traceSummaries: TraceSummary[] = []
   #traceCursor: string | undefined
-  #execution: ApcExecutionState = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [] }
+  #execution: ApcExecutionState = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [], topologyActivity: [], topologyApplicable: false }
   #executionId: string | null = null
   #executionPresetId: string | null = null
   #executionTraceId: string | null = null
+  #executionTopologyInvalidated = false
   #executionSerial = 0
   readonly #retiredExecutionIds = new Set<string>()
   constructor(options: ApcFrontendStateOptions) {
@@ -540,6 +610,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     if (this.#snapshot.stale) throw staleOperationError("update config")
     const current = this.#snapshot.config
     if (current === null || this.#snapshot.presetId === null) throw new ApcFrontendStateError("NO_CONFIG", "APC config is not hydrated")
+    if (this.#snapshot.executionMutationLocked) throw new ApcFrontendStateError("EXECUTION_LOCKED", "APC configuration is locked while execution is active")
     const next = mutator(deepFreeze(cloneValue(current)))
     if (JSON.stringify(next) === JSON.stringify(current)) return this.#snapshot
     const staged = cloneValue(next)
@@ -555,6 +626,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     if (this.#snapshot.config === null || this.#snapshot.presetId === null) throw new ApcFrontendStateError("NO_CONFIG", "APC config is not hydrated")
     const availability = this.#snapshot.modeAvailability[mode]
     if (!availability.supported || !availability.valid) return false
+    if (this.#snapshot.executionMutationLocked) throw new ApcFrontendStateError("EXECUTION_LOCKED", "APC configuration is locked while execution is active")
     if (this.#snapshot.activeMode === mode) {
       if (!this.#snapshot.dirty) return true
       const presetId = this.#snapshot.presetId
@@ -766,12 +838,27 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     }
   }
 
-  async loadTrace(traceKey: string): Promise<ApcTraceDetailSurface> {
+  async loadTrace(
+    traceKey: string,
+    options: Readonly<{ executionKey?: string }> = {},
+  ): Promise<ApcTraceDetailSurface> {
     this.#assertUsable()
     const presetId = this.#requirePreset()
     const identity = this.#traceIdsByKey.get(traceKey)
     if (identity === undefined) throw staleOperationError("load trace")
-    const token = this.#nextOperation(`trace:${traceKey}`, presetId, undefined, this.#traceGeneration)
+    const expectedExecutionId = options.executionKey === undefined
+      ? undefined
+      : this.#executionIdsByKey(options.executionKey)
+    if (
+      options.executionKey !== undefined &&
+      (expectedExecutionId === undefined || identity.executionId !== expectedExecutionId)
+    ) throw staleOperationError("load trace")
+    const token = this.#nextOperation(
+      `trace:${traceKey}`,
+      presetId,
+      expectedExecutionId,
+      this.#traceGeneration,
+    )
     const payload = await this.#persistence.getTrace(presetId, identity.executionId, identity.traceId)
     this.#assertCurrent(token)
     const currentIdentity = this.#traceIdsByKey.get(traceKey)
@@ -834,7 +921,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#traceIdsByKey.clear()
     this.#traceSummaries = []
     this.#traceCursor = undefined
-    this.#execution = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [] }
+    this.#execution = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [], topologyActivity: [], topologyApplicable: false }
+    this.#executionTopologyInvalidated = false
     this.#executionId = null
     this.#executionPresetId = null
     this.#executionTraceId = null
@@ -890,6 +978,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     const decodedSource = values.decoded
     const decoded = decodedSource === null ? null : sanitizeDecoded(decodedSource)
     const config = values.config === null ? null : cloneValue(values.config)
+    const execution = cloneValue(values.execution ?? this.#execution)
+    const executionMutationLocked = execution.phase !== "idle" && !execution.terminal
     const modeIssues = modeIssueMap(decodedSource, config)
     const modeAvailability = modeAvailabilitySurface(config, decodedSource)
     const blockedReasons = [...(values.blockedReasons ?? [])]
@@ -910,7 +1000,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       availableConnections: cloneValue(values.availableConnections ?? this.#availableConnections),
       connectionBindings: cloneValue(values.connectionBindings ?? this.#connectionBindings),
       consent: cloneValue(values.consent ?? this.#consent),
-      execution: cloneValue(values.execution ?? this.#execution),
+      execution,
+      executionMutationLocked,
       traces: cloneValue(values.traces ?? this.#traceState()),
       busy: values.busy ?? this.#currentBusyReason() !== null,
       busyReason: values.busyReason === undefined ? this.#currentBusyReason() : values.busyReason,
@@ -933,7 +1024,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     for (const key of Object.keys(this.#traceDetails)) delete this.#traceDetails[key]
     this.#traceSummaries = []
     this.#traceCursor = undefined
-    this.#execution = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [] }
+    this.#execution = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [], topologyActivity: [], topologyApplicable: false }
+    this.#executionTopologyInvalidated = false
     this.#executionBusy = false
     this.#executionActivityGeneration = 0
     this.#busyReason = null
@@ -1024,8 +1116,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       const terminalPhase = hydratedExecution.phase === "completed" || hydratedExecution.phase === "failed" || hydratedExecution.phase === "cancelled"
       if (
         hydratedExecution.presetId !== payload.presetId ||
-        typeof hydratedExecution.executionId !== "string" ||
-        hydratedExecution.executionId.length === 0 ||
+        boundedActivityLabel(hydratedExecution.executionId, 128) === undefined ||
         !["started", "progress", "completed", "failed", "cancelled"].includes(hydratedExecution.phase) ||
         hydratedExecution.terminal !== terminalPhase
       ) {
@@ -1037,6 +1128,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#executionPresetId = hydratedExecution.presetId
         this.#executionTraceId = hydratedExecution.traceId ?? null
         this.#execution = executionFromActivity(hydratedExecution, `execution-${this.#executionSerial}`)
+        this.#executionTopologyInvalidated = false
         this.#executionBusy = !this.#execution.terminal
       }
     }
@@ -1099,13 +1191,26 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     }).catch(() => {})
   }
 
+  #invalidateExecutionTopology(): void {
+    if (!this.#execution.topologyApplicable && this.#execution.topologyActivity.length === 0) return
+    this.#execution = deepFreeze({
+      ...this.#execution,
+      topologyActivity: [],
+      topologyApplicable: false,
+    })
+  }
+  #clearTerminalTopology(): void {
+    if (!this.#execution.terminal) return
+    this.#invalidateExecutionTopology()
+  }
   #setConfig(raw: unknown, dirty: boolean): void {
+    this.#clearTerminalTopology()
     const decoded = decodeApcPresetConfig(raw)
     const config = editableConfig(decoded, this.#snapshot.config)
     if (!(decoded.status === "valid" && decoded.config?.supportedModes.some((mode) => mode !== "single") === true)) {
       this.#availableConnections = []
     }
-    this.#snapshot = this.#makeSnapshot({ ...this.#snapshot, decoded, config, activeMode: config?.activeMode ?? "single", dirty, revision: this.#snapshot.revision + 1, saveError: null, stale: false, availableConnections: this.#availableConnections })
+    this.#snapshot = this.#makeSnapshot({ ...this.#snapshot, execution: this.#execution, decoded, config, activeMode: config?.activeMode ?? "single", dirty, revision: this.#snapshot.revision + 1, saveError: null, stale: false, availableConnections: this.#availableConnections })
     this.#notify()
   }
 
@@ -1233,6 +1338,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     }
     this.#presetGeneration += 1
     this.#operationGenerations.clear()
+    this.#executionTopologyInvalidated = this.#execution.executionKey !== null
+    if (this.#executionTopologyInvalidated) this.#invalidateExecutionTopology()
     this.#persistedRaw = cloneValue(state.metadata)
     const decoded = decodeApcPresetConfig(state.metadata)
     const config = editableConfig(decoded, this.#snapshot.config)
@@ -1241,6 +1348,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     if (!activeGraph) this.#availableConnections = []
     this.#snapshot = this.#makeSnapshot({
       ...this.#snapshot,
+      execution: this.#execution,
       decoded,
       config,
       activeMode: config?.activeMode ?? "single",
@@ -1254,6 +1362,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
   #handleDomainMessage(message: ApcDomainResponse): void {
     if (this.#disposed || message.type !== "activity") return
     if (message.payload.presetId !== this.#snapshot.presetId) return
+    if (boundedActivityLabel(message.payload.executionId, 128) === undefined) return
     const phase = message.payload.phase
     const expectedTerminal = phase === "completed" || phase === "failed" || phase === "cancelled"
     if (message.payload.terminal !== expectedTerminal) return
@@ -1266,6 +1375,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#executionTraceId = message.payload.traceId ?? null
       const executionKey = `execution-${this.#executionSerial}`
       this.#execution = executionFromActivity(message.payload, executionKey)
+      this.#executionTopologyInvalidated = false
     } else if (currentId !== message.payload.executionId) {
       if (!this.#execution.terminal || phase !== "started" || this.#retiredExecutionIds.has(message.payload.executionId)) return
       this.#retiredExecutionIds.add(currentId)
@@ -1279,6 +1389,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#executionPresetId = message.payload.presetId
       this.#executionTraceId = message.payload.traceId ?? null
       this.#execution = executionFromActivity(message.payload, `execution-${this.#executionSerial}`)
+      this.#executionTopologyInvalidated = false
     } else {
       if (this.#execution.terminal || phase === "started") return
       if (phase !== "progress" && !expectedTerminal) return
@@ -1288,8 +1399,10 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#execution.executionKey as string,
         this.#execution.activity,
         this.#execution.usage,
+        this.#execution.topologyActivity,
       )
     }
+    if (this.#executionTopologyInvalidated) this.#invalidateExecutionTopology()
     this.#executionActivityGeneration += 1
     this.#executionBusy = !this.#execution.terminal
     const busyReason = this.#currentBusyReason()

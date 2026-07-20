@@ -1,19 +1,57 @@
 import type { Cleanup } from "./dom"
 
+const APC_EDITOR_COMPACT_MAX_INLINE_SIZE = "72rem"
+const APC_EDITOR_STACK_MAX_INLINE_SIZE = "48rem"
+const APC_EDITOR_CONTAINER_NAME = "apc-editor"
+
 /** Extension-owned editor rules. Every selector is rooted through :scope. */
 export const APC_EDITOR_STYLE = `
 :scope {
+  --apc-surface-root: var(--lumiverse-bg-deep, Canvas);
+  --apc-surface-pane: var(--lumiverse-bg, Canvas);
+  --apc-surface-raised: var(--lumiverse-bg-elevated, Canvas);
+  --apc-surface-card: var(--lumiverse-fill-subtle, ButtonFace);
+  --apc-surface-hover: var(--lumiverse-fill-hover, ButtonFace);
+  --apc-border: var(--lumiverse-border, GrayText);
+  --apc-border-strong: var(--lumiverse-border-hover, GrayText);
+  --apc-text: var(--lumiverse-text, CanvasText);
+  --apc-text-muted: var(--lumiverse-text-muted, GrayText);
+  --apc-text-dim: var(--lumiverse-text-dim, GrayText);
+  --apc-accent: var(--lumiverse-primary, Highlight);
+  --apc-accent-text: var(--lumiverse-primary-text, LinkText);
+  --apc-accent-soft: var(--lumiverse-primary-010, ButtonFace);
+  --apc-accent-border: var(--lumiverse-primary-050, Highlight);
+  --apc-success: var(--lumiverse-success, LinkText);
+  --apc-success-soft: var(--lumiverse-success-015, ButtonFace);
+  --apc-success-border: var(--lumiverse-success-050, LinkText);
+  --apc-warning: var(--lumiverse-warning, MarkText);
+  --apc-warning-soft: var(--lumiverse-warning-015, Mark);
+  --apc-warning-border: var(--lumiverse-warning-050, MarkText);
+  --apc-danger: var(--lumiverse-danger, CanvasText);
+  --apc-danger-soft: var(--lumiverse-danger-015, ButtonFace);
+  --apc-danger-border: var(--lumiverse-danger-050, CanvasText);
+  --apc-radius-compact: var(--lumiverse-radius-sm, .3125rem);
+  --apc-radius: var(--lumiverse-radius, .5rem);
+  --apc-shadow: var(--lumiverse-shadow-md, 0 1rem 3rem var(--lumiverse-fill-heavy, GrayText));
+  --apc-layer-scrim: 20;
+  --apc-layer-dialog: 21;
+  container-name: ${APC_EDITOR_CONTAINER_NAME};
+  container-type: inline-size;
   display: grid;
   grid-template-columns:
-    minmax(12rem, 1fr)
-    minmax(20rem, 2fr)
-    minmax(14rem, 1fr);
+    minmax(0, 15rem)
+    minmax(0, 1fr)
+    minmax(0, 21rem);
   grid-template-areas: "threads graph inspector";
-  gap: 0.75rem;
-  min-width: 0;
-  color: var(--lumiverse-text, CanvasText);
-  background: var(--lumiverse-bg, Canvas);
-  font: inherit;
+  gap: .75rem;
+  align-items: start;
+  min-inline-size: 0;
+  color: var(--apc-text);
+  background: var(--apc-surface-root);
+  font-family: var(--lumiverse-font-family, inherit);
+  font-size: calc(.8125rem * var(--lumiverse-font-scale, 1));
+  line-height: 1.45;
+  isolation: isolate;
 }
 :scope > [data-apc-panel="threads"] {
   grid-area: threads;
@@ -24,200 +62,971 @@ export const APC_EDITOR_STYLE = `
 :scope > [data-apc-panel="inspector"] {
   grid-area: inspector;
 }
-:scope [data-apc-panel],
-:scope .apc-graph-editor,
-:scope [data-apc-thread-editor] {
+:scope > [data-apc-panel] {
+  box-sizing: border-box;
   display: grid;
-  gap: 0.75rem;
-  min-width: 0;
+  gap: .75rem;
+  align-content: start;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  padding: .75rem;
+  overflow: auto;
+  color: var(--apc-text);
+  background: var(--apc-surface-pane);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius);
 }
-:scope [data-apc-panel] > h2,
-:scope [data-apc-panel] > h3,
-:scope .apc-graph-editor h2,
-:scope .apc-graph-editor h3,
-:scope .apc-graph-editor h4,
-:scope .apc-graph-editor h5,
-:scope .apc-graph-editor h6,
-:scope [data-apc-thread-editor] h2 {
+:scope [data-apc-panel],
+:scope [data-apc-panel] *,
+:scope .apc-graph-toolbar-contribution,
+:scope .apc-graph-toolbar-contribution * {
+  box-sizing: border-box;
+}
+:scope [data-apc-panel] :where(h1, h2, h3, h4, h5, h6, p),
+:scope .apc-graph-toolbar-contribution :where(h1, h2, h3, h4, h5, h6, p) {
+  min-inline-size: 0;
+  max-inline-size: 100%;
   margin: 0;
+  overflow-wrap: anywhere;
 }
-:scope .apc-mode-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  align-items: flex-start;
+:scope [data-apc-panel] :where(h2, h3),
+:scope .apc-module-heading,
+:scope .apc-inspector-section-title {
+  color: var(--apc-text-muted);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: .09em;
+  line-height: 1.3;
+  text-transform: uppercase;
 }
-:scope .apc-mode-toolbar button,
-:scope .apc-card-actions button,
-:scope .apc-graph-editor button,
-:scope [data-apc-thread-editor] button {
-  color: inherit;
-  background: var(--lumiverse-fill-subtle, transparent);
-  border: 0.0625rem solid var(--lumiverse-border, currentColor);
-  border-radius: 0.25rem;
-  padding: 0.35rem 0.65rem;
+:scope [data-apc-panel] :where(h4, h5, h6) {
+  color: var(--apc-text);
+  font-size: calc(.75rem * var(--lumiverse-font-scale, 1));
+  font-weight: 650;
 }
-:scope .apc-mode-toolbar button[aria-checked="true"] {
-  color: var(--lumiverse-accent-fg, var(--lumiverse-text, CanvasText));
-  background: var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
-}
-:scope .apc-mode-toolbar button:disabled,
-:scope .apc-graph-editor button:disabled,
-:scope [data-apc-thread-editor] button:disabled {
-  cursor: not-allowed;
-  opacity: 0.65;
-}
+:scope .apc-graph-editor,
 :scope .apc-graph-content,
-:scope .apc-thread-list,
+:scope .apc-graph-workspace,
+:scope .apc-thread-workspace-pane,
+:scope .apc-thread-workspace,
 :scope .apc-stage-list,
+:scope .apc-topology-stages,
 :scope .apc-stage-runs,
 :scope .apc-final-response,
-:scope [data-apc-thread-id],
-:scope [data-apc-workspace],
-:scope .apc-bindings {
+:scope .apc-bindings,
+:scope .apc-inspector,
+:scope .apc-inspector-content,
+:scope .apc-inspector-execution {
   display: grid;
-  gap: 0.75rem;
-  min-width: 0;
+  gap: .75rem;
+  align-content: start;
+  min-inline-size: 0;
+  max-inline-size: 100%;
 }
-:scope .apc-thread-card,
-:scope .apc-stage-card,
-:scope .apc-run-card,
-:scope [data-apc-connection],
-:scope [data-apc-workspace] {
-  min-width: 0;
-  padding: 0.75rem;
-  color: inherit;
-  background: var(--lumiverse-fill-subtle, transparent);
-  border: 0.0625rem solid var(--lumiverse-border, currentColor);
-  border-radius: 0.35rem;
+:scope .apc-mode-toolbar-shell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem 1rem;
+  align-items: center;
+  min-inline-size: 0;
+}
+:scope .apc-mode-toolbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: .25rem;
+  align-items: center;
+  min-inline-size: 0;
+  padding: .25rem;
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius);
+}
+:scope .apc-mode-toolbar .apc-disabled-reason {
+  flex: 1 0 100%;
+  padding-inline: .25rem;
+}
+:scope button,
+:scope input,
+:scope select,
+:scope textarea {
+  font: inherit;
+}
+:scope button {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  min-block-size: 2rem;
+  padding: .375rem .625rem;
+  overflow-wrap: anywhere;
+  color: var(--apc-text);
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+  line-height: 1.25;
+  text-align: start;
+  white-space: normal;
+}
+:scope button[data-action="add-stage"],
+:scope button[data-action="create-graph"],
+:scope button[data-apc-approve-consent],
+:scope .apc-mode-toolbar button[aria-checked="true"] {
+  color: var(--lumiverse-primary-contrast, HighlightText);
+  background: var(--apc-accent);
+  border-color: var(--apc-accent-border);
+  font-weight: 700;
+}
+:scope button[data-selected="true"],
+:scope button[aria-pressed="true"] {
+  color: var(--apc-accent-text);
+  background: var(--apc-accent-soft);
+  border-color: var(--apc-accent-border);
+}
+:scope [data-selected="true"] {
+  border-color: var(--apc-accent-border);
+  box-shadow: inset .25rem 0 0 var(--apc-accent);
+}
+:scope button[data-inspector-action="stop"],
+:scope button[data-apc-revoke-consent] {
+  color: var(--apc-danger);
+  background: var(--apc-danger-soft);
+  border-color: var(--apc-danger-border);
+  font-weight: 700;
+}
+:scope button:disabled,
+:scope button[aria-disabled="true"],
+:scope input:disabled,
+:scope select:disabled,
+:scope textarea:disabled {
+  cursor: not-allowed;
+  opacity: .52;
+  filter: saturate(.4);
+}
+:scope input[readonly],
+:scope textarea[readonly],
+:scope [aria-readonly="true"] {
+  color: var(--apc-text-muted);
+  background: var(--apc-surface-card);
+  border-style: dashed;
+}
+:scope button:focus-visible,
+:scope input:focus-visible,
+:scope select:focus-visible,
+:scope textarea:focus-visible,
+:scope [tabindex]:focus-visible,
+:scope summary:focus-visible {
+  outline: .1875rem solid var(--apc-accent);
+  outline-offset: .125rem;
+  box-shadow: 0 0 0 .125rem var(--apc-surface-root);
 }
 :scope .apc-card-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: .5rem;
+  align-items: center;
+  min-inline-size: 0;
+}
+:scope .apc-card-actions > button {
+  flex: 0 1 auto;
 }
 :scope .apc-field,
-:scope [data-apc-thread-editor] label {
+:scope [data-apc-thread-editor] label,
+:scope [data-apc-connection-slot-list] label {
   display: grid;
-  gap: 0.25rem;
-  min-width: 0;
+  gap: .25rem;
+  min-inline-size: 0;
+  max-inline-size: 100%;
 }
-:scope .apc-field-label {
-  font-weight: 600;
+:scope .apc-field-label,
+:scope [data-apc-thread-editor] label > span:first-child,
+:scope [data-apc-connection-slot-list] label > span:first-child {
+  color: var(--apc-text-muted);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
 }
 :scope .apc-field input,
 :scope .apc-field textarea,
 :scope .apc-field select,
-:scope [data-apc-thread-editor] input,
+:scope [data-apc-thread-editor] input:not([type="checkbox"]):not([type="radio"]),
 :scope [data-apc-thread-editor] textarea,
-:scope [data-apc-thread-editor] select {
-  box-sizing: border-box;
-  width: 100%;
-  max-width: 100%;
-  color: inherit;
-  background: var(--lumiverse-bg, Canvas);
-  border: 0.0625rem solid var(--lumiverse-border, currentColor);
+:scope [data-apc-thread-editor] select,
+:scope [data-apc-connection-slot-label] {
+  inline-size: 100%;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  padding: .5rem .625rem;
+  color: var(--apc-text);
+  background: var(--apc-surface-root);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope textarea {
+  min-block-size: 5rem;
+  resize: vertical;
+}
+:scope fieldset,
+:scope legend,
+:scope dl,
+:scope dd,
+:scope dt {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+:scope fieldset {
+  margin: 0;
+}
+:scope legend {
+  padding-inline: .25rem;
+  overflow-wrap: anywhere;
+  color: var(--apc-text-muted);
+  font-weight: 700;
 }
 :scope .apc-checkbox-field,
 :scope .apc-radio-field {
   display: inline-flex;
-  gap: 0.4rem;
-  align-items: center;
+  gap: .5rem;
+  align-items: flex-start;
+  inline-size: fit-content;
+  max-inline-size: 100%;
 }
-:scope .apc-disabled-reason,
+:scope .apc-checkbox-field input,
+:scope .apc-radio-field input {
+  flex: 0 0 auto;
+  margin-block-start: .125rem;
+  accent-color: var(--apc-accent);
+}
+:scope .apc-disabled-reason {
+  display: block;
+  color: var(--apc-text-muted);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+  line-height: 1.4;
+}
 :scope .apc-blocked-status,
-:scope .apc-validation-errors {
-  color: var(--lumiverse-danger, currentColor);
+:scope .apc-validation-errors,
+:scope [data-apc-blocked] {
+  padding: .625rem .75rem;
+  color: var(--apc-danger);
+  background: var(--apc-danger-soft);
+  border: .0625rem solid var(--apc-danger-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-thread-list > ul,
+:scope [data-apc-run-navigation],
+:scope [data-apc-connection-slot-list],
+:scope .apc-run-inputs,
+:scope .apc-inspector-source-list,
+:scope .apc-inspector-stage-list,
+:scope .apc-inspector-run-list,
+:scope .apc-inspector-activity,
+:scope .apc-inspector-traces,
+:scope .apc-inspector-trace-events {
+  display: grid;
+  gap: .5rem;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+:scope .apc-thread-list {
+  display: grid;
+  gap: .625rem;
+  min-inline-size: 0;
+}
+:scope .apc-thread-list > ul > li,
+:scope [data-apc-run-navigation] > li,
+:scope [data-apc-connection-slot-list] > li {
+  display: grid;
+  gap: .375rem;
+  min-inline-size: 0;
+  padding: .5rem;
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-thread-list [data-apc-thread-select],
+:scope [data-apc-run-navigation] [data-apc-run-select] {
+  inline-size: 100%;
+  padding: .25rem;
+  background: transparent;
+  border-color: transparent;
+  font-weight: 700;
+}
+:scope .apc-thread-source,
+:scope .apc-run-meta,
+:scope .apc-run-flags {
+  color: var(--apc-text-muted);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+}
+:scope .apc-thread-list .apc-card-actions {
+  gap: .25rem;
+}
+:scope .apc-thread-list .apc-card-actions button,
+:scope .apc-stage-card > .apc-card-actions button,
+:scope .apc-run-card > .apc-card-actions button {
+  min-block-size: 1.75rem;
+  padding: .25rem .5rem;
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+}
+:scope .apc-stage-list {
+  position: relative;
+  padding: .75rem;
+  background: var(--apc-surface-root);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius);
+}
+:scope .apc-council-warning {
+  padding: .625rem .75rem;
+  color: var(--apc-warning);
+  background: var(--apc-warning-soft);
+  border: .0625rem solid var(--apc-warning-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-topology-stages {
+  gap: 1.5rem;
+}
+:scope .apc-stage-card,
+:scope .apc-run-card,
+:scope .apc-final-response,
+:scope .apc-selection-detail,
+:scope .apc-connection-slots,
+:scope .apc-missing-graph-actions,
+:scope .apc-inline-confirmation {
+  position: relative;
+  min-inline-size: 0;
+  padding: .625rem;
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-stage-card {
+  display: grid;
+  gap: .625rem;
+}
+:scope .apc-stage-card > h3 {
+  padding-block-end: .5rem;
+  border-block-end: .0625rem solid var(--apc-border);
+}
+:scope .apc-stage-runs {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: .75rem;
+}
+:scope .apc-run-card {
+  display: grid;
+  gap: .375rem;
+  align-content: start;
+}
+:scope .apc-run-card > h4 button {
+  inline-size: 100%;
+  padding: .25rem;
+  background: transparent;
+  border-color: transparent;
+  font-size: calc(.8125rem * var(--lumiverse-font-scale, 1));
+}
+:scope .apc-run-inputs {
+  gap: .25rem;
+}
+:scope .apc-run-inputs > li {
+  padding: .25rem .5rem;
+  overflow-wrap: anywhere;
+  color: var(--apc-accent-text);
+  background: var(--apc-accent-soft);
+  border: .0625rem solid var(--apc-accent-border);
+  border-radius: var(--apc-radius-compact);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+}
+:scope [data-apc-topology="parallel"] .apc-stage-runs {
+  position: relative;
+  padding-block-end: 1rem;
+}
+:scope [data-apc-topology="parallel"] .apc-stage-runs::after {
+  content: "";
+  position: absolute;
+  inset-inline: 12.5%;
+  inset-block-end: .25rem;
+  border-block-end: .125rem solid var(--apc-accent-border);
+}
+:scope [data-apc-topology="parallel"] .apc-stage-runs::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 50%;
+  inset-block-end: -.75rem;
+  block-size: 1rem;
+  border-inline-start: .125rem solid var(--apc-accent-border);
+}
+:scope [data-apc-topology="parallel"] .apc-run-card::after {
+  content: "";
+  position: absolute;
+  inset-inline-start: 50%;
+  inset-block-end: -.875rem;
+  block-size: .875rem;
+  border-inline-start: .125rem solid var(--apc-accent-border);
+}
+:scope [data-apc-causal-chain] > .apc-stage-card:not(:last-child)::after {
+  content: "↓";
+  position: absolute;
+  inset-inline-start: 50%;
+  inset-block-end: -1.375rem;
+  color: var(--apc-accent);
+  font-size: 1rem;
+  font-weight: 800;
+  line-height: 1;
+}
+:scope .apc-final-response {
+  order: 10;
+  padding: .75rem;
+  border-style: dashed;
+  border-color: var(--apc-accent-border);
+}
+:scope .apc-stage-list > .apc-card-actions {
+  position: sticky;
+  inset-block-end: 0;
+  z-index: 2;
+  order: 20;
+  margin: 0 -.75rem -.75rem;
+  padding: .625rem .75rem;
+  background: var(--apc-surface-raised);
+  border-block-start: .0625rem solid var(--apc-border-strong);
+  border-radius: 0 0 var(--apc-radius) var(--apc-radius);
+}
+:scope .apc-missing-graph-actions {
+  order: 15;
+}
+:scope .apc-graph-empty {
+  display: grid;
+  gap: 1rem;
+  align-content: center;
+  min-block-size: min(62dvh, 36rem);
+  min-inline-size: 0;
+  padding: clamp(1rem, 4vw, 3rem);
+  background: var(--apc-accent-soft);
+  border: .125rem dashed var(--apc-accent-border);
+  border-radius: var(--apc-radius);
+}
+:scope .apc-graph-empty > h2 {
+  color: var(--apc-text);
+  font-size: calc(1.25rem * var(--lumiverse-font-scale, 1));
+  letter-spacing: normal;
+  text-transform: none;
+}
+:scope .apc-graph-empty > ol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: .75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: apc-onboarding;
+}
+:scope .apc-graph-empty > ol > li {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr);
+  gap: .5rem;
+  align-items: start;
+  min-inline-size: 0;
+  counter-increment: apc-onboarding;
+}
+:scope .apc-graph-empty > ol > li::before {
+  content: counter(apc-onboarding);
+  display: grid;
+  place-items: center;
+  inline-size: 1.5rem;
+  block-size: 1.5rem;
+  color: var(--lumiverse-primary-contrast, HighlightText);
+  background: var(--apc-accent);
+  border-radius: 50%;
+  font-weight: 800;
+}
+:scope .apc-graph-empty > .apc-card-actions:not([data-apc-unavailable-graph-actions]) {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+:scope .apc-graph-empty button[data-action="create-graph"] {
+  min-block-size: 3rem;
+  justify-content: center;
+  text-align: center;
+}
+:scope [data-apc-unavailable-graph-actions] {
+  padding: .625rem;
+  background: var(--apc-surface-card);
+  border: .0625rem dashed var(--apc-border-strong);
+  border-radius: var(--apc-radius-compact);
+}
+:scope [data-apc-unavailable-graph-action] {
+  border-style: dashed;
+}
+:scope [data-apc-unavailable-graph-actions] + .apc-disabled-reason {
+  padding-inline-start: .625rem;
+  border-inline-start: .1875rem solid var(--apc-border-strong);
+}
+:scope .apc-connection-slots {
+  display: grid;
+  gap: .625rem;
+}
+:scope [data-apc-connection-slot-list] > li {
+  padding: .625rem;
+}
+:scope .apc-thread-workspace-pane {
+  gap: .75rem;
+}
+:scope .apc-thread-workspace-header {
+  display: grid;
+  gap: .375rem;
+  min-inline-size: 0;
+  padding-block-end: .625rem;
+  border-block-end: .0625rem solid var(--apc-border);
+}
+:scope [data-apc-pane="workspace"] .apc-thread-workspace-pane {
+  min-block-size: min(70dvh, 46rem);
+}
+:scope [data-apc-pane="workspace"] .apc-thread-workspace,
+:scope [data-apc-pane="workspace"] .apc-host-loom-editor {
+  min-block-size: min(62dvh, 40rem);
+  min-inline-size: 0;
+  background: var(--apc-surface-root);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-thread-identity,
+:scope .apc-thread-connection,
+:scope .apc-workspace-source,
+:scope .apc-run-configuration,
+:scope .apc-binding {
+  display: grid;
+  gap: .625rem;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  margin: 0;
+  padding: .625rem;
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-bindings {
+  gap: .625rem;
+}
+:scope .apc-binding {
+  background: var(--apc-surface-root);
+}
+:scope [data-apc-thread-output],
+:scope [data-apc-bound-connection],
+:scope [data-apc-main-context],
+:scope [data-apc-run-position-impact],
+:scope [data-apc-run-required-reason] {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  padding: .5rem .625rem;
+  overflow-wrap: anywhere;
+  color: var(--apc-text-muted);
+  background: var(--apc-surface-root);
+  border-inline-start: .1875rem solid var(--apc-border-strong);
+}
+:scope:has(.apc-consent-review)::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: var(--apc-layer-scrim);
+  background: var(--lumiverse-modal-backdrop, var(--lumiverse-fill-heavy, GrayText));
+  pointer-events: auto;
+}
+:scope:has(.apc-consent-review) > [data-apc-panel] {
+  pointer-events: none;
+  user-select: none;
+}
+:scope .apc-consent-review {
+  position: fixed;
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  z-index: var(--apc-layer-dialog);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .75rem;
+  inline-size: min(calc(100vw - 2rem), 42rem);
+  max-block-size: calc(100dvh - 2rem);
+  padding: 1rem;
+  overflow: auto;
+  color: var(--apc-text);
+  background: var(--apc-surface-raised);
+  border: .0625rem solid var(--apc-accent-border);
+  border-radius: var(--apc-radius);
+  box-shadow: var(--apc-shadow);
+  pointer-events: auto;
+  transform: translate(-50%, -50%);
+}
+:scope .apc-consent-review > :where(h3, h4, p, ul, dl, label) {
+  grid-column: 1 / -1;
+}
+:scope .apc-consent-review > h3 {
+  color: var(--apc-text);
+  font-size: calc(1.125rem * var(--lumiverse-font-scale, 1));
+  letter-spacing: normal;
+  text-transform: none;
+}
+:scope .apc-consent-details {
+  display: grid;
+  grid-template-columns: minmax(7rem, auto) minmax(0, 1fr);
+  gap: .375rem .75rem;
+  margin: 0;
+  padding: .75rem;
+  background: var(--apc-surface-root);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-consent-details dt {
+  color: var(--apc-text-muted);
+  font-weight: 700;
+}
+:scope .apc-consent-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+:scope .apc-consent-review [data-apc-consent-resolution="stale"],
+:scope .apc-consent-review [data-apc-consent-resolution="missing"] {
+  padding: .625rem;
+  color: var(--apc-warning);
+  background: var(--apc-warning-soft);
+  border: .0625rem solid var(--apc-warning-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-consent-review > button {
+  inline-size: 100%;
+  justify-self: stretch;
+}
+:scope .apc-inspector-content {
+  gap: .625rem;
+}
+:scope .apc-inspector-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+  justify-content: space-between;
+  min-inline-size: 0;
+  padding-block-end: .625rem;
+  border-block-end: .0625rem solid var(--apc-border);
+}
+:scope .apc-inspector-title {
+  color: var(--apc-text);
+  font-size: calc(.875rem * var(--lumiverse-font-scale, 1));
+  letter-spacing: normal;
+  text-transform: none;
+}
+:scope .apc-inspector-section {
+  display: grid;
+  gap: .5rem;
+  min-inline-size: 0;
+  padding: .625rem;
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-inspector-question {
+  gap: .625rem;
+  padding: 0 0 .625rem;
+  background: transparent;
+  border-width: 0 0 .0625rem;
+  border-radius: 0;
+}
+:scope .apc-inspector-question:last-child {
+  border-block-end: 0;
+}
+:scope .apc-inspector-field {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, auto) minmax(0, 1fr);
+  gap: .5rem;
+  align-items: start;
+  min-inline-size: 0;
+}
+:scope .apc-inspector-field-label {
+  color: var(--apc-text-muted);
+  font-size: calc(.6875rem * var(--lumiverse-font-scale, 1));
+  font-weight: 650;
+}
+:scope .apc-inspector-field-value {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  text-align: end;
 }
 :scope .apc-inspector-badge {
   display: inline-flex;
+  gap: .375rem;
   align-items: center;
-  width: fit-content;
-  padding: 0.15rem 0.45rem;
-  color: var(--lumiverse-text-muted);
-  background: var(--lumiverse-fill-subtle);
-  border: 0.0625rem solid var(--lumiverse-border);
-  border-radius: var(--lumiverse-radius);
-  font-weight: 600;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  padding: .1875rem .5rem;
+  overflow-wrap: anywhere;
+  color: var(--apc-text-muted);
+  background: var(--apc-surface-card);
+  border: .0625rem solid var(--apc-border);
+  border-radius: 999rem;
+  font-size: calc(.625rem * var(--lumiverse-font-scale, 1));
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
 }
-:scope [data-outcome-class],
+:scope .apc-inspector-status-shape {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  inline-size: 1rem;
+  block-size: 1rem;
+  border: .0625rem solid currentColor;
+  border-radius: 50%;
+  font-weight: 900;
+  line-height: 1;
+}
+:scope [data-status-kind="graph-fallback"] .apc-inspector-status-shape,
+:scope [data-badge-kind="graph-fallback"] .apc-inspector-status-shape {
+  border-radius: var(--apc-radius-compact);
+  transform: rotate(45deg);
+}
+:scope [data-status-kind="graph-fallback"] .apc-inspector-status-shape::first-letter,
+:scope [data-badge-kind="graph-fallback"] .apc-inspector-status-shape::first-letter {
+  transform: rotate(-45deg);
+}
+:scope .apc-inspector-run-identity,
+:scope .apc-inspector-stage,
+:scope .apc-inspector-run,
+:scope .apc-inspector-source,
+:scope .apc-inspector-activity-item,
+:scope .apc-inspector-trace,
+:scope .apc-inspector-trace-event {
+  display: grid;
+  gap: .375rem;
+  min-inline-size: 0;
+  padding: .5rem;
+  background: var(--apc-surface-root);
+  border: .0625rem solid var(--apc-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-inspector-run-identity,
+:scope .apc-inspector-stage,
+:scope .apc-inspector-run,
+:scope .apc-inspector-activity-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+:scope .apc-inspector-activity-error,
+:scope .apc-inspector-error-message,
+:scope .apc-inspector-stop-warning {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+  color: var(--apc-danger);
+}
+:scope .apc-inspector-error {
+  color: var(--apc-danger);
+  background: var(--apc-danger-soft);
+  border-color: var(--apc-danger-border);
+}
+:scope .apc-inspector-stop-control {
+  display: grid;
+  gap: .5rem;
+  padding: .625rem;
+  background: var(--apc-danger-soft);
+  border: .0625rem solid var(--apc-danger-border);
+  border-radius: var(--apc-radius-compact);
+}
+:scope .apc-inspector-progress {
+  inline-size: 100%;
+  max-inline-size: 100%;
+  accent-color: var(--apc-accent);
+}
+:scope .apc-inspector-trace-details {
+  min-inline-size: 0;
+  overflow: hidden;
+  border-block-start: .0625rem solid var(--apc-border);
+}
+:scope .apc-inspector-trace-details > summary {
+  padding-block: .5rem;
+  color: var(--apc-accent-text);
+  cursor: pointer;
+}
 :scope [data-activity-status],
-:scope [data-current-run-status] {
-  padding-inline-start: 0.75rem;
-  border-inline-start: 0.25rem solid var(--lumiverse-border);
+:scope [data-current-run-status],
+:scope [data-stage-status],
+:scope [data-run-status],
+:scope [data-outcome-class] {
+  border-inline-start-width: .25rem;
+  border-inline-start-style: solid;
+}
+:scope [data-activity-status] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  display: inline-grid;
+  place-items: center;
+  inline-size: 1rem;
+  block-size: 1rem;
+  margin-inline-end: .375rem;
+  border: .0625rem solid currentColor;
+  border-radius: 50%;
+  font-weight: 900;
+  line-height: 1;
 }
 :scope [data-badge-kind="completed"],
 :scope [data-inspector-status="completed"],
+:scope [data-status-kind="completed"],
 :scope [data-activity-status="completed"],
 :scope [data-current-run-status="completed"],
+:scope [data-stage-status="completed"],
+:scope [data-run-status="completed"],
 :scope [data-outcome-class="success"] {
-  color: var(--lumiverse-success);
-  background: var(--lumiverse-success-015);
-  border-color: var(--lumiverse-success-050);
+  color: var(--apc-success);
+  background: var(--apc-success-soft);
+  border-color: var(--apc-success-border);
+  border-style: solid;
+}
+:scope [data-activity-status="completed"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "✓";
 }
 :scope [data-badge-kind="running"],
 :scope [data-inspector-status="running"],
+:scope [data-status-kind="running"],
 :scope [data-activity-status="running"],
 :scope [data-current-run-status="running"],
+:scope [data-stage-status="running"],
+:scope [data-run-status="running"],
 :scope [data-badge-kind="required"] {
-  color: var(--lumiverse-primary);
-  background: var(--lumiverse-primary-010);
-  border-color: var(--lumiverse-primary-050);
+  color: var(--apc-accent-text);
+  background: var(--apc-accent-soft);
+  border-color: var(--apc-accent-border);
+  border-style: double;
+}
+:scope [data-activity-status="running"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "●";
+  border-style: double;
 }
 :scope [data-badge-kind="pending"],
 :scope [data-badge-kind="skipped"],
 :scope [data-badge-kind="optional"],
 :scope [data-badge-kind="cancelled"],
 :scope [data-inspector-status="cancelled"],
+:scope [data-status-kind="pending"],
+:scope [data-status-kind="skipped"],
+:scope [data-status-kind="cancelled"],
 :scope [data-activity-status="pending"],
 :scope [data-activity-status="skipped"],
 :scope [data-activity-status="cancelled"],
 :scope [data-current-run-status="pending"],
 :scope [data-current-run-status="skipped"],
 :scope [data-current-run-status="cancelled"],
+:scope [data-stage-status="pending"],
+:scope [data-stage-status="skipped"],
+:scope [data-stage-status="cancelled"],
+:scope [data-run-status="pending"],
+:scope [data-run-status="skipped"],
+:scope [data-run-status="cancelled"],
 :scope [data-outcome-class="parent-cancel"] {
-  color: var(--lumiverse-text-muted);
-  background: var(--lumiverse-fill-subtle);
-  border-color: var(--lumiverse-border);
+  color: var(--apc-text-muted);
+  background: var(--apc-surface-card);
+  border-color: var(--apc-border-strong);
+  border-style: dashed;
 }
-:scope [data-outcome-class="graph-fallback"] {
-  color: var(--lumiverse-warning);
-  background: var(--lumiverse-warning-015);
-  border-color: var(--lumiverse-warning-050);
+:scope [data-activity-status="pending"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "○";
+  border-style: dashed;
+}
+:scope [data-activity-status="skipped"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before,
+:scope [data-activity-status="cancelled"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "—";
+  border-style: dashed;
+}
+:scope [data-outcome-class="graph-fallback"],
+:scope [data-outcome="graph-fallback"],
+:scope [data-badge-kind="graph-fallback"],
+:scope [data-inspector-status="graph-fallback"],
+:scope [data-status-kind="graph-fallback"] {
+  color: var(--apc-warning);
+  background: var(--apc-warning-soft);
+  border-color: var(--apc-warning-border);
+  border-style: double;
+}
+:scope [data-activity-status="graph-fallback"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "◆";
+  border-radius: var(--apc-radius-compact);
 }
 :scope [data-badge-kind="failed"],
 :scope [data-badge-kind="timed-out"],
 :scope [data-inspector-status="failed"],
 :scope [data-inspector-status="timed-out"],
+:scope [data-status-kind="failed"],
+:scope [data-status-kind="timed-out"],
 :scope [data-activity-status="failed"],
 :scope [data-activity-status="timed-out"],
 :scope [data-current-run-status="failed"],
 :scope [data-current-run-status="timed-out"],
+:scope [data-stage-status="failed"],
+:scope [data-stage-status="timed-out"],
+:scope [data-run-status="failed"],
+:scope [data-run-status="timed-out"],
 :scope [data-outcome-class="optional-local"],
 :scope [data-outcome-class="selected-final-failure"],
 :scope [data-outcome-class="integrity-fatal"] {
-  color: var(--lumiverse-danger);
-  background: var(--lumiverse-danger-015);
-  border-color: var(--lumiverse-danger-050);
+  color: var(--apc-danger);
+  background: var(--apc-danger-soft);
+  border-color: var(--apc-danger-border);
+  border-style: solid;
+}
+:scope [data-activity-status="failed"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before,
+:scope [data-activity-status="timed-out"] > :where(.apc-run-status, .apc-stage-status, .apc-final-route-status)::before {
+  content: "×";
+  border-radius: var(--apc-radius-compact);
+}
+:scope [data-activity-status="completed"] .apc-stage-runs::before,
+:scope [data-activity-status="completed"] .apc-stage-runs::after,
+:scope .apc-run-card[data-activity-status="completed"]::after {
+  border-color: var(--apc-success-border);
+}
+:scope [data-activity-status="failed"] .apc-stage-runs::before,
+:scope [data-activity-status="failed"] .apc-stage-runs::after,
+:scope .apc-run-card[data-activity-status="failed"]::after {
+  border-color: var(--apc-danger-border);
 }
 :scope [data-apc-live-region],
-:scope [data-apc-thread-live-region] {
+:scope [data-apc-thread-live-region],
+:scope .apc-inspector-live-region {
   position: absolute;
-  width: 0.0625rem;
-  height: 0.0625rem;
+  inline-size: .0625rem;
+  block-size: .0625rem;
   overflow: hidden;
   clip: rect(0 0 0 0);
   clip-path: inset(50%);
   white-space: nowrap;
 }
-:scope button:focus-visible,
-:scope input:focus-visible,
-:scope select:focus-visible,
-:scope textarea:focus-visible {
-  outline: 0.125rem solid var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
-  outline-offset: 0.125rem;
+@media (hover: hover) {
+  :scope button:hover:not(:disabled):not([aria-disabled="true"]) {
+    color: var(--apc-text);
+    background: var(--apc-surface-hover);
+    border-color: var(--apc-border-strong);
+  }
+  :scope button[data-action="add-stage"]:hover:not(:disabled),
+  :scope button[data-action="create-graph"]:hover:not(:disabled),
+  :scope button[data-apc-approve-consent]:hover:not(:disabled) {
+    color: var(--lumiverse-primary-contrast, HighlightText);
+    background: var(--lumiverse-primary-hover, var(--apc-accent));
+    border-color: var(--apc-accent);
+  }
 }
-@media (max-width: 48rem) {
+@media (max-width: ${APC_EDITOR_COMPACT_MAX_INLINE_SIZE}) {
+  :scope {
+    grid-template-columns:
+      minmax(0, 12rem)
+      minmax(0, 1fr)
+      minmax(0, 16rem);
+    gap: .5rem;
+  }
+  :scope > [data-apc-panel] {
+    gap: .625rem;
+    padding: .625rem;
+  }
+  :scope .apc-inspector-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope .apc-inspector-field-value {
+    text-align: start;
+  }
+  :scope .apc-stage-runs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: ${APC_EDITOR_STACK_MAX_INLINE_SIZE}) {
   :scope {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -225,36 +1034,163 @@ export const APC_EDITOR_STYLE = `
       "graph"
       "inspector";
   }
-  :scope .apc-thread-card,
-  :scope .apc-stage-card,
-  :scope .apc-run-card,
-  :scope [data-apc-connection],
-  :scope [data-apc-workspace] {
-    padding: 0.6rem;
+  :scope > [data-apc-panel] {
+    inline-size: 100%;
+    max-block-size: none;
+    overflow: visible;
   }
-  :scope .apc-card-actions button {
+  :scope .apc-mode-toolbar-shell,
+  :scope .apc-mode-toolbar {
+    align-items: stretch;
+  }
+  :scope .apc-mode-toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    inline-size: 100%;
+  }
+  :scope .apc-mode-toolbar button {
+    inline-size: 100%;
+    text-align: center;
+  }
+  :scope .apc-graph-empty {
+    min-block-size: 0;
+    padding: 1rem;
+  }
+  :scope .apc-graph-empty > ol,
+  :scope .apc-graph-empty > .apc-card-actions:not([data-apc-unavailable-graph-actions]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope .apc-card-actions > button {
     flex: 1 1 10rem;
+  }
+  :scope .apc-consent-review {
+    grid-template-columns: minmax(0, 1fr);
+    inline-size: calc(100vw - 1rem);
+    max-block-size: calc(100dvh - 1rem);
+    padding: .75rem;
+  }
+  :scope .apc-consent-details {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope [data-apc-pane="workspace"] .apc-thread-workspace-pane,
+  :scope [data-apc-pane="workspace"] .apc-thread-workspace,
+  :scope [data-apc-pane="workspace"] .apc-host-loom-editor {
+    min-block-size: 24rem;
+  }
+}
+@container ${APC_EDITOR_CONTAINER_NAME} (max-width: ${APC_EDITOR_COMPACT_MAX_INLINE_SIZE}) {
+  :scope > [data-apc-panel] {
+    gap: .625rem;
+    padding: .625rem;
+  }
+  :scope .apc-inspector-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope .apc-inspector-field-value {
+    text-align: start;
+  }
+  :scope .apc-stage-runs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@container ${APC_EDITOR_CONTAINER_NAME} (max-width: ${APC_EDITOR_STACK_MAX_INLINE_SIZE}) {
+  :scope > [data-apc-panel] {
+    grid-area: auto;
+    grid-column: 1 / -1;
+    inline-size: 100%;
+    max-block-size: none;
+    overflow: visible;
+  }
+  :scope .apc-mode-toolbar-shell,
+  :scope .apc-mode-toolbar {
+    align-items: stretch;
+  }
+  :scope .apc-mode-toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    inline-size: 100%;
+  }
+  :scope .apc-mode-toolbar button {
+    inline-size: 100%;
+    text-align: center;
+  }
+  :scope .apc-graph-empty {
+    min-block-size: 0;
+    padding: 1rem;
+  }
+  :scope .apc-graph-empty > ol,
+  :scope .apc-graph-empty > .apc-card-actions:not([data-apc-unavailable-graph-actions]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope .apc-card-actions > button {
+    flex: 1 1 10rem;
+  }
+  :scope .apc-consent-review {
+    grid-template-columns: minmax(0, 1fr);
+    inline-size: calc(100vw - 1rem);
+    max-block-size: calc(100dvh - 1rem);
+    padding: .75rem;
+  }
+  :scope .apc-consent-details {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :scope [data-apc-pane="workspace"] .apc-thread-workspace-pane,
+  :scope [data-apc-pane="workspace"] .apc-thread-workspace,
+  :scope [data-apc-pane="workspace"] .apc-host-loom-editor {
+    min-block-size: 24rem;
   }
 }
 @media (forced-colors: active) {
-  :scope .apc-thread-card,
+  :scope,
+  :scope > [data-apc-panel],
+  :scope button,
+  :scope input,
+  :scope select,
+  :scope textarea,
+  :scope fieldset,
   :scope .apc-stage-card,
   :scope .apc-run-card,
-  :scope [data-apc-connection],
-  :scope [data-apc-workspace],
-  :scope .apc-graph-editor button,
-  :scope [data-apc-thread-editor] button {
-    border-color: CanvasText;
-  }
-  :scope .apc-inspector-badge,
-  :scope [data-inspector-status],
-  :scope [data-outcome-class],
+  :scope .apc-final-response,
+  :scope .apc-consent-review,
+  :scope .apc-inspector-section,
+  :scope .apc-inspector-error,
+  :scope .apc-inspector-stop-control,
+  :scope .apc-inspector-activity-error,
+  :scope .apc-inspector-error-message,
+  :scope .apc-inspector-stop-warning,
   :scope [data-activity-status],
-  :scope [data-current-run-status] {
+  :scope [data-current-run-status],
+  :scope [data-stage-status],
+  :scope [data-run-status],
+  :scope [data-status-kind],
+  :scope [data-badge-kind],
+  :scope [data-inspector-status],
+  :scope [data-outcome-class] {
     color: CanvasText;
     background: Canvas;
     border-color: CanvasText;
     forced-color-adjust: auto;
+  }
+  :scope [data-selected="true"],
+  :scope button[aria-checked="true"],
+  :scope button[aria-pressed="true"] {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+  }
+  :scope button:focus-visible,
+  :scope input:focus-visible,
+  :scope select:focus-visible,
+  :scope textarea:focus-visible,
+  :scope [tabindex]:focus-visible,
+  :scope summary:focus-visible {
+    outline-color: Highlight;
+    box-shadow: none;
+  }
+  :scope [data-apc-unavailable-graph-actions],
+  :scope [data-apc-unavailable-graph-action],
+  :scope .apc-graph-empty {
+    border-color: GrayText;
   }
 }
 `

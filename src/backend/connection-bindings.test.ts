@@ -5,7 +5,7 @@ import {
   ConnectionBindings,
   cloneDispatchDescriptor,
 } from "./connection-bindings"
-import type { ConnectionDispatchDescriptorDTO } from "lumiverse-spindle-types"
+import type { ConnectionDispatchDescriptorDTO, ConnectionProfileDTO } from "lumiverse-spindle-types"
 import { MAX_CONNECTION_SLOTS } from "../config/limits"
 import { AtomicJsonStore, type StorageAdapter } from "../state/atomic-json-store"
 import { buildBindingDocumentKey, buildBindingKey } from "../state/documents"
@@ -61,7 +61,12 @@ class MemoryStorage implements StorageAdapter {
   }
 }
 
-function profile(connectionId: string, owner = USER_ID) {
+type TestConnectionProfile = ConnectionProfileDTO & {
+  ownerUserId?: string
+  apiKey?: string
+}
+
+function profile(connectionId: string, owner = USER_ID): TestConnectionProfile {
   return {
     id: connectionId,
     name: "Bound connection",
@@ -95,6 +100,7 @@ async function setup(
   requestUserId = USER_ID,
   connectionOwner = USER_ID,
   storage = new MemoryStorage(),
+  listProfiles: TestConnectionProfile[] = [profile(CONNECTION_ID, connectionOwner)],
 ) {
   const store = new AtomicJsonStore(storage, { nonceGenerator: () => "a".repeat(32) })
   await store.initialize(HOST_ID)
@@ -109,17 +115,27 @@ async function setup(
     if (requestUserId !== connectionOwner) return null
     return descriptors.get(connectionId) ?? null
   }
+  const listUserIds: Array<string | undefined> = []
+  const getUserIds: Array<string | undefined> = []
+
   const service = new ConnectionBindings({
     store,
     connections: {
-      async get(connectionId: string) {
-        if (requestUserId !== connectionOwner) return null
+      async get(connectionId: string, userId?: string) {
+        getUserIds.push(userId)
+        if (userId === undefined) throw new Error("operator-scoped get requires an authenticated user ID")
+        if (requestUserId !== connectionOwner || userId !== requestUserId) return null
         if (descriptors.has(connectionId)) return profile(connectionId, connectionOwner)
         return null
       },
-      async list() {
-        return requestUserId === connectionOwner ? [profile(CONNECTION_ID, connectionOwner)] : []
+
+      async list(userId?: string) {
+        listUserIds.push(userId)
+        if (userId === undefined) throw new Error("operator-scoped list requires an authenticated user ID")
+        if (requestUserId !== connectionOwner || userId !== requestUserId) return []
+        return listProfiles
       },
+
       async resolveDispatch(connectionId) {
         return descriptorResolver(connectionId)
       },
@@ -128,6 +144,8 @@ async function setup(
   })
   return {
     store,
+    listUserIds,
+    getUserIds,
     service,
     setDescriptor: (value: ConnectionDispatchDescriptorDTO | null) => {
       if (value === null) {
@@ -177,6 +195,98 @@ describe("ConnectionBindings", () => {
     expect(listed.bindings[0]?.connectionId).toBe(SECOND_CONNECTION_ID)
     const unbound = await service.unbindSlot({ userId: USER_ID, presetId: PRESET_ID, slotId: SLOT_ID })
     expect(unbound.bindings).toHaveLength(0)
+  })
+
+  it("forwards the authenticated user ID to the operator-scoped host list without mutating bindings", async () => {
+    const { service, listUserIds } = await setup()
+    const before = await service.listBindings(USER_ID, PRESET_ID)
+
+    const listed = await service.listConnections(USER_ID)
+
+    expect(listed).toHaveLength(1)
+    expect(listUserIds).toEqual([USER_ID])
+    expect(await service.listBindings(USER_ID, PRESET_ID)).toEqual(before)
+  })
+
+  it("forwards the authenticated user ID to owned lookups during binding and resolution", async () => {
+    const { service, getUserIds } = await setup()
+
+    await service.bindSlot({
+      userId: USER_ID,
+      presetId: PRESET_ID,
+      slotId: SLOT_ID,
+      connectionId: CONNECTION_ID,
+      descriptor: descriptor(CONNECTION_ID, "revision-a"),
+    })
+    const resolved = await service.resolveSlot({
+      userId: USER_ID,
+      presetId: PRESET_ID,
+      slotId: SLOT_ID,
+    })
+
+    expect(resolved.connectionId).toBe(CONNECTION_ID)
+    expect(getUserIds).toEqual([USER_ID, USER_ID])
+  })
+
+  it("rejects invalid and callback-mismatched identities before granting connection ownership", async () => {
+    const invalid = await setup()
+    await expect(invalid.service.bindSlot({
+      userId: "",
+      presetId: PRESET_ID,
+      slotId: SLOT_ID,
+      connectionId: CONNECTION_ID,
+    })).rejects.toMatchObject<Partial<ConnectionBindingError>>({ code: "INVALID_IDENTITY" })
+    expect(invalid.getUserIds).toEqual([])
+
+    const mismatched = await setup()
+    await expect(mismatched.service.bindSlot({
+      userId: OTHER_USER_ID,
+      presetId: PRESET_ID,
+      slotId: SLOT_ID,
+      connectionId: CONNECTION_ID,
+    })).rejects.toMatchObject<Partial<ConnectionBindingError>>({ code: "CONNECTION_NOT_FOUND" })
+    expect(mismatched.getUserIds).toEqual([OTHER_USER_ID])
+  })
+
+  it("validates the authenticated user ID before invoking the host list", async () => {
+    const { service, listUserIds } = await setup()
+
+    await expect(service.listConnections("")).rejects.toMatchObject<Partial<ConnectionBindingError>>({
+      code: "INVALID_IDENTITY",
+    })
+    expect(listUserIds).toEqual([])
+  })
+
+  it("filters mismatched owner hints fail-closed while projecting safe DTOs", async () => {
+    const accepted = {
+      ...profile(CONNECTION_ID, USER_ID),
+      metadata: { ownerUserId: USER_ID, secret: "do-not-expose" },
+      apiKey: "do-not-expose",
+    }
+    const mismatchedTopLevel = {
+      ...profile(SECOND_CONNECTION_ID, OTHER_USER_ID),
+      metadata: { ownerUserId: USER_ID },
+    }
+    const mismatchedMetadata = {
+      ...profile(TEST_CONNECTION_IDS[0], USER_ID),
+      metadata: { ownerUserId: OTHER_USER_ID },
+    }
+    const { service } = await setup(
+      USER_ID,
+      USER_ID,
+      new MemoryStorage(),
+      [accepted, mismatchedTopLevel, mismatchedMetadata],
+    )
+
+    const listed = await service.listConnections(USER_ID)
+    const safe = listed[0]
+
+    expect(listed.map((connection) => connection.id)).toEqual([CONNECTION_ID])
+    expect(safe).toMatchObject({ id: CONNECTION_ID, metadata: {} })
+    expect(safe).not.toHaveProperty("apiKey")
+    expect(safe).not.toHaveProperty("ownerUserId")
+    expect(Object.isFrozen(safe)).toBe(true)
+    expect(Object.isFrozen(listed)).toBe(true)
   })
 
   it("rejects stale document revisions and duplicate destinations", async () => {

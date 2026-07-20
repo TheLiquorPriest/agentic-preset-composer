@@ -128,6 +128,139 @@ describe("safe execution inspector", () => {
     inspector.destroy()
   })
 
+  test("answers four execution questions with safe run, input, outcome, and delivery summaries", () => {
+    const loadedTraceKeys: string[] = []
+    let traceLists = 0
+    const inspector = mountInspector({
+      onStop: () => undefined,
+      onLoadTraces: () => {
+        traceLists += 1
+      },
+      onLoadTrace: key => {
+        loadedTraceKeys.push(key)
+      },
+    })
+    const privateTraceKey = "frontend-trace-private-key"
+    const hostilePreview = "<img src=x onerror=steal()> token=private-secret https://private.example.test/v1"
+    inspector.render(snapshot("running", {
+      stoppable: true,
+      inspectedRun: {
+        label: "Synthesize answer",
+        threadLabel: "Synthesizer",
+        stageLabel: "Compose",
+        status: "running",
+        optional: false,
+        dispatch: {
+          source: "slot",
+          status: "dispatched",
+          descriptor: {
+            label: "Approved research connection",
+            provider: "Safe provider",
+            model: "Safe model",
+          },
+        },
+        inputSources: [
+          {
+            kind: "earlier-output",
+            label: "Research summary",
+            roleLabel: "User",
+            required: true,
+            missingPolicy: "fail-graph",
+          },
+          {
+            kind: "main-context",
+            label: "Main context",
+            required: false,
+            missingPolicy: "omit-binding",
+          },
+        ],
+      },
+      stages: [{
+        label: "Research",
+        status: "completed",
+        runs: [{ label: "Researcher", status: "completed" }],
+      }, {
+        label: "Compose",
+        status: "running",
+        runs: [{ label: "Synthesizer", status: "running" }],
+      }],
+      finalRoute: { target: "thread", targetLabel: "Synthesizer" },
+      traces: [{
+        key: privateTraceKey,
+        status: "running",
+        eventCount: 1,
+        preview: hostilePreview,
+      }],
+      traceDetails: {
+        [privateTraceKey]: {
+          key: privateTraceKey,
+          status: "running",
+          eventCount: 1,
+          preview: hostilePreview,
+          events: [{
+            sequence: 1,
+            kind: "dispatch",
+            status: "running",
+            preview: hostilePreview,
+          }],
+        },
+      },
+    }))
+
+    const questions = [...inspector.element.querySelectorAll<HTMLElement>("[data-inspector-question]")]
+    expect(questions.map(node => node.dataset.inspectorQuestion)).toEqual([
+      "ran",
+      "inputs",
+      "happened",
+      "delivered",
+    ])
+    expect(questions.map(node => node.querySelector(":scope > h3")?.textContent)).toEqual([
+      "en:agentGraph.run",
+      "en:graph.inputs",
+      "en:inspector.outcome",
+      "en:inspector.finalRoute",
+    ])
+    expect(questions[0]?.textContent).toContain("Synthesize answer")
+    expect(questions[0]?.textContent).toContain("Approved research connection")
+    expect(questions[0]?.textContent).toContain("Safe provider")
+    expect(questions[1]?.querySelectorAll(".apc-inspector-source")).toHaveLength(2)
+    expect(questions[1]?.textContent).toContain("Research summary")
+    expect(questions[1]?.textContent).toContain("en:workspace.mainContext")
+    expect(questions[2]?.textContent).toContain("en:inspector.statusRunning")
+    expect(questions[3]?.textContent).toContain("Synthesizer")
+    expect(questions[3]?.textContent).toContain("en:terminal.finalizing")
+
+    const statusTokens = [...inspector.element.querySelectorAll<HTMLElement>(".apc-inspector-status-token")]
+    expect(statusTokens.length).toBeGreaterThan(0)
+    for (const token of statusTokens) {
+      expect(token.getAttribute("aria-label")).toBeTruthy()
+      expect(token.querySelector("[aria-hidden=true]")?.textContent).toBeTruthy()
+      expect(token.querySelector(".apc-inspector-status-label")?.textContent).toBe(token.getAttribute("aria-label"))
+    }
+    expect(inspector.element.querySelector("[data-status-kind=completed]")?.textContent).toContain("✓")
+    expect(inspector.element.querySelector("[data-status-kind=running]")?.textContent).toContain("●")
+
+    const traceList = actionButton(inspector, "load-traces")
+    const traceDetail = actionButton(inspector, "load-trace")
+    expect(traceList?.textContent).toBe("en:inspector.traces")
+    expect(traceDetail?.textContent).toBe("en:inspector.traceDetails")
+    expect(inspector.element.textContent).not.toContain("en:action.refreshConnections")
+    traceDetail?.click()
+    actionButton(inspector, "load-traces")?.click()
+    expect(traceLists).toBe(1)
+    expect(loadedTraceKeys).toEqual([privateTraceKey])
+
+    const text = inspector.element.textContent ?? ""
+    const html = inspector.element.outerHTML
+    expect(text).not.toContain(hostilePreview)
+    expect(html).not.toContain("private-secret")
+    expect(html).not.toContain("private.example.test")
+    expect(html).not.toContain(privateTraceKey)
+    expect(html).not.toContain("onerror")
+    expect(text).not.toContain("en:action.retry")
+    inspector.destroy()
+  })
+
   test("execution state overrides stale selection views and terminal dispatch comes from the final route", () => {
     const inspector = mountInspector({ onStop: () => undefined })
     inspector.render(snapshot("running", {
@@ -245,7 +378,7 @@ describe("safe execution inspector", () => {
           finalRoute: { target: "thread", targetLabel: "Synthesizer", delivered: true },
         }),
         outcome: "success",
-        expected: "en:terminal.ready",
+        expected: "en:outcome.success",
       },
       {
         snapshot: snapshot("failed", {
@@ -270,7 +403,7 @@ describe("safe execution inspector", () => {
           finalRoute: { target: "main", delivered: true, retainedCompletedRuns: 2 },
         }),
         outcome: "graph-fallback",
-        expected: "en:fallback.main",
+        expected: "en:fallback.title",
       },
     ]
 
@@ -289,6 +422,54 @@ describe("safe execution inspector", () => {
     }))
     expect(inspector.element.querySelector("[data-inspector-field=fallback-cause]")?.textContent).toContain("en:error.timeout")
     expect(inspector.element.querySelector("[data-inspector-field=main-fallback-result]")?.textContent).toContain("en:terminal.unavailable")
+    expect(inspector.element.querySelector("[data-inspector-field=final-delivery] [data-status-kind=failed]")?.textContent).toContain("en:terminal.unavailable")
+    inspector.destroy()
+  })
+
+  test("distinguishes failed work, amber Main fallback, and explicit final delivery without output bodies", () => {
+    const inspector = mountInspector()
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "graph-fallback", category: "timeout" },
+      inspectedRun: {
+        label: "Synthesizer",
+        status: "timed-out",
+        optional: false,
+        error: { category: "timeout" },
+        output: {
+          label: "Final response",
+          available: false,
+        },
+      },
+      activity: [
+        { status: "completed", runLabel: "Researcher" },
+        { status: "failed", runLabel: "Synthesizer", error: { category: "timeout" } },
+      ],
+      fallback: { category: "timeout", mainResponded: true },
+      finalRoute: {
+        target: "thread",
+        targetLabel: "Configured Synthesizer",
+        delivered: true,
+        retainedCompletedRuns: 1,
+      },
+    }))
+
+    const happened = inspector.element.querySelector<HTMLElement>("[data-inspector-question=happened]")
+    const delivered = inspector.element.querySelector<HTMLElement>("[data-inspector-question=delivered]")
+    expect(inspector.element.querySelector("[data-inspector-status=graph-fallback][data-outcome-class=graph-fallback]")?.textContent).toContain("en:fallback.title")
+    expect(inspector.element.querySelector("[data-current-run-status=timed-out]")).not.toBeNull()
+    expect(inspector.element.querySelector("[data-activity-status=completed] [data-status-kind=completed]")?.textContent).toContain("✓")
+    expect(inspector.element.querySelector("[data-activity-status=failed] [data-status-kind=failed]")?.textContent).toContain("×")
+    expect(happened?.querySelector("[data-outcome-class=graph-fallback]")).not.toBeNull()
+    expect(happened?.textContent).toContain("en:error.timeout")
+    expect(delivered?.querySelector("[data-outcome-class=graph-fallback]")).not.toBeNull()
+    expect(delivered?.querySelector("[data-status-kind=graph-fallback]")?.textContent).toContain("◆")
+    expect(delivered?.querySelector("[data-inspector-field=final-route]")?.textContent).toContain("Main")
+    expect(delivered?.textContent).not.toContain("Configured Synthesizer")
+    expect(delivered?.querySelector("[data-inspector-field=final-delivery] [data-status-kind=completed]")?.textContent).toContain("en:terminal.ready")
+    expect(delivered?.querySelector("[data-inspector-field=main-fallback-result] [data-status-kind=completed]")?.textContent).toContain("en:terminal.ready")
+    expect(inspector.element.querySelector("[data-inspector-section=output]")).toBeNull()
+    expect(inspector.element.textContent).not.toContain("en:action.retry")
     inspector.destroy()
   })
 
@@ -315,19 +496,34 @@ describe("safe execution inspector", () => {
     inspector.destroy()
   })
 
-  test("renders exactly one Stop action, invokes it once, and never renders Retry", () => {
+  test("gates one irreversible Stop action to stoppable nonterminal execution and never renders Retry", () => {
     let calls = 0
     const inspector = mountInspector({
       onStop: () => {
         calls += 1
       },
     })
+    const unavailable: readonly ExecutionInspectorSnapshot[] = [
+      snapshot("running", { stoppable: false }),
+      snapshot("running", { stoppable: true, terminal: true }),
+      snapshot("completed", { stoppable: true }),
+      snapshot("running", { stoppable: true, cancellation: { requested: true } }),
+    ]
+    for (const current of unavailable) {
+      inspector.render(current)
+      expect(actionButton(inspector, "stop")).toBeNull()
+    }
+
     inspector.render(snapshot("running", { stoppable: true }))
+    const stop = actionButton(inspector, "stop")
     expect(inspector.element.querySelectorAll("button[data-inspector-action=stop]")).toHaveLength(1)
+    expect(inspector.element.querySelector("[data-inspector-stop-control]")?.textContent).toContain("en:cancel.confirm")
+    expect(inspector.element.querySelector("[data-inspector-stop-control]")?.textContent).toContain("en:council.effects")
+    expect(stop?.getAttribute("aria-label")).toContain("en:council.effects")
     expect(inspector.element.querySelector("button[data-inspector-action=retry]")).toBeNull()
     expect(inspector.element.textContent).not.toContain("en:action.retry")
 
-    actionButton(inspector, "stop")?.click()
+    stop?.click()
     expect(calls).toBe(1)
     expect(actionButton(inspector, "stop")).toBeNull()
     inspector.element.dispatchEvent(new browser.window.Event("click", { bubbles: true }))
@@ -351,6 +547,36 @@ describe("safe execution inspector", () => {
     expect(testDocument.activeElement?.getAttribute("data-inspector-action")).toBe("stop")
     actionButton(inspector, "stop")?.click()
     expect(testDocument.activeElement).toBe(inspector.element)
+    inspector.destroy()
+  })
+
+  test("preserves trace-detail focus by opaque identity when summaries reorder", () => {
+    const inspector = mountInspector({ onLoadTrace: () => undefined })
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [
+        { key: "trace-first", status: "completed", eventCount: 1 },
+        { key: "trace-second", status: "failed", eventCount: 2 },
+      ],
+    }))
+    const buttons = inspector.element.querySelectorAll<HTMLButtonElement>(
+      "[data-inspector-action=load-trace]",
+    )
+    buttons[1]?.focus()
+    expect(testDocument.activeElement?.getAttribute("data-inspector-trace-position")).toBe("2")
+
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [
+        { key: "trace-second", status: "failed", eventCount: 2 },
+        { key: "trace-first", status: "completed", eventCount: 1 },
+      ],
+    }))
+
+    expect(testDocument.activeElement?.getAttribute("data-inspector-action")).toBe("load-trace")
+    expect(testDocument.activeElement?.getAttribute("data-inspector-trace-position")).toBe("1")
     inspector.destroy()
   })
 
@@ -475,6 +701,90 @@ describe("safe execution inspector", () => {
     await Promise.resolve()
     expect(uses).toBe(1)
     inspector.destroy()
+  })
+
+  test("offers one keyboard-accessible terminal return action without retrying or changing execution state", () => {
+    let returns = 0
+    let stops = 0
+    const inspector = mountInspector({
+      onBackToConfiguration: () => {
+        returns += 1
+      },
+      onStop: () => {
+        stops += 1
+      },
+      onLoadTrace: () => undefined,
+    })
+    const terminalCases: readonly ExecutionInspectorSnapshot[] = [
+      snapshot("completed", {
+        terminal: true,
+        outcome: { class: "success" },
+      }),
+      snapshot("failed", {
+        terminal: true,
+        outcome: { class: "selected-final-failure", category: "provider" },
+      }),
+      snapshot("completed", {
+        terminal: true,
+        outcome: { class: "graph-fallback", category: "timeout" },
+        fallback: { category: "timeout", mainResponded: true },
+      }),
+    ]
+
+    for (const terminal of terminalCases) {
+      inspector.render(terminal)
+      const actions = inspector.element.querySelectorAll<HTMLButtonElement>("[data-apc-back-to-configuration]")
+      expect(actions).toHaveLength(1)
+      expect(actions[0]?.tagName).toBe("BUTTON")
+      expect(actions[0]?.type).toBe("button")
+      expect(actions[0]?.textContent).toBe("en:action.backToConfiguration")
+      expect(actions[0]?.getAttribute("aria-label")).toBe("en:action.backToConfiguration")
+      expect(actionButton(inspector, "retry")).toBeNull()
+      expect(inspector.element.textContent).not.toContain("en:action.retry")
+    }
+
+    const unavailable: readonly ExecutionInspectorSnapshot[] = [
+      snapshot("running"),
+      snapshot("idle"),
+      snapshot("idle", { terminal: true }),
+    ]
+    for (const current of unavailable) {
+      inspector.render(current)
+      expect(inspector.element.querySelector("[data-apc-back-to-configuration]")).toBeNull()
+    }
+
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [{ key: "retained-trace", status: "completed", eventCount: 1 }],
+    }))
+    const back = inspector.element.querySelector<HTMLButtonElement>("[data-apc-back-to-configuration]")
+    expect(back).not.toBeNull()
+    expect(inspector.element.querySelectorAll(".apc-inspector-trace")).toHaveLength(1)
+
+    back?.click()
+    expect(returns).toBe(1)
+    expect(stops).toBe(0)
+    expect(inspector.element.dataset.status).toBe("completed")
+    expect(inspector.element.querySelectorAll(".apc-inspector-trace")).toHaveLength(1)
+
+    back?.focus()
+    expect(testDocument.activeElement).toBe(back)
+    back?.dispatchEvent(new browser.window.MouseEvent("click", {
+      bubbles: true,
+      detail: 0,
+    }))
+    expect(returns).toBe(2)
+    expect(stops).toBe(0)
+
+    inspector.destroy()
+    back?.click()
+    expect(returns).toBe(2)
+
+    const noCallback = mountInspector()
+    noCallback.render(snapshot("completed", { terminal: true, outcome: { class: "success" } }))
+    expect(noCallback.element.querySelector("[data-apc-back-to-configuration]")).toBeNull()
+    noCallback.destroy()
   })
 
   test("renders one localized title in every view and rerenders visible and aria text for the current locale", () => {

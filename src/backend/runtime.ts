@@ -508,32 +508,32 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
   let executionRegistrationOrder = 0
   const activeInterceptorCalls = new Set<Promise<LlmMessageDTO[] | InterceptorResultDTO>>()
   const epochs = new Map<string, number>()
-  const fallbackTombstones = new Map<string, Readonly<{ userId: string; presetId: string }>>()
-  const MAX_FALLBACK_TOMBSTONES_PER_SCOPE = 64
-  const MAX_FALLBACK_TOMBSTONES = 256
-  const claimFallbackTombstone = (userId: string, presetId: string, executionId: string): boolean => {
+  const replayTombstones = new Map<string, Readonly<{ userId: string; presetId: string }>>()
+  const MAX_REPLAY_TOMBSTONES_PER_SCOPE = 64
+  const MAX_REPLAY_TOMBSTONES = 256
+  const claimReplayTombstone = (userId: string, presetId: string, executionId: string): boolean => {
     const key = executionKey(userId, presetId, executionId)
-    if (fallbackTombstones.has(key)) return false
-    fallbackTombstones.set(key, Object.freeze({ userId, presetId }))
+    if (replayTombstones.has(key)) return false
+    replayTombstones.set(key, Object.freeze({ userId, presetId }))
     let scopeCount = 0
-    for (const tombstone of fallbackTombstones.values()) {
+    for (const tombstone of replayTombstones.values()) {
       if (tombstone.userId === userId && tombstone.presetId === presetId) scopeCount += 1
     }
-    while (scopeCount > MAX_FALLBACK_TOMBSTONES_PER_SCOPE) {
+    while (scopeCount > MAX_REPLAY_TOMBSTONES_PER_SCOPE) {
       let removed = false
-      for (const [candidateKey, tombstone] of fallbackTombstones) {
+      for (const [candidateKey, tombstone] of replayTombstones) {
         if (tombstone.userId !== userId || tombstone.presetId !== presetId || candidateKey === key) continue
-        fallbackTombstones.delete(candidateKey)
+        replayTombstones.delete(candidateKey)
         scopeCount -= 1
         removed = true
         break
       }
       if (!removed) break
     }
-    while (fallbackTombstones.size > MAX_FALLBACK_TOMBSTONES) {
-      const oldest = fallbackTombstones.keys().next().value
+    while (replayTombstones.size > MAX_REPLAY_TOMBSTONES) {
+      const oldest = replayTombstones.keys().next().value
       if (typeof oldest !== "string") break
-      fallbackTombstones.delete(oldest)
+      replayTombstones.delete(oldest)
     }
     return true
   }
@@ -548,6 +548,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
   let router: BackendEndpointRouter | undefined
   let registry: InterceptorRegistrationRegistry
   const terminalExecutions = new WeakSet<ActiveExecution>()
+  const replayEligibleExecutions = new WeakSet<ActiveExecution>()
   const cancellationSources = new Map<string, ActivityCancellationSource>()
   const emitExecutionActivity = (
     execution: ActiveExecution | Readonly<{ userId: string }>,
@@ -612,8 +613,8 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     let traceOwned = false
     let tombstoneClaimed = false
     try {
-      if (fallbackTombstones.has(key)) return
-      if (!claimFallbackTombstone(context.userId, presetId, context.generationId)) return
+      if (replayTombstones.has(key)) return
+      if (!claimReplayTombstone(context.userId, presetId, context.generationId)) return
       tombstoneClaimed = true
       const existing = getTrace(traces, context.userId, presetId, context.generationId)
       if (existing?.status !== "active" && existing?.entries.some(entry => entry.kind === "final-response-permission-missing")) return
@@ -629,7 +630,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         }),
       )
       if (!acquired.accepted) {
-        if (acquired.reason === "duplicate-execution") fallbackTombstones.delete(key)
+        if (acquired.reason === "duplicate-execution") replayTombstones.delete(key)
         else emitTerminal()
         return
       }
@@ -713,8 +714,8 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     let traceOwned = false
     let tombstoneClaimed = false
     try {
-      if (fallbackTombstones.has(key)) return
-      if (!claimFallbackTombstone(capturedContext.userId, presetId, executionId)) return
+      if (replayTombstones.has(key)) return
+      if (!claimReplayTombstone(capturedContext.userId, presetId, executionId)) return
       tombstoneClaimed = true
       const existing = getTrace(traces, capturedContext.userId, presetId, executionId)
       if (existing?.status !== "active" && existing?.entries.some(entry => entry.kind === "runtime-fallback")) return
@@ -733,7 +734,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         Object.freeze({ startedAt }),
       )
       if (!acquired.accepted) {
-        if (acquired.reason === "duplicate-execution") fallbackTombstones.delete(key)
+        if (acquired.reason === "duplicate-execution") replayTombstones.delete(key)
         else emitTerminal()
         return
       }
@@ -1035,6 +1036,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         dispatchRevision: resolved.revision,
         disclosureVersion: disclosure.disclosureVersion,
       })
+      replayEligibleExecutions.add(activeExecution)
     } catch {
       if (!current()) return cancellationRun()
       sequence.value += 1
@@ -1148,7 +1150,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     invocation.context = capturedContext
     const presetId = capturedContext.presetId
     if (presetId === null) return messages
-    if (fallbackTombstones.has(executionKey(capturedContext.userId, presetId, capturedContext.generationId))) return messages
+    if (replayTombstones.has(executionKey(capturedContext.userId, presetId, capturedContext.generationId))) return messages
     const parentMessages = snapshotParentMessages(messages)
     if (parentMessages === undefined) return messages
     const decoded = decodeApcPresetConfig(capturedContext.presetMetadata)
@@ -1299,9 +1301,9 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           graphCallbackFailure = true
           let tombstoneClaimed = false
           try {
-            tombstoneClaimed = claimFallbackTombstone(capturedContext.userId, presetId, capturedContext.generationId)
+            tombstoneClaimed = claimReplayTombstone(capturedContext.userId, presetId, capturedContext.generationId)
           } catch {
-            // A fallback tombstone is diagnostic protection only.
+            // A replay tombstone is diagnostic protection only.
           }
           if (tombstoneClaimed) {
             sequence.value += 1
@@ -1508,9 +1510,9 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     } catch {
       let tombstoneClaimed = false
       try {
-        tombstoneClaimed = claimFallbackTombstone(capturedContext.userId, presetId, capturedContext.generationId)
+        tombstoneClaimed = claimReplayTombstone(capturedContext.userId, presetId, capturedContext.generationId)
       } catch {
-        // A fallback tombstone is diagnostic protection only.
+        // A replay tombstone is diagnostic protection only.
       }
       if (tombstoneClaimed) {
         sequence.value += 1
@@ -1604,6 +1606,13 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         ...(cancellationSource === undefined ? {} : { cancellationSource }),
       })
       if (activeExecutions.get(activeKey) === activeExecution) {
+        if (!disposed && replayEligibleExecutions.has(activeExecution)) {
+          try {
+            claimReplayTombstone(capturedContext.userId, presetId, capturedContext.generationId)
+          } catch {
+            // Replay retention cannot replace terminal projection.
+          }
+        }
         try {
           finalizeTrace(traces, capturedContext.userId, presetId, capturedContext.generationId, {
             sequence: sequence.value + 1,
@@ -1687,6 +1696,11 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           outcome: "parent-cancel",
           cancellationSource: cancellationSourceFor(reason) ?? "disposed",
         })
+        try {
+          claimReplayTombstone(execution.userId, execution.presetId, execution.executionId)
+        } catch {
+          // Replay retention cannot replace disposal.
+        }
         const trace = getTrace(traces, execution.userId, execution.presetId, execution.executionId)
         try {
           finalizeTrace(traces, execution.userId, execution.presetId, execution.executionId, {
@@ -1721,7 +1735,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       router = undefined
       activeExecutions.clear()
       epochs.clear()
-      fallbackTombstones.clear()
+      replayTombstones.clear()
       started = false
       await Promise.allSettled([...activeInterceptorCalls])
       if (runtimeGlobals()[ACTIVE_RUNTIME_KEY] === runtime) delete runtimeGlobals()[ACTIVE_RUNTIME_KEY]

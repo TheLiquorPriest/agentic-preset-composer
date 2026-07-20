@@ -13,7 +13,14 @@ import type {
   ApcRunV1,
   ApcThreadV1,
 } from "../config/schema"
-import { MAX_BINDINGS_PER_RUN, MAX_CONNECTION_SLOTS } from "../config/limits"
+import {
+  MAX_BINDINGS_PER_RUN,
+  MAX_CONNECTION_SLOTS,
+  MAX_PARALLEL_WIDTH,
+  MAX_RUNS_PER_PIPELINE,
+  MAX_STAGES_PER_PIPELINE,
+} from "../config/limits"
+import { validateConfigForMode } from "../config/validate"
 import { SpindleCompatibilityError, validateSpindleHostDescriptor } from "../compat"
 import {
   createApcTranslator,
@@ -44,6 +51,7 @@ import {
   GRAPH_EDITOR_TAB_ID,
   GRAPH_EDITOR_TOOLBAR_ITEM_ID,
   type GraphEditorHandle,
+  type GraphEditorMutation,
   type GraphEditorSnapshot,
 } from "./graph-editor"
 import {
@@ -53,6 +61,7 @@ import {
   type ThreadEditorLoomBridge,
   type ThreadEditorRunBindingChange,
   type ThreadEditorRunChange,
+  type ThreadEditorSurface,
   type ThreadEditorSnapshot,
 } from "./thread-editor"
 import {
@@ -65,7 +74,7 @@ import {
   type InspectorOutcomeInput,
   type InspectorRunSnapshot,
 } from "./inspector"
-import { createLiveRegion } from "./accessibility"
+import { createLiveRegion, focusElement, type LiveRegion } from "./accessibility"
 import { createDomScope, type DomScope } from "./dom"
 import {
   installScopedStyles,
@@ -132,12 +141,14 @@ export type ApcAppOptions = Readonly<{
 type ThreadContinuationToken = Readonly<{
   thread: ThreadEditorController
   presetId: string
+  threadId: string
   contextAuthorityGeneration: number
   consentAuthorityGeneration: number
 }>
 type InspectorContinuationToken = Readonly<{
   inspector: ExecutionInspectorController
   presetId: string
+  executionKey: string
 }>
 export type ApcAppHandle = Readonly<{
   root: HTMLElement
@@ -388,7 +399,27 @@ function graphSnapshot(
   snapshot: ApcFrontendSnapshot,
   finalResponseAvailable: boolean,
   locale: string,
+  uiMutationLocked = false,
 ): GraphEditorSnapshot {
+  const execution: GraphEditorSnapshot["execution"] =
+    snapshot.execution.executionKey === null || !snapshot.execution.topologyApplicable
+      ? undefined
+      : {
+          terminal: snapshot.execution.terminal,
+          ...(snapshot.execution.outcome === "graph-fallback" ? { outcome: "graph-fallback" as const } : {}),
+          activity: snapshot.execution.topologyActivity.flatMap((item) => {
+            const { stageIndex, runIndex, status } = item
+            if (
+              typeof stageIndex !== "number" ||
+              !Number.isInteger(stageIndex) ||
+              stageIndex < 0 ||
+              typeof runIndex !== "number" ||
+              !Number.isInteger(runIndex) ||
+              runIndex < 0
+            ) return []
+            return [{ stageIndex, runIndex, status }]
+          }),
+        }
   return {
     presetId: snapshot.presetId,
     config: snapshot.config,
@@ -405,6 +436,8 @@ function graphSnapshot(
     stale: snapshot.stale,
     finalResponseAvailable,
     ...(finalResponseAvailable ? {} : { finalResponseBlockedReason: { key: "mode.threadFinalUnavailable" } }),
+    ...(execution === undefined ? {} : { execution }),
+    mutationLocked: snapshot.executionMutationLocked || uiMutationLocked,
     locale,
   }
 }
@@ -538,6 +571,7 @@ function threadSnapshot(
   boundConnectionKeys: ReadonlyMap<string, string>,
   contextAuthorityGeneration: number,
   consentAuthorityGeneration: number,
+  consentReviewOpen = false,
 ): ThreadEditorSnapshot | null {
   const presetId = snapshot.presetId
   const config = snapshot.config
@@ -550,17 +584,30 @@ function threadSnapshot(
 
   const selectedLocation = selectedRunLocation(snapshot)
   const selectedThreadId = selectionThreadId(snapshot)
+  const consentImpact = selectedThreadId === null
+    ? undefined
+    : activePipeline(config)?.stages.reduce((impact, stage) => {
+        for (const run of stage.runs) {
+          if (run.threadId !== selectedThreadId) continue
+          if (run.required) impact.requiredRuns += 1
+          else impact.optionalRuns += 1
+        }
+        return impact
+      }, { requiredRuns: 0, optionalRuns: 0 })
   const selectedRun = selectedLocation === undefined
     ? undefined
     : (() => {
         const earlier = earlierRunLocations(config, selectedLocation)
         const earlierIds = new Set(earlier.map((location) => location.run.id))
+        const position = runPositionProjection(config, selectedLocation)
         return {
           id: selectedLocation.run.id,
           threadId: selectedLocation.run.threadId,
           stageName: selectedLocation.pipeline.stages[selectedLocation.stageIndex]?.name ?? "",
           stageOrdinal: selectedLocation.stageIndex + 1,
           ordinal: selectedLocation.runIndex + 1,
+          positionTargets: position.targets,
+          ...(position.restricted ? { positionRestricted: true } : {}),
           required: selectedLocation.run.required,
           requiredLocked: requiredLockedRunIds(selectedLocation.pipeline).has(selectedLocation.run.id),
           timeoutMs: selectedLocation.run.timeoutMs,
@@ -582,8 +629,8 @@ function threadSnapshot(
             })),
         }
       })()
-  const executionLocked = snapshot.execution.executionKey !== null && !snapshot.execution.terminal
-  const mutationLocked = executionLocked || snapshot.busyReason === "save" || snapshot.stale
+  const mutationLocked = snapshot.executionMutationLocked
+  const readOnly = mutationLocked || snapshot.busyReason === "save" || snapshot.stale
 
   return {
     installationId: host.extensionInstallationId,
@@ -591,6 +638,8 @@ function threadSnapshot(
     contextAuthorityGeneration,
     consentAuthorityGeneration,
     selectedThreadId,
+    ...(consentImpact === undefined ? {} : { consentImpact }),
+    ...(consentReviewOpen ? { consentReviewOpen: true } : {}),
     ...(selectedRun === undefined ? {} : { selectedRun }),
     threads: config.threads.map((thread) => ({
       id: thread.id,
@@ -653,7 +702,8 @@ function threadSnapshot(
         ...(consent?.disclosure === undefined ? {} : { disclosure: clone(consent.disclosure) }),
       }
     }),
-    readOnly: mutationLocked || snapshot.blockedReasons.length > 0,
+    consentReviewOpen,
+    readOnly: readOnly || snapshot.blockedReasons.length > 0,
     mutationLocked,
     ...(snapshot.blockedReasons[0] === undefined ? {} : { blockedReason: snapshot.blockedReasons[0] }),
   }
@@ -666,13 +716,14 @@ function inspectorErrorCategory(category: ActivityErrorCategory | undefined): In
     case "provider": return "provider"
     case "timeout": return "timeout"
     case "dispatch": return "connection"
-    case "capacity":
     case "config":
+    case "capacity":
     case "assembly":
     case "tool": return "graph"
     case "unknown":
     case undefined: return "unknown"
   }
+  return "unknown"
 }
 
 function inspectorOutcome(
@@ -763,7 +814,7 @@ function inspectorTraceStatus(status: string | undefined):
   return undefined
 }
 
-function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): ExecutionInspectorSnapshot {
+export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): ExecutionInspectorSnapshot {
   const config = snapshot.config
   const execution = snapshot.execution
   const pipeline = activePipeline(config)
@@ -791,8 +842,9 @@ function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): Execut
   const selectedThread = config === null || selection?.kind !== "thread"
     ? undefined
     : config.threads.find((thread) => thread.id === selection.threadId)
+  const topologyIdentityApplicable = execution.executionKey === null || execution.topologyApplicable
   let finalRoute: ExecutionInspectorSnapshot["finalRoute"]
-  if (pipeline !== undefined) {
+  if (topologyIdentityApplicable && pipeline !== undefined) {
     const response = pipeline.finalResponse
     if (response.source === "main") {
       finalRoute = { target: "main" }
@@ -843,9 +895,11 @@ function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): Execut
     }
   }
 
-  const currentStage = pipeline?.stages[execution.stageIndex ?? -1]
-  const currentRun = currentStage?.runs[execution.runIndex ?? -1]
-  const currentThread = config?.threads.find((thread) => thread.id === currentRun?.threadId)
+  const currentStage = execution.topologyApplicable ? pipeline?.stages[execution.stageIndex ?? -1] : undefined
+  const currentRun = execution.topologyApplicable ? currentStage?.runs[execution.runIndex ?? -1] : undefined
+  const currentThread = execution.topologyApplicable
+    ? config?.threads.find((thread) => thread.id === currentRun?.threadId)
+    : undefined
   const source = currentThread === undefined
     ? undefined
     : config?.activeMode === "sequential" || currentThread.connectionSlotId === undefined
@@ -860,22 +914,59 @@ function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): Execut
   const currentDispatch = source === undefined
     ? undefined
     : { source, ...(descriptor === undefined ? {} : { descriptor }) }
+  const currentLocation: RunLocation | undefined =
+    execution.topologyApplicable &&
+      pipeline !== undefined &&
+      currentStage !== undefined &&
+      currentRun !== undefined &&
+      currentThread !== undefined &&
+      execution.stageIndex !== undefined &&
+      execution.runIndex !== undefined
+      ? {
+          pipeline,
+          stageIndex: execution.stageIndex,
+          runIndex: execution.runIndex,
+          run: currentRun,
+          thread: currentThread,
+        }
+      : undefined
+  const currentActivity = execution.topologyApplicable
+    ? execution.topologyActivity.findLast(
+        (item) => item.stageIndex === execution.stageIndex && item.runIndex === execution.runIndex,
+      )
+    : undefined
+  const currentActivityOwnsError = currentActivity?.status === "failed" &&
+    currentActivity.errorCategory !== undefined
+  const inspectedRun = currentLocation === undefined || config === null
+    ? undefined
+    : {
+        ...inspectorRun(config, currentLocation, t),
+        status: currentActivity?.status ?? "pending",
+        ...(currentDispatch === undefined ? {} : { dispatch: currentDispatch }),
+        ...(currentActivityOwnsError
+          ? { error: { category: inspectorErrorCategory(currentActivity?.errorCategory) } }
+          : {}),
+      }
   const cancellationReason = execution.cancellationSource === "user" ||
       execution.cancellationSource === "stop" ||
       execution.cancellationSource === "replacement" ||
       execution.cancellationSource === "timeout"
     ? execution.cancellationSource
     : undefined
-  const canUseMainFallback = execution.terminal &&
+  const canUseMainFallback = execution.topologyApplicable &&
+    execution.terminal &&
     execution.outcome === "graph-fallback" &&
     pipeline?.finalResponse.source === "thread"
-  const executionStageCount = execution.stageCount ?? pipeline?.stages.length
-
+  const executionStageCount = execution.topologyApplicable
+    ? execution.stageCount ?? pipeline?.stages.length
+    : undefined
+  const progressStageIndex = execution.topologyApplicable ? execution.stageIndex : undefined
 
   return {
     view: "execution",
     status: execution.status,
     terminal: execution.terminal,
+    ...(inspectedRun === undefined ? {} : { inspectedRun }),
     ...(execution.usage === undefined ? {} : { usage: execution.usage }),
     ...(execution.outcome === undefined
       ? {}
@@ -883,14 +974,14 @@ function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): Execut
     ...(execution.errorCategory === undefined
       ? {}
       : { error: { category: inspectorErrorCategory(execution.errorCategory) } }),
-    ...(execution.stageIndex === undefined &&
+    ...(progressStageIndex === undefined &&
       executionStageCount === undefined &&
       execution.completedRuns === undefined &&
       execution.totalRuns === undefined
       ? {}
       : {
           progress: {
-            ...(execution.stageIndex === undefined ? {} : { stageIndex: execution.stageIndex + 1 }),
+            ...(progressStageIndex === undefined ? {} : { stageIndex: progressStageIndex + 1 }),
             ...(executionStageCount === undefined ? {} : { stageCount: executionStageCount }),
             ...(execution.completedRuns === undefined ? {} : { completedRuns: execution.completedRuns }),
             ...(execution.totalRuns === undefined ? {} : { totalRuns: execution.totalRuns }),
@@ -915,7 +1006,11 @@ function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate): Execut
     ...(currentDispatch === undefined ? {} : { currentDispatch }),
     ...(execution.activity.length === 0
       ? {}
-      : { activity: execution.activity.map((item) => inspectorActivity(config, pipeline, item)) }),
+      : {
+          activity: execution.activity.map((item) => execution.topologyApplicable
+            ? inspectorActivity(config, pipeline, item)
+            : inspectorActivity(null, undefined, item)),
+        }),
     ...traceView,
     ...(finalRoute === undefined ? {} : { finalRoute }),
     ...(canUseMainFallback ? { canUseMainFallback: true } : {}),
@@ -949,13 +1044,14 @@ function updateRun(
   }
 }
 
+
 function changeRunBinding(
   config: Readonly<ApcPresetConfigV1>,
   runId: string,
   bindingId: string,
   change: ThreadEditorRunBindingChange,
 ): ApcPresetConfigV1 {
-  return updateRun(config, runId, (run, location) => {
+  const candidate = updateRun(config, runId, (run, location) => {
     const entry = outputBindings(run).find((candidate) => candidate.key === bindingId)
     if (entry === undefined) return run
     if (
@@ -975,11 +1071,19 @@ function changeRunBinding(
           }),
     }
   })
+  try {
+    return validateConfigForMode(candidate, candidate.activeMode).valid
+      ? candidate
+      : config as ApcPresetConfigV1
+  } catch {
+    return config as ApcPresetConfigV1
+  }
 }
 
 function addRunBinding(config: Readonly<ApcPresetConfigV1>, runId: string): ApcPresetConfigV1 {
-  return updateRun(config, runId, (run, location) => {
-    const source = earlierRunLocations(config as ApcPresetConfigV1, location)[0]
+  const candidate = updateRun(config, runId, (run, location) => {
+    const earlier = earlierRunLocations(config as ApcPresetConfigV1, location)
+    const source = earlier.find((candidate) => candidate.run.required) ?? earlier[0]
     if (run.inputs.length >= MAX_BINDINGS_PER_RUN) return run
     if (source === undefined) return run
     return {
@@ -990,11 +1094,18 @@ function addRunBinding(config: Readonly<ApcPresetConfigV1>, runId: string): ApcP
           source: "output",
           runId: source.run.id,
           role: "user",
-          onMissing: "fail-graph",
+          onMissing: source.run.required ? "fail-graph" : "omit-binding",
         },
       ],
     }
   })
+  try {
+    return validateConfigForMode(candidate, candidate.activeMode).valid
+      ? candidate
+      : config as ApcPresetConfigV1
+  } catch {
+    return config as ApcPresetConfigV1
+  }
 }
 
 function removeRunBinding(
@@ -1010,12 +1121,154 @@ function removeRunBinding(
   })
 }
 
+type RunPosition = NonNullable<ThreadEditorRunChange["position"]>
+type RunPositionProjection = Readonly<{
+  targets: readonly Readonly<RunPosition & { stageName: string }>[]
+  restricted: boolean
+}>
+
+function runPositionProjection(
+  config: ApcPresetConfigV1,
+  location: RunLocation,
+): RunPositionProjection {
+  const plausible = config.activeMode === "sequential"
+    ? location.pipeline.stages.map((stage, stageIndex) => ({
+        stageOrdinal: stageIndex + 1,
+        runOrdinal: 1,
+        stageName: stage.name,
+      }))
+    : config.activeMode === "parallel"
+      ? location.pipeline.stages.flatMap((stage, stageIndex) => {
+          const positions = stageIndex === location.stageIndex
+            ? Math.min(stage.runs.length, MAX_PARALLEL_WIDTH)
+            : stage.runs.length >= MAX_PARALLEL_WIDTH
+              ? 0
+              : stage.runs.length + 1
+          return Array.from({ length: positions }, (_, runIndex) => ({
+            stageOrdinal: stageIndex + 1,
+            runOrdinal: runIndex + 1,
+            stageName: stage.name,
+          }))
+        })
+      : []
+  let restricted = false
+  const targets = plausible.filter((target) => {
+    const current = target.stageOrdinal === location.stageIndex + 1 &&
+      target.runOrdinal === location.runIndex + 1
+    if (current) return true
+    if (moveRun(config, location.run.id, target) !== config) return true
+    restricted = true
+    return false
+  })
+  return { targets, restricted }
+}
+
+function bindingsReferenceEarlierRuns(pipeline: ApcPipelineV1): boolean {
+  const stageByRun = new Map<string, number>()
+  pipeline.stages.forEach((stage, stageIndex) => {
+    stage.runs.forEach((run) => stageByRun.set(run.id, stageIndex))
+  })
+  return pipeline.stages.every((stage, stageIndex) => stage.runs.every((run) =>
+    run.inputs.every((input) => {
+      if (input.source !== "output") return true
+      const sourceStageIndex = stageByRun.get(input.runId)
+      return sourceStageIndex !== undefined && sourceStageIndex < stageIndex
+    })
+  ))
+}
+
+function moveRun(
+  config: Readonly<ApcPresetConfigV1>,
+  runId: string,
+  position: RunPosition,
+): ApcPresetConfigV1 {
+  if (
+    config.activeMode === "single" ||
+    !Number.isInteger(position.stageOrdinal) ||
+    !Number.isInteger(position.runOrdinal)
+  ) return config as ApcPresetConfigV1
+  const pipeline = config.pipelines[config.activeMode]
+  if (
+    pipeline === undefined ||
+    pipeline.stages.length === 0 ||
+    pipeline.stages.length > MAX_STAGES_PER_PIPELINE ||
+    pipeline.stages.reduce((count, stage) => count + stage.runs.length, 0) > MAX_RUNS_PER_PIPELINE
+  ) return config as ApcPresetConfigV1
+  const location = findRun(config as ApcPresetConfigV1, runId, pipeline)
+  const targetStageIndex = position.stageOrdinal - 1
+  if (
+    location === undefined ||
+    targetStageIndex < 0 ||
+    targetStageIndex >= pipeline.stages.length
+  ) return config as ApcPresetConfigV1
+
+  let stages: ApcPipelineV1["stages"]
+  if (config.activeMode === "sequential") {
+    if (
+      position.runOrdinal !== 1 ||
+      pipeline.stages.some((stage) => stage.runs.length !== 1) ||
+      targetStageIndex === location.stageIndex
+    ) return config as ApcPresetConfigV1
+    const reordered = [...pipeline.stages]
+    const [sourceStage] = reordered.splice(location.stageIndex, 1)
+    if (sourceStage === undefined) return config as ApcPresetConfigV1
+    reordered.splice(targetStageIndex, 0, sourceStage)
+    stages = reordered
+  } else {
+    const targetStage = pipeline.stages[targetStageIndex]
+    const sourceStage = pipeline.stages[location.stageIndex]
+    if (
+      targetStage === undefined ||
+      sourceStage === undefined ||
+      (sourceStage.runs.length === 1 && targetStageIndex !== location.stageIndex)
+    ) return config as ApcPresetConfigV1
+    const targetLength = targetStage.runs.length + (targetStageIndex === location.stageIndex ? 0 : 1)
+    if (
+      position.runOrdinal < 1 ||
+      (
+        targetStageIndex !== location.stageIndex &&
+        targetStage.runs.some((run) => run.threadId === location.run.threadId)
+      ) ||
+      position.runOrdinal > targetLength ||
+      targetLength > MAX_PARALLEL_WIDTH ||
+      (
+        targetStageIndex === location.stageIndex &&
+        position.runOrdinal === location.runIndex + 1
+      )
+    ) return config as ApcPresetConfigV1
+    const withoutRun = pipeline.stages.map((stage, stageIndex) => stageIndex === location.stageIndex
+      ? { ...stage, runs: stage.runs.filter((run) => run.id !== runId) }
+      : stage)
+    stages = withoutRun.map((stage, stageIndex) => {
+      if (stageIndex !== targetStageIndex) return stage
+      const runs = [...stage.runs]
+      runs.splice(position.runOrdinal - 1, 0, location.run)
+      return { ...stage, runs }
+    })
+  }
+
+  const candidatePipeline: ApcPipelineV1 = { ...pipeline, stages }
+  if (!bindingsReferenceEarlierRuns(candidatePipeline)) return config as ApcPresetConfigV1
+  const candidateConfig: ApcPresetConfigV1 = {
+    ...config,
+    pipelines: {
+      ...config.pipelines,
+      [config.activeMode]: candidatePipeline,
+    },
+  }
+  return validateConfigForMode(candidateConfig, config.activeMode).valid
+    ? candidateConfig
+    : config as ApcPresetConfigV1
+}
+
 function changeRun(
   config: Readonly<ApcPresetConfigV1>,
   runId: string,
   change: ThreadEditorRunChange,
 ): ApcPresetConfigV1 {
-  return updateRun(config, runId, (run) => ({
+  const positioned = change.position === undefined ? config as ApcPresetConfigV1 : moveRun(config, runId, change.position)
+  if (change.position !== undefined && positioned === config) return config as ApcPresetConfigV1
+  return updateRun(positioned, runId, (run) => ({
     ...run,
     ...(change.required === undefined ? {} : { required: change.required }),
     ...(change.timeoutMs === undefined ? {} : { timeoutMs: change.timeoutMs }),
@@ -1061,8 +1314,8 @@ class ApcAppImpl implements ApcAppHandle {
   readonly #scope: DomScope
   readonly #styles: ScopedStylesheet
   readonly #toolbarStyles: ScopedStylesheet
-  readonly #tabPanel: HTMLElement
-  readonly #threadPanel: HTMLElement
+  readonly #navigationPanel: HTMLElement
+  readonly #workspacePanel: HTMLElement
   readonly #inspectorPanel: HTMLElement
   readonly #state: ApcFrontendStore
   readonly #loom: ThreadEditorLoomBridge
@@ -1075,10 +1328,17 @@ class ApcAppImpl implements ApcAppHandle {
   #modeTransitionOperation: ModeTransitionOperation | null = null
   #modeSurfaceGeneration = 0
   #modeSurfaceProjection: ModeSurfaceProjection | null = null
-  #graph: GraphEditorHandle | null = null
-  #thread: ThreadEditorController | null = null
+  #graphNavigation: GraphEditorHandle | null = null
+  #graphTopology: GraphEditorHandle | null = null
+  #threadConfiguration: ThreadEditorController | null = null
+  #threadWorkspace: ThreadEditorController | null = null
   #inspector: ExecutionInspectorController | null = null
   #presetId: string | null = null
+  #workspaceThreadId: string | null = null
+  #dismissedTerminalExecutionKey: string | null = null
+  #focusConfigurationAfterInspector = false
+  #consentReviewOpen = false
+  #consentReviewSelectionKey: string | null = null
   #unsubscribeState: (() => void) | null = null
   #unsubscribeLocale: (() => void) | null = null
   #unsubscribeEvents: Array<() => void> = []
@@ -1113,26 +1373,48 @@ class ApcAppImpl implements ApcAppHandle {
     this.#state = state
     this.#loom = {
       mountLoomBlockEditor: (target, loomOptions) => {
+        if (!this.#activity.active || this.#disposed) {
+          throw new Error("APC frontend authority was lost before Loom mount")
+        }
         const handle = ctx.components.mountLoomBlockEditor(target, loomOptions)
         try {
           validateLoomHandle(handle)
-          return handle
         } catch (error) {
           disposeMalformedLoomHandle(handle, target)
           throw error
         }
+        if (!this.#activity.active || this.#disposed) {
+          disposeMalformedLoomHandle(handle, target)
+          throw new Error("APC frontend authority was lost during Loom mount")
+        }
+        return handle
       },
     }
     this.#toolbarStyles = toolbarStyles
     this.#finalResponseAvailable = finalResponseAvailable
-    this.#tabPanel = scope.createElement("div", { "data-apc-panel": "graph" })
-    this.#threadPanel = scope.createElement("div", { "data-apc-panel": "threads" })
-    this.#inspectorPanel = scope.createElement("div", { "data-apc-panel": "inspector" })
+    this.#navigationPanel = scope.createElement("div", {
+      "data-apc-panel": "threads",
+      "data-apc-pane": "navigation",
+      role: "region",
+      "aria-label": t("graph.threadNavigation"),
+    })
+    this.#workspacePanel = scope.createElement("div", {
+      "data-apc-panel": "graph",
+      "data-apc-pane": "workspace",
+      role: "region",
+      "aria-label": t("graph.stages"),
+    })
+    this.#inspectorPanel = scope.createElement("div", {
+      "data-apc-panel": "inspector",
+      "data-apc-pane": "configuration",
+      role: "region",
+      "aria-label": t("threadEditor.ariaLabel"),
+    })
     toolbar.root.replaceChildren()
     toolbar.root.setAttribute("data-apc-toolbar", "true")
     toolbar.root.setAttribute("aria-label", t("agentGraph.title"))
-    scope.append(this.#tabPanel)
-    scope.append(this.#threadPanel)
+    scope.append(this.#navigationPanel)
+    scope.append(this.#workspacePanel)
     scope.append(this.#inspectorPanel)
     tab.root.append(scope.element)
   }
@@ -1154,6 +1436,7 @@ class ApcAppImpl implements ApcAppHandle {
     let state: ApcFrontendStore | null = null
     let pendingFinalResponseGranted: boolean | undefined
     let app: ApcAppImpl | null = null
+    let readyCalled = false
     const activity: ApcActivityGate = { active: true }
     const setupUnsubscribeEvents: Array<() => void> = []
     const removeSetupEventListeners = (): void => {
@@ -1263,10 +1546,24 @@ class ApcAppImpl implements ApcAppHandle {
         ),
       )
       app = createdApp
+      if (!activity.active) throw new Error("APC frontend setup was cancelled while constructing the app")
       createdApp.#unsubscribeEvents.push(...setupUnsubscribeEvents.splice(0))
       createdApp.mount()
-      createdApp.subscribeLocale(ctx.locale.subscribe(() => createdApp.localeChanged()))
+      if (!activity.active) throw new Error("APC frontend setup was cancelled during mount")
+      const localeUnsubscribe = ctx.locale.subscribe(() => createdApp.localeChanged())
+      if (!activity.active || createdApp.#disposed) {
+        try {
+          localeUnsubscribe()
+        } catch {
+          // Preserve the lifecycle failure while still releasing the late subscription.
+        }
+        throw new Error("APC frontend setup was cancelled during locale subscription")
+      }
+      createdApp.subscribeLocale(localeUnsubscribe)
       const initial = editor.getState()
+      if (!activity.active || createdApp.#disposed) {
+        throw new Error("APC frontend setup was cancelled while reading the initial preset")
+      }
       if (initial.presetId !== null) {
         try {
           await appState.hydrate(initial.presetId)
@@ -1276,7 +1573,10 @@ class ApcAppImpl implements ApcAppHandle {
       }
       if (!activity.active) throw new Error("APC frontend setup was cancelled before readiness")
       createdApp.render(appState.getSnapshot())
+      if (!activity.active) throw new Error("APC frontend setup was cancelled while rendering")
+      readyCalled = true
       ctx.ready()
+      if (!activity.active) throw new Error("APC frontend setup was cancelled during readiness")
       return createdApp
     } catch (error) {
       activity.active = false
@@ -1300,10 +1600,12 @@ class ApcAppImpl implements ApcAppHandle {
           }
         }
       }
-      try {
-        ctx.ready()
-      } catch {
-        // The host may already have failed the startup gate.
+      if (!readyCalled) {
+        try {
+          ctx.ready()
+        } catch {
+          // The host may already have failed the startup gate.
+        }
       }
       throw error
     }
@@ -1411,21 +1713,30 @@ class ApcAppImpl implements ApcAppHandle {
   }
 
   private captureInspectorContinuation(): InspectorContinuationToken | null {
-    const presetId = this.#state.getSnapshot().presetId
-    if (this.#disposed || !this.#activity.active || this.#inspector === null || presetId === null) return null
-    return { inspector: this.#inspector, presetId }
+    const snapshot = this.#state.getSnapshot()
+    const executionKey = snapshot.execution.executionKey
+    if (
+      this.#disposed ||
+      !this.#activity.active ||
+      this.#inspector === null ||
+      snapshot.presetId === null ||
+      executionKey === null
+    ) return null
+    return { inspector: this.#inspector, presetId: snapshot.presetId, executionKey }
   }
 
   private isInspectorContinuationActive(token: InspectorContinuationToken): boolean {
     return !this.#disposed &&
       this.#activity.active &&
       this.#inspector === token.inspector &&
-      this.#state.getSnapshot().presetId === token.presetId
+      this.#state.getSnapshot().presetId === token.presetId &&
+      this.#state.getSnapshot().execution.executionKey === token.executionKey
   }
 
   private activateModeSurface(mode: string | undefined): void {
     if (this.#disposed || !this.#activity.active) return
     this.#toolbar.setVisible(true)
+    if (this.#disposed || !this.#activity.active) return
     if (mode === "single") {
       this.#ctx.ui.presetEditor.extension.activateBuiltinTab("blocks")
     } else if (mode === "sequential" || mode === "parallel") {
@@ -1433,24 +1744,49 @@ class ApcAppImpl implements ApcAppHandle {
     }
   }
 
-  private captureThreadContinuation(): ThreadContinuationToken | null {
-    if (this.#disposed || !this.#activity.active || this.#thread === null || this.#presetId === null) return null
+  private captureThreadContinuation(thread: ThreadEditorController | null): ThreadContinuationToken | null {
+    const snapshot = this.#state.getSnapshot()
+    const threadId = selectionThreadId(snapshot)
+    if (
+      this.#disposed ||
+      !this.#activity.active ||
+      thread === null ||
+      this.#presetId === null ||
+      threadId === null ||
+      snapshot.presetId !== this.#presetId ||
+      (this.#threadConfiguration !== thread && this.#threadWorkspace !== thread)
+    ) return null
     return {
-      thread: this.#thread,
+      thread,
       presetId: this.#presetId,
+      threadId,
       contextAuthorityGeneration: this.#threadContextAuthorityGeneration,
       consentAuthorityGeneration: this.#threadConsentAuthorityGeneration,
+    }
+  }
+
+  private beginThreadContextMutation(
+    thread: ThreadEditorController | null,
+    expectedThreadId?: string,
+  ): ThreadContinuationToken | null {
+    const token = this.captureThreadContinuation(thread)
+    if (token === null || (expectedThreadId !== undefined && token.threadId !== expectedThreadId)) return null
+    this.#threadContextAuthorityGeneration += 1
+    return {
+      ...token,
+      contextAuthorityGeneration: this.#threadContextAuthorityGeneration,
     }
   }
 
   private isThreadContinuationActive(token: ThreadContinuationToken): boolean {
     return !this.#disposed &&
       this.#activity.active &&
-      this.#thread === token.thread &&
+      (this.#threadConfiguration === token.thread || this.#threadWorkspace === token.thread) &&
       this.#presetId === token.presetId &&
       this.#threadContextAuthorityGeneration === token.contextAuthorityGeneration &&
       this.#threadConsentAuthorityGeneration === token.consentAuthorityGeneration &&
-      this.#state.getSnapshot().presetId === token.presetId
+      this.#state.getSnapshot().presetId === token.presetId &&
+      selectionThreadId(this.#state.getSnapshot()) === token.threadId
   }
 
   private async resolveSelectedConsent(
@@ -1502,18 +1838,52 @@ class ApcAppImpl implements ApcAppHandle {
     this.renderThread(this.#state.getSnapshot())
   }
 
+  private openLoomWorkspace(threadId: string): void {
+    const snapshot = this.#state.getSnapshot()
+    const thread = snapshot.config?.threads.find((candidate) => candidate.id === threadId)
+    if (
+      this.#disposed ||
+      this.#consentReviewOpen ||
+      thread?.workspaceSource !== "native-blocks"
+    ) return
+    this.#workspaceThreadId = threadId
+    this.#state.setSelection({ kind: "thread", threadId })
+  }
+
+  private closeLoomWorkspace(): void {
+    if (this.#workspaceThreadId === null) return
+    this.#workspaceThreadId = null
+    this.render(this.#state.getSnapshot())
+  }
+
   mount(): void {
-    this.#toolbar.setVisible(true)
-    this.#unsubscribeEvents.push(
-      this.#tab.onActivate(() => {
-        if (!this.#disposed) this.#toolbar.setVisible(true)
-      }),
-    )
+    let tabActivationUnsubscribe: (() => void) | null = null
+    let liveRegion: LiveRegion | null = null
+    let localNavigation: GraphEditorHandle | null = null
+    let localTopology: GraphEditorHandle | null = null
+    let localStateUnsubscribe: (() => void) | null = null
+    try {
+      this.#toolbar.setVisible(true)
+      if (this.#disposed || !this.#activity.active) {
+        throw new Error("APC frontend setup was cancelled during toolbar visibility")
+      }
+      tabActivationUnsubscribe = this.#tab.onActivate(() => {
+        if (this.#disposed || !this.#activity.active) return
+        this.#toolbar.setVisible(true)
+      })
+      if (this.#disposed || !this.#activity.active) {
+        tabActivationUnsubscribe?.()
+        tabActivationUnsubscribe = null
+        throw new Error("APC frontend setup was cancelled during tab activation registration")
+      }
+      this.#unsubscribeEvents.push(tabActivationUnsubscribe)
+      tabActivationUnsubscribe = null
     const interceptModeClick = (event: Event): void => {
       const elementConstructor = this.#document.defaultView?.Element
       const target = event.target
       if (elementConstructor === undefined || !(target instanceof elementConstructor)) return
       const control = target.closest<HTMLElement>('[data-action="select-mode"]')
+      if (this.#consentReviewOpen) return
       if (control === null || !this.#toolbar.root.contains(control)) return
       if (
         (control.hasAttribute("disabled") || control.getAttribute("aria-disabled") === "true") &&
@@ -1534,34 +1904,87 @@ class ApcAppImpl implements ApcAppHandle {
       event.preventDefault()
       event.stopImmediatePropagation()
       this.configChanged(snapshot.config, mode)
+      this.#toolbar.root.querySelector<HTMLElement>(
+        `[data-action="select-mode"][data-mode="${mode}"]`,
+      )?.focus()
     }
+    const interceptModeKey = (event: Event): void => {
+      const keyboard = event as KeyboardEvent
+      const elementConstructor = this.#document.defaultView?.Element
+      const target = event.target
+      if (elementConstructor === undefined || !(target instanceof elementConstructor)) return
+      const control = target.closest<HTMLElement>('[data-action="select-mode"]')
+      if (this.#consentReviewOpen || control === null || !this.#toolbar.root.contains(control)) return
+      const snapshot = this.#state.getSnapshot()
+      if (
+        !snapshot.busy ||
+        snapshot.busyReason !== "save" ||
+        snapshot.config === null ||
+        snapshot.stale ||
+        snapshot.blockedReasons.length > 0
+      ) return
+      const mode = control.dataset.mode
+      if (mode !== "single" && mode !== "sequential" && mode !== "parallel") return
+      let nextMode: ApcMode | null = mode
+      if (keyboard.key === "ArrowRight" || keyboard.key === "ArrowDown" ||
+        keyboard.key === "ArrowLeft" || keyboard.key === "ArrowUp") {
+        const direction = keyboard.key === "ArrowRight" || keyboard.key === "ArrowDown" ? 1 : -1
+        const modes: readonly ApcMode[] = ["single", "sequential", "parallel"]
+        const index = modes.indexOf(mode)
+        nextMode = null
+        for (let offset = 1; offset <= modes.length; offset += 1) {
+          const candidate = modes[(index + direction * offset + modes.length * 2) % modes.length]
+          const availability = snapshot.modeAvailability[candidate]
+          if (availability.supported && availability.valid) {
+            nextMode = candidate
+            break
+          }
+        }
+      } else if (keyboard.key !== " " && keyboard.key !== "Enter") {
+        return
+      }
+      const availability = nextMode === null ? undefined : snapshot.modeAvailability[nextMode]
+      if (
+        nextMode === null ||
+        availability === undefined ||
+        !availability.supported ||
+        !availability.valid
+      ) return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      this.configChanged(snapshot.config, nextMode)
+      this.#toolbar.root.querySelector<HTMLElement>(
+        `[data-action="select-mode"][data-mode="${nextMode}"]`,
+      )?.focus()
+    }
+    this.#toolbar.root.addEventListener("keydown", interceptModeKey, true)
+    this.#unsubscribeEvents.push(() => this.#toolbar.root.removeEventListener("keydown", interceptModeKey, true))
     this.#toolbar.root.addEventListener("click", interceptModeClick, true)
     this.#unsubscribeEvents.push(() => this.#toolbar.root.removeEventListener("click", interceptModeClick, true))
 
-    const liveRegion = createLiveRegion(this.#tabPanel, { label: this.#t("graph.editorAria") })
+    liveRegion = createLiveRegion(this.#navigationPanel, { label: this.#t("graph.editorAria") })
+    if (this.#disposed || !this.#activity.active) {
+      throw new Error("APC frontend setup was cancelled while creating accessibility resources")
+    }
     const graphView = (): GraphEditorSnapshot => graphSnapshot(
       this.#state.getSnapshot(),
       this.#finalResponseAvailable,
       this.#ctx.locale.get(),
+      this.#consentReviewOpen,
     )
-    this.#graph = createGraphEditor({
-      t: this.#t,
-      document: this.#document,
-      toolbarHost: this.#toolbar.root,
-      state: {
-        getSnapshot: graphView,
-        subscribe: (listener) => this.#state.subscribe((snapshot) => listener(graphSnapshot(
-          snapshot,
-          this.#finalResponseAvailable,
-          this.#ctx.locale.get(),
-        ))),
-      },
-      liveRegion,
-      onConfigChange: (config, mutation) => this.configChanged(
+    const graphState = {
+      getSnapshot: graphView,
+      subscribe: (listener: (snapshot: GraphEditorSnapshot) => void) => this.#state.subscribe((snapshot) => listener(
+        graphSnapshot(snapshot, this.#finalResponseAvailable, this.#ctx.locale.get(), this.#consentReviewOpen),
+      )),
+    }
+    const graphCallbacks = {
+      onConfigChange: (config: ApcPresetConfigV1, mutation: GraphEditorMutation) => this.configChanged(
         config,
         mutation.type === "mode" ? mutation.mode : undefined,
       ),
-      onAddConnectionSlot: (slot) => {
+      onAddConnectionSlot: (slot: ApcPresetConfigV1["connectionSlots"][number]) => {
+        if (this.#consentReviewOpen) return
         this.#state.updateConfig((config) => {
           if (
             config.activeMode === "single" ||
@@ -1574,7 +1997,8 @@ class ApcAppImpl implements ApcAppHandle {
           }
         })
       },
-      onRenameConnectionSlot: (slotId, label) => {
+      onRenameConnectionSlot: (slotId: string, label: string) => {
+        if (this.#consentReviewOpen) return
         this.#state.updateConfig((config) => {
           if (config.activeMode === "single" || !config.connectionSlots.some((slot) => slot.id === slotId)) return config
           return {
@@ -1583,8 +2007,8 @@ class ApcAppImpl implements ApcAppHandle {
           }
         })
       },
-      onRemoveConnectionSlot: async (slotId) => {
-        if (this.#disposed || !this.#activity.active) return
+      onRemoveConnectionSlot: async (slotId: string) => {
+        if (this.#disposed || !this.#activity.active || this.#consentReviewOpen) return
         const operationSnapshot = this.#state.getSnapshot()
         const operationPresetId = operationSnapshot.presetId
         const binding = operationSnapshot.connectionBindings[slotId]
@@ -1593,13 +2017,14 @@ class ApcAppImpl implements ApcAppHandle {
             const unbound = await this.#state.unbindConnection(slotId)
             if (unbound.bound !== false) throw new Error("Connection slot remains bound")
           } catch (error) {
-            this.#graph?.render(graphSnapshot(this.#state.getSnapshot(), this.#finalResponseAvailable, this.#ctx.locale.get()))
+            this.renderGraphProjection(this.#state.getSnapshot())
             throw error
           }
         }
         if (
           this.#disposed ||
           !this.#activity.active ||
+          this.#consentReviewOpen ||
           this.#state.getSnapshot().presetId !== operationPresetId
         ) return
         this.#state.updateConfig((config) => {
@@ -1614,45 +2039,146 @@ class ApcAppImpl implements ApcAppHandle {
           }
         })
       },
-      onSelectionChange: (selection) => {
-        if (this.#disposed) return
+      onSelectionChange: (selection: ApcFrontendSnapshot["selection"]) => {
+        if (this.#disposed || this.#consentReviewOpen || selection === undefined) return
+        const snapshot = this.#state.getSnapshot()
+        if (snapshot.execution.executionKey !== null && snapshot.execution.terminal) {
+          this.#dismissedTerminalExecutionKey = snapshot.execution.executionKey
+        }
+        this.#threadContextAuthorityGeneration += 1
+        this.#threadConsentAuthorityGeneration += 1
         this.#state.setSelection(selection)
         void this.resolveSelectedConsent()
       },
+    }
+    localNavigation = createGraphEditor({
+      t: this.#t,
+      document: this.#document,
+      toolbarHost: this.#toolbar.root,
+      state: graphState,
+      liveRegion: liveRegion ?? undefined,
+      surface: "navigation",
+      ...graphCallbacks,
     })
-    this.#tabPanel.append(this.#graph.element)
-    this.#unsubscribeState = this.#state.subscribe((snapshot) => this.render(snapshot))
+    if (this.#disposed || !this.#activity.active) {
+      throw new Error("APC frontend setup was cancelled while mounting navigation")
+    }
+    localTopology = createGraphEditor({
+      t: this.#t,
+      document: this.#document,
+      state: graphState,
+      liveRegion: liveRegion ?? undefined,
+      surface: "topology",
+      ...graphCallbacks,
+    })
+    if (this.#disposed || !this.#activity.active) {
+      throw new Error("APC frontend setup was cancelled while mounting topology")
+    }
+    if (localNavigation === null || localTopology === null) {
+      throw new Error("APC frontend graph registration returned no handle")
+    }
+    const mountedNavigation = localNavigation
+    const mountedTopology = localTopology
+    this.#graphNavigation = mountedNavigation
+    localNavigation = null
+    this.#graphTopology = mountedTopology
+    localTopology = null
+    this.#navigationPanel.append(mountedNavigation.element)
+    this.#workspacePanel.append(mountedTopology.element)
+    localStateUnsubscribe = this.#state.subscribe((snapshot) => this.render(snapshot))
+    if (this.#disposed || !this.#activity.active) {
+      throw new Error("APC frontend setup was cancelled while subscribing to state")
+    }
+    this.#unsubscribeState = localStateUnsubscribe
+    localStateUnsubscribe = null
     this.render(this.#state.getSnapshot())
+    if (this.#disposed || !this.#activity.active) {
+      throw new Error("APC frontend setup was cancelled while rendering")
+    }
+    } catch (error) {
+      try {
+        localStateUnsubscribe?.()
+      } catch {
+        // Preserve the lifecycle failure while still releasing every local resource.
+      }
+      localStateUnsubscribe = null
+      try {
+        localTopology?.destroy()
+      } catch {
+        // Preserve the lifecycle failure while still releasing every local resource.
+      }
+      localTopology = null
+      try {
+        localNavigation?.destroy()
+      } catch {
+        // Preserve the lifecycle failure while still releasing every local resource.
+      }
+      localNavigation = null
+      try {
+        liveRegion?.cleanup()
+      } catch {
+        // Preserve the lifecycle failure while still releasing every local resource.
+      }
+      liveRegion = null
+      try {
+        tabActivationUnsubscribe?.()
+      } catch {
+        // Preserve the lifecycle failure while still releasing every local resource.
+      }
+      tabActivationUnsubscribe = null
+      this.disarm()
+      throw error
+    }
   }
 
   subscribeLocale(unsubscribe: () => void): void {
+    if (this.#disposed || !this.#activity.active) {
+      try {
+        unsubscribe()
+      } catch {
+        // Preserve the lifecycle failure while still releasing the late subscription.
+      }
+      return
+    }
     this.#unsubscribeLocale = unsubscribe
   }
 
   localeChanged(): void {
-    if (this.#disposed) return
+    if (this.#disposed || !this.#activity.active) return
     const title = this.#t("agentGraph.title")
     this.#tab.setTitle(title)
+    if (this.#disposed || !this.#activity.active) return
     this.#toolbar.root.setAttribute("aria-label", title)
     this.#scope.element.setAttribute("aria-label", title)
     const snapshot = this.#state.getSnapshot()
-    this.#graph?.render(graphSnapshot(snapshot, this.#finalResponseAvailable, this.#ctx.locale.get()))
+    const graphView = graphSnapshot(
+      snapshot,
+      this.#finalResponseAvailable,
+      this.#ctx.locale.get(),
+      this.#consentReviewOpen,
+    )
+    if (this.#disposed || !this.#activity.active) return
+    this.#graphNavigation?.render(graphView)
+    this.#graphTopology?.render(graphView)
     this.render(snapshot)
   }
   permissionChanged(payload: unknown): void {
-    if (this.#disposed) return
+    if (this.#disposed || !this.#activity.active) return
     const granted = finalResponsePermissionChange(payload)
     if (granted === undefined) return
     const available = granted && (this.#host.capabilities["interceptor-final-response-v1"] ?? 0) >= 1
     if (available === this.#finalResponseAvailable) return
     this.#finalResponseAvailable = available
     const snapshot = this.#state.getSnapshot()
-    this.#graph?.render(graphSnapshot(snapshot, available, this.#ctx.locale.get()))
+    const graphView = graphSnapshot(snapshot, available, this.#ctx.locale.get(), this.#consentReviewOpen)
+    if (this.#disposed || !this.#activity.active) return
+    this.#graphNavigation?.render(graphView)
+    this.#graphTopology?.render(graphView)
     this.render(snapshot)
   }
 
   configChanged(config: ApcPresetConfigV1, mode: ApcMode | undefined): void {
-    if (this.#disposed || !this.#state.getSnapshot().hydrated) return
+    if (this.#disposed || !this.#activity.active || this.#consentReviewOpen || !this.#state.getSnapshot().hydrated) return
     try {
       if (mode !== undefined) {
         const operation = this.beginModeTransition(mode)
@@ -1664,6 +2190,13 @@ class ApcAppImpl implements ApcAppHandle {
         void this.#state.setActiveMode(mode).then((saved) => {
           if (!this.isModeTransitionCurrent(operation)) return
           const snapshot = this.#state.getSnapshot()
+          if (!saved) {
+            this.queueModeSurface(snapshot)
+            this.#toolbar.root.querySelector<HTMLElement>(
+              `[data-action="select-mode"][data-mode="${operation.mode}"]`,
+            )?.focus()
+            return
+          }
           if (
             saved &&
             snapshot.hydrated &&
@@ -1675,6 +2208,10 @@ class ApcAppImpl implements ApcAppHandle {
         }).catch(() => {
           if (!this.isModeTransitionCurrent(operation)) return
           this.queueModeSurface(this.#state.getSnapshot())
+          const control = this.#toolbar.root.querySelector<HTMLElement>(
+            `[data-action="select-mode"][data-mode="${operation.mode}"]`,
+          )
+          control?.focus()
         })
         return
       }
@@ -1684,17 +2221,286 @@ class ApcAppImpl implements ApcAppHandle {
     }
   }
   render(snapshot: ApcFrontendSnapshot): void {
-    if (this.#disposed) return
+    if (this.#disposed || !this.#activity.active) return
+    if (
+      snapshot.execution.executionKey === null ||
+      !snapshot.execution.terminal
+    ) this.#dismissedTerminalExecutionKey = null
     this.queueModeSurface(snapshot)
     this.releaseModeToolbarSaveLock(snapshot)
     this.renderThread(snapshot)
     this.renderInspector(snapshot)
+    this.updatePaneLandmarks(snapshot)
+  }
+
+  private executionInspectorVisible(snapshot: ApcFrontendSnapshot): boolean {
+    const execution = snapshot.execution
+    return execution.executionKey !== null &&
+      !(
+        execution.terminal &&
+        (
+          this.#dismissedTerminalExecutionKey === execution.executionKey ||
+          !execution.topologyApplicable
+        )
+      )
+  }
+
+  private renderGraphProjection(snapshot: ApcFrontendSnapshot): void {
+    if (this.#disposed || !this.#activity.active) return
+    const view = graphSnapshot(
+      snapshot,
+      this.#finalResponseAvailable,
+      this.#ctx.locale.get(),
+      this.#consentReviewOpen,
+    )
+    this.#graphNavigation?.render(view)
+    this.#graphTopology?.render(view)
+  }
+
+  private applyConsentReviewLock(): void {
+    const locked = this.#consentReviewOpen
+    const ownedToolbar = this.#toolbar.root.querySelector<HTMLElement>("[data-apc-graph-toolbar-owned=true]")
+    const reviewOwner = locked
+      ? [this.#workspacePanel, this.#inspectorPanel].find((surface) =>
+          surface.querySelector("[data-apc-consent-review=true]") !== null
+        ) ?? null
+      : null
+    for (const surface of [this.#navigationPanel, this.#workspacePanel, this.#inspectorPanel, ownedToolbar]) {
+      if (surface === null) continue
+      const surfaceLocked = locked && surface !== reviewOwner
+      surface.toggleAttribute("inert", surfaceLocked)
+      if (surfaceLocked) surface.setAttribute("aria-hidden", "true")
+      else surface.removeAttribute("aria-hidden")
+    }
+  }
+
+  private consentReviewSelectionKey(snapshot: ApcFrontendSnapshot): string | null {
+    const selection = snapshot.selection
+    if (selection === null) return null
+    switch (selection.kind) {
+      case "thread": return `thread:${selection.threadId}`
+      case "run": return `run:${selection.runId}`
+      case "stage": return `stage:${selection.stageId}`
+      case "main": return "main"
+    }
+  }
+
+  private setConsentReviewOpen(open: boolean): void {
+    if (this.#disposed || this.#consentReviewOpen === open) return
+    const snapshot = this.#state.getSnapshot()
+    this.#consentReviewOpen = open
+    this.#consentReviewSelectionKey = open ? this.consentReviewSelectionKey(snapshot) : null
+    this.applyConsentReviewLock()
+    this.renderGraphProjection(snapshot)
+    this.renderThread(snapshot)
+    this.updatePaneLandmarks(snapshot)
+  }
+
+  private updatePaneLandmarks(snapshot: ApcFrontendSnapshot): void {
+    const centerSurface = this.#threadWorkspace === null ? "topology" : "loom"
+    const rightSurface = this.executionInspectorVisible(snapshot) ? "execution" : "configuration"
+    const workspaceThread = snapshot.config?.threads.find((thread) => thread.id === this.#workspaceThreadId)
+    const centerLabel = centerSurface === "loom" && workspaceThread !== undefined
+      ? this.#t("threadEditor.workspaceAria", { name: workspaceThread.name })
+      : this.#t("graph.stages")
+    this.#navigationPanel.setAttribute("aria-label", this.#t("graph.threadNavigation"))
+    this.#workspacePanel.setAttribute("aria-label", centerLabel)
+    this.#inspectorPanel.setAttribute(
+      "aria-label",
+      this.#t(rightSurface === "execution" ? "inspector.title" : "threadEditor.ariaLabel"),
+    )
+    this.#workspacePanel.dataset.apcCenterSurface = centerSurface
+    this.#inspectorPanel.dataset.apcRightSurface = rightSurface
+    this.applyConsentReviewLock()
+  }
+
+  private destroyThreadSurfaces(): void {
+    const configuration = this.#threadConfiguration
+    this.#threadConfiguration = null
+    configuration?.destroy()
+    const workspace = this.#threadWorkspace
+    this.#threadWorkspace = null
+    workspace?.destroy()
+    this.#presetId = null
+  }
+
+  private createThreadSurface(view: ThreadEditorSnapshot, surface: ThreadEditorSurface): ThreadEditorController {
+    let editor: ThreadEditorController | null = null
+    editor = createThreadEditor({
+      host: this.#host,
+      presetId: view.presetId,
+      loom: this.#loom,
+      t: this.#t,
+      document: this.#document,
+      surface,
+      onBackToGraph: () => {
+        if (!this.#consentReviewOpen) this.closeLoomWorkspace()
+      },
+      onOpenWorkspace: (threadId) => {
+        if (!this.#consentReviewOpen) this.openLoomWorkspace(threadId)
+      },
+      onConsentReviewChange: (open) => {
+        this.setConsentReviewOpen(open)
+        return undefined
+      },
+      onRename: (threadId, change) => {
+        if (this.#consentReviewOpen) return
+        this.#state.updateConfig((config) => ({
+          ...config,
+          threads: config.threads.map((thread) => thread.id === threadId ? { ...thread, ...change } : thread),
+        }))
+      },
+      onWorkspaceSourceChange: async (threadId, workspaceSource) => {
+        if (this.#consentReviewOpen) return
+        const token = this.beginThreadContextMutation(editor, threadId)
+        if (token === null) return
+        this.#state.updateConfig((config) => ({
+          ...config,
+          threads: config.threads.map((thread) => thread.id === threadId
+            ? { ...thread, workspaceSource }
+            : thread),
+        }))
+        await this.resolveSelectedConsent(true, token)
+        this.advanceThreadContextAuthority(token)
+      },
+      onConnectionSlotChange: async (threadId, slotId) => {
+        if (this.#consentReviewOpen) return
+        const token = this.beginThreadContextMutation(editor, threadId)
+        if (token === null) return
+        this.#state.updateConfig((config) => ({
+          ...config,
+          threads: config.threads.map((thread) => {
+            if (thread.id !== threadId) return thread
+            if (slotId !== undefined) return { ...thread, connectionSlotId: slotId }
+            const { connectionSlotId: _removed, ...withoutSlot } = thread
+            return withoutSlot
+          }),
+        }))
+        await this.resolveSelectedConsent(true, token)
+        this.advanceThreadContextAuthority(token)
+      },
+      onRunChange: (runId, change) => {
+        if (this.#consentReviewOpen) return change.position === undefined ? undefined : false
+        let positionChanged = false
+        this.#state.updateConfig((config) => {
+          const pipeline = activePipeline(config)
+          if (
+            change.required === false &&
+            pipeline !== undefined &&
+            requiredLockedRunIds(pipeline).has(runId)
+          ) return config
+          const changed = changeRun(config, runId, change)
+          if (change.position !== undefined) positionChanged = changed !== config
+          return changed
+        })
+        return change.position === undefined ? undefined : positionChanged
+      },
+      onRunBindingChange: (runId, bindingId, change) => {
+        if (this.#consentReviewOpen) return
+        this.#state.updateConfig((config) => changeRunBinding(config, runId, bindingId, change))
+      },
+      onAddRunBinding: (runId) => {
+        if (this.#consentReviewOpen) return
+        this.#state.updateConfig((config) => addRunBinding(config, runId))
+      },
+      onRemoveRunBinding: (runId, bindingId) => {
+        if (this.#consentReviewOpen) return
+        this.#state.updateConfig((config) => removeRunBinding(config, runId, bindingId))
+      },
+      onDirty: (threadId, value) => {
+        if (this.#consentReviewOpen) return
+        this.#state.updateConfig((config) => ({
+          ...config,
+          threads: config.threads.map((thread) => thread.id === threadId
+            ? {
+                ...thread,
+                blocks: clone(value.blocks),
+                promptVariableValues: clone(value.promptVariableValues),
+              }
+            : thread),
+        }))
+      },
+      onFlush: async () => {
+        if (this.#consentReviewOpen) return
+        const token = this.captureThreadContinuation(editor)
+        if (token === null) return
+        try {
+          await this.#state.flush()
+        } catch (error) {
+          if (this.isThreadContinuationActive(token)) throw error
+        }
+      },
+      onBind: async (slotId, connectionId) => {
+        if (this.#consentReviewOpen) return
+        const token = this.beginThreadContextMutation(editor)
+        if (token === null) return
+        await this.#state.bindConnection(slotId, connectionId)
+        if (!this.isThreadContinuationActive(token)) return
+        this.#boundConnectionKeys.set(slotId, connectionId)
+        await this.resolveSelectedConsent(true, token)
+        this.advanceThreadContextAuthority(token)
+      },
+      onUnbind: async (slotId) => {
+        if (this.#consentReviewOpen) return
+        const token = this.beginThreadContextMutation(editor)
+        if (token === null) return
+        await this.#state.unbindConnection(slotId)
+        if (!this.isThreadContinuationActive(token)) return
+        this.#boundConnectionKeys.delete(slotId)
+        await this.resolveSelectedConsent(true, token)
+        this.advanceThreadContextAuthority(token)
+      },
+      onRefreshConnections: async () => {
+        if (this.#consentReviewOpen) return
+        const token = this.beginThreadContextMutation(editor)
+        if (token === null) return
+        await this.#state.refreshConnections()
+        this.advanceThreadContextAuthority(token)
+      },
+      onResolveConsent: async (selector: ThreadEditorConsentSelector) => {
+        const token = this.captureThreadContinuation(editor)
+        if (token === null) return
+        await this.#state.resolveConsent(consentSelector(selector))
+        this.advanceThreadConsentAuthority(token)
+      },
+      onApproveConsent: async (selector) => {
+        const token = this.captureThreadContinuation(editor)
+        if (token === null) return
+        await this.#state.approveConsent(consentSelector(selector))
+        this.advanceThreadConsentAuthority(token)
+      },
+      onRevokeConsent: async (selector) => {
+        const token = this.captureThreadContinuation(editor)
+        if (token === null) return
+        await this.#state.revokeConsent(consentSelector(selector))
+        this.advanceThreadConsentAuthority(token)
+      },
+    })
+    if (this.#disposed || !this.#activity.active) {
+      editor?.destroy()
+      throw new Error("APC frontend authority was lost while creating a thread surface")
+    }
+    return editor
   }
 
   renderThread(snapshot: ApcFrontendSnapshot): void {
+    if (this.#disposed || !this.#activity.active) return
+    if (
+      this.#consentReviewOpen &&
+      (
+        snapshot.executionMutationLocked ||
+        snapshot.presetId !== this.#presetId ||
+        this.consentReviewSelectionKey(snapshot) !== this.#consentReviewSelectionKey
+      )
+    ) {
+      this.#consentReviewOpen = false
+      this.#consentReviewSelectionKey = null
+      this.renderGraphProjection(snapshot)
+    }
     if (snapshot.presetId !== this.#boundConnectionKeysPresetId) {
       this.#boundConnectionKeys.clear()
       this.#boundConnectionKeysPresetId = snapshot.presetId
+      this.#workspaceThreadId = null
     }
     const view = threadSnapshot(
       snapshot,
@@ -1702,152 +2508,103 @@ class ApcAppImpl implements ApcAppHandle {
       this.#boundConnectionKeys,
       this.#threadContextAuthorityGeneration,
       this.#threadConsentAuthorityGeneration,
+      this.#consentReviewOpen,
     )
+    const selectedThread = view?.threads.find((thread) => thread.id === view.selectedThreadId)
+    if (
+      snapshot.executionMutationLocked ||
+      selectedThread?.id !== this.#workspaceThreadId ||
+      selectedThread?.workspaceSource !== "native-blocks"
+    ) {
+      this.#workspaceThreadId = null
+    }
     if (view === null) {
-      if (this.#thread !== null) {
-        this.#thread.destroy()
-        this.#thread = null
-        this.#presetId = null
-      }
-      this.#threadPanel.replaceChildren(this.placeholder(this.#t("validation.configNotHydrated")))
+      this.destroyThreadSurfaces()
+      if (this.#graphTopology !== null) this.#workspacePanel.replaceChildren(this.#graphTopology.element)
       return
     }
-    if (this.#thread === null || this.#presetId !== view.presetId) {
-      this.#thread?.destroy()
-      this.#threadPanel.replaceChildren()
-      this.#thread = createThreadEditor({
-        host: this.#host,
-        presetId: view.presetId,
-        loom: this.#loom,
-        t: this.#t,
-        document: this.#document,
-        parent: this.#threadPanel,
-        onBackToGraph: () => {
-          this.#state.setSelection({ kind: "main" })
-        },
-        onRename: (threadId, change) => {
-          this.#state.updateConfig((config) => ({
-            ...config,
-            threads: config.threads.map((thread) => thread.id === threadId ? { ...thread, ...change } : thread),
-          }))
-        },
-        onWorkspaceSourceChange: async (threadId, workspaceSource) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          this.#state.updateConfig((config) => ({
-            ...config,
-            threads: config.threads.map((thread) => thread.id === threadId
-              ? { ...thread, workspaceSource }
-              : thread),
-          }))
-          await this.resolveSelectedConsent(true, token)
-          this.advanceThreadContextAuthority(token)
-        },
-        onConnectionSlotChange: async (threadId, slotId) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          this.#state.updateConfig((config) => ({
-            ...config,
-            threads: config.threads.map((thread) => {
-              if (thread.id !== threadId) return thread
-              if (slotId !== undefined) return { ...thread, connectionSlotId: slotId }
-              const { connectionSlotId: _removed, ...withoutSlot } = thread
-              return withoutSlot
-            }),
-          }))
-          await this.resolveSelectedConsent(true, token)
-          this.advanceThreadContextAuthority(token)
-        },
-        onRunChange: (runId, change) => {
-          this.#state.updateConfig((config) => {
-            const pipeline = activePipeline(config)
-            if (
-              change.required === false &&
-              pipeline !== undefined &&
-              requiredLockedRunIds(pipeline).has(runId)
-            ) return config
-            return changeRun(config, runId, change)
-          })
-        },
-        onRunBindingChange: (runId, bindingId, change) => {
-          this.#state.updateConfig((config) => changeRunBinding(config, runId, bindingId, change))
-        },
-        onAddRunBinding: (runId) => {
-          this.#state.updateConfig((config) => addRunBinding(config, runId))
-        },
-        onRemoveRunBinding: (runId, bindingId) => {
-          this.#state.updateConfig((config) => removeRunBinding(config, runId, bindingId))
-        },
-        onDirty: (threadId, value) => {
-          this.#state.updateConfig((config) => ({
-            ...config,
-            threads: config.threads.map((thread) => thread.id === threadId
-              ? {
-                  ...thread,
-                  blocks: clone(value.blocks),
-                  promptVariableValues: clone(value.promptVariableValues),
-                }
-              : thread),
-          }))
-        },
-        onFlush: async () => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          try {
-            await this.#state.flush()
-          } catch (error) {
-            if (this.isThreadContinuationActive(token)) throw error
-          }
-        },
-        onBind: async (slotId, connectionId) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.bindConnection(slotId, connectionId)
-          if (!this.isThreadContinuationActive(token)) return
-          this.#boundConnectionKeys.set(slotId, connectionId)
-          await this.resolveSelectedConsent(true, token)
-          this.advanceThreadContextAuthority(token)
-        },
-        onUnbind: async (slotId) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.unbindConnection(slotId)
-          if (!this.isThreadContinuationActive(token)) return
-          this.#boundConnectionKeys.delete(slotId)
-          await this.resolveSelectedConsent(true, token)
-          this.advanceThreadContextAuthority(token)
-        },
-        onRefreshConnections: async () => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.refreshConnections()
-          this.advanceThreadContextAuthority(token)
-        },
-        onResolveConsent: async (selector: ThreadEditorConsentSelector) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.resolveConsent(consentSelector(selector))
-          this.advanceThreadConsentAuthority(token)
-        },
-        onApproveConsent: async (selector) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.approveConsent(consentSelector(selector))
-          this.advanceThreadConsentAuthority(token)
-        },
-        onRevokeConsent: async (selector) => {
-          const token = this.captureThreadContinuation()
-          if (token === null) return
-          await this.#state.revokeConsent(consentSelector(selector))
-          this.advanceThreadConsentAuthority(token)
-        },
-      })
-      this.#presetId = view.presetId
+    if (this.#presetId !== view.presetId) {
+      this.destroyThreadSurfaces()
+      try {
+        const configuration = this.createThreadSurface(view, "configuration")
+        if (this.#disposed || !this.#activity.active) {
+          configuration.destroy()
+          return
+        }
+        this.#threadConfiguration = configuration
+        this.#presetId = view.presetId
+      } catch (error) {
+        if (this.#disposed || !this.#activity.active) return
+        throw error
+      }
+    } else if (this.#threadConfiguration === null) {
+      try {
+        const configuration = this.createThreadSurface(view, "configuration")
+        if (this.#disposed || !this.#activity.active) {
+          configuration.destroy()
+          return
+        }
+        this.#threadConfiguration = configuration
+      } catch (error) {
+        if (this.#disposed || !this.#activity.active) return
+        throw error
+      }
     }
-    this.#thread?.render(view)
+    const configuration = this.#threadConfiguration
+    if (configuration === null) return
+    configuration.render(view)
+    if (this.#disposed || !this.#activity.active) return
+    if (this.#workspaceThreadId === null) {
+      const workspace = this.#threadWorkspace
+      this.#threadWorkspace = null
+      workspace?.destroy()
+      if (this.#graphTopology !== null) this.#workspacePanel.replaceChildren(this.#graphTopology.element)
+      return
+    }
+    if (this.#threadWorkspace === null) {
+      try {
+        const workspace = this.createThreadSurface(view, "workspace")
+        if (this.#disposed || !this.#activity.active) {
+          workspace.destroy()
+          return
+        }
+        this.#threadWorkspace = workspace
+      } catch (error) {
+        if (this.#disposed || !this.#activity.active) return
+        throw error
+      }
+    }
+    const workspace = this.#threadWorkspace
+    if (workspace === null) return
+    this.#workspacePanel.replaceChildren(workspace.element)
+    try {
+      workspace.render(view)
+      if (this.#disposed || !this.#activity.active) return
+    } catch {
+      this.#threadWorkspace = null
+      this.#workspaceThreadId = null
+      workspace.destroy()
+      if (this.#graphTopology !== null && !this.#disposed) this.#workspacePanel.replaceChildren(this.#graphTopology.element)
+    }
   }
-
   renderInspector(snapshot: ApcFrontendSnapshot): void {
+    if (this.#disposed || !this.#activity.active) return
+    if (!this.executionInspectorVisible(snapshot)) {
+      const inspector = this.#inspector
+      this.#inspector = null
+      inspector?.destroy()
+      this.#inspectorPanel.replaceChildren(
+        this.#threadConfiguration?.element ?? this.placeholder(this.#t("validation.configNotHydrated")),
+      )
+      if (this.#focusConfigurationAfterInspector) {
+        this.#focusConfigurationAfterInspector = false
+        focusElement(
+          this.#inspectorPanel.querySelector<HTMLElement>("[data-apc-thread-workspace-heading]") ??
+            this.#inspectorPanel.querySelector<HTMLElement>("[data-apc-thread-name]"),
+        )
+      }
+      return
+    }
     const view = inspectorStatus(snapshot, this.#t)
     if (this.#inspector === null) {
       const inspectorOptions = {
@@ -1858,13 +2615,13 @@ class ApcAppImpl implements ApcAppHandle {
         onLoadTraces: async () => {
           const token = this.captureInspectorContinuation()
           if (token === null) return
-          await this.#state.loadTraces()
+          await this.#state.loadTraces({ executionKey: token.executionKey })
           if (this.isInspectorContinuationActive(token)) this.renderInspector(this.#state.getSnapshot())
         },
         onLoadTrace: async (key: string) => {
           const token = this.captureInspectorContinuation()
           if (token === null) return
-          await this.#state.loadTrace(key)
+          await this.#state.loadTrace(key, { executionKey: token.executionKey })
           if (this.isInspectorContinuationActive(token)) this.renderInspector(this.#state.getSnapshot())
         },
         onStop: () => {
@@ -1872,24 +2629,43 @@ class ApcAppImpl implements ApcAppHandle {
           if (executionKey !== null) return this.#state.cancelExecution(executionKey, "stop")
         },
         onUseMainFallback: () => {
-          this.#state.updateConfig(routeActivePipelineToMain)
+          this.#focusConfigurationAfterInspector = true
+          try {
+            this.#state.updateConfig(routeActivePipelineToMain)
+          } catch (error) {
+            this.#focusConfigurationAfterInspector = false
+            throw error
+          }
+        },
+        onBackToConfiguration: () => {
+          const current = this.#state.getSnapshot()
+          if (current.execution.executionKey === null || !current.execution.terminal) return
+          this.#focusConfigurationAfterInspector = true
+          this.#dismissedTerminalExecutionKey = current.execution.executionKey
+          this.render(current)
         },
       }
-      this.#inspector = createExecutionInspector(inspectorOptions)
-      this.#inspectorPanel.replaceChildren(this.#inspector.element)
+      const inspector = createExecutionInspector(inspectorOptions)
+      if (this.#disposed || !this.#activity.active) {
+        inspector.destroy()
+        return
+      }
+      this.#inspector = inspector
     } else {
       this.#inspector.render(view)
     }
+    if (this.#disposed || !this.#activity.active || this.#inspector === null) return
+    this.#inspectorPanel.replaceChildren(this.#inspector.element)
   }
 
   async flushWorkspace(): Promise<void> {
-    if (this.#disposed || !this.#activity.active) return
-    const thread = this.#thread
-    if (thread === null) {
+    if (this.#disposed || !this.#activity.active || this.#consentReviewOpen) return
+    const workspace = this.#threadWorkspace
+    if (workspace === null) {
       await this.#state.flush()
       return
     }
-    await thread.flush()
+    await workspace.flush()
   }
 
   placeholder(message: string): HTMLElement {
@@ -1918,6 +2694,10 @@ class ApcAppImpl implements ApcAppHandle {
     if (this.#disposed) return undefined
     this.#disposed = true
     this.#modeTransitionOperation = null
+    this.#focusConfigurationAfterInspector = false
+    this.#dismissedTerminalExecutionKey = null
+    this.#consentReviewOpen = false
+    this.#consentReviewSelectionKey = null
     this.#activity.active = false
     let failure: unknown
     const runCleanup = (cleanup: () => void): void => {
@@ -1935,13 +2715,20 @@ class ApcAppImpl implements ApcAppHandle {
     const unsubscribeState = this.#unsubscribeState
     this.#unsubscribeState = null
     runCleanup(() => unsubscribeState?.())
-    const graph = this.#graph
-    this.#graph = null
-    runCleanup(() => graph?.destroy())
-    const thread = this.#thread
-    this.#thread = null
+    const graphNavigation = this.#graphNavigation
+    this.#graphNavigation = null
+    runCleanup(() => graphNavigation?.destroy())
+    const graphTopology = this.#graphTopology
+    this.#graphTopology = null
+    runCleanup(() => graphTopology?.destroy())
+    const threadConfiguration = this.#threadConfiguration
+    this.#threadConfiguration = null
+    runCleanup(() => threadConfiguration?.destroy())
+    const threadWorkspace = this.#threadWorkspace
+    this.#threadWorkspace = null
     this.#presetId = null
-    runCleanup(() => thread?.destroy())
+    this.#workspaceThreadId = null
+    runCleanup(() => threadWorkspace?.destroy())
     const inspector = this.#inspector
     this.#inspector = null
     runCleanup(() => inspector?.destroy())

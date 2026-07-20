@@ -21,6 +21,7 @@ import {
 import {
   TraceStore,
   type TraceMetadata,
+  type TraceMutationResult,
   acquireTrace,
   appendTrace,
   cancelTrace,
@@ -228,6 +229,55 @@ describe("user-scoped immutable trace retention", () => {
       expect(entry.previewTruncated).toBe(true)
       expect(utf8Bytes(entry.preview)).toBeLessThanOrEqual(TRACE_PREVIEW_BYTES)
       expect(entry.preview.endsWith("\uD83D")).toBe(false)
+    }
+  })
+
+  test("bounds very large previews before fitting and retains safe trace bytes", () => {
+    const store = new TraceStore()
+    const executionId = "very-large-preview"
+    expect(acquireTrace(store, USER_A, PRESET, executionId).accepted).toBe(true)
+
+    const filler = "x".repeat(TRACE_PREVIEW_BYTES)
+    let sequence = 0
+    let trace = getTrace(store, USER_A, PRESET, executionId)
+    while (trace !== undefined && trace.bytes < MAX_TRACE_BYTES - TRACE_PREVIEW_BYTES) {
+      const appended = appendTrace(store, USER_A, PRESET, executionId, {
+        sequence: sequence + 1,
+        kind: "fill",
+        preview: filler,
+      })
+      if (!appended.accepted) break
+      sequence += 1
+      trace = appended.trace
+    }
+    if (trace === undefined) throw new Error("trace disappeared while filling capacity")
+
+    const hugePreview = "y".repeat(MAX_TRACE_BYTES * 64)
+    const originalEncode = TextEncoder.prototype.encode
+    let rawScanCount = 0
+    TextEncoder.prototype.encode = function (input = ""): Uint8Array {
+      if (input === hugePreview) rawScanCount += 1
+      return originalEncode.call(this, input)
+    }
+    let appended: TraceMutationResult
+    try {
+      appended = appendTrace(store, USER_A, PRESET, executionId, {
+        sequence: sequence + 1,
+        kind: "huge-preview",
+        preview: hugePreview,
+      })
+    } finally {
+      TextEncoder.prototype.encode = originalEncode
+    }
+    expect(rawScanCount).toBe(0)
+    expect(appended.accepted).toBe(true)
+    if (appended.accepted) {
+      const entry = appended.trace.entries.at(-1)
+      if (entry === undefined) throw new Error("large preview entry was not retained")
+      expect(entry.preview).toBe("y".repeat(entry.preview.length))
+      expect(entry.previewTruncated).toBe(true)
+      expect(utf8Bytes(entry.preview)).toBeLessThanOrEqual(TRACE_PREVIEW_BYTES)
+      expect(appended.trace.bytes).toBeLessThanOrEqual(MAX_TRACE_BYTES)
     }
   })
 

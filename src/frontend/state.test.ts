@@ -14,7 +14,7 @@ import type {
   ApcPresetEditorDraftState,
 } from "./persistence"
 import { createApcPersistence } from "./persistence"
-import { PROTOCOL_VERSION } from "../protocol/messages"
+import { createBackendActivityResponse, PROTOCOL_VERSION } from "../protocol/messages"
 import type { ApcFrontendStore } from "./state"
 import { createApcFrontendState } from "./state"
  
@@ -246,6 +246,7 @@ describe("APC frontend application state", () => {
     expect(snapshot.decoded?.status).toBe("valid")
     expect(snapshot.modeIssues.sequential).toEqual([])
     expect(snapshot.modeAvailability.parallel.valid).toBe(true)
+    expect(snapshot.traces).toEqual({ summaries: [], details: {} })
     store.dispose()
   })
   test("hydrates an active execution into an opaque safe activity snapshot", async () => {
@@ -276,8 +277,30 @@ describe("APC frontend application state", () => {
     expect(snapshot.execution.usage).toEqual({ input: 4, output: 2, total: 6 })
     expect(snapshot.execution.activity[0]?.status).toBe("running")
     expect(snapshot.execution.activity[0]?.phase).toBe("progress")
+    expect(snapshot.execution.topologyActivity).toHaveLength(1)
+    expect(snapshot.execution.topologyActivity[0]?.status).toBe("running")
+    expect(snapshot.execution.topologyApplicable).toBe(true)
     expect(snapshot.busyReason).toBe("execution")
     expect(JSON.stringify(snapshot)).not.toContain("execution-hydrated")
+    store.dispose()
+  })
+  test("rejects malformed hydrated execution identities before creating a mutation lock", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const pending = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const request = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(request?.type).toBe("hydrate_preset")
+    transport.respondHydration(request?.correlationId ?? "missing", PRESET_A, [], [], {
+      executionId: "x".repeat(129),
+      presetId: PRESET_A,
+      kind: "graph",
+      phase: "progress",
+      terminal: false,
+    })
+    await expect(pending).rejects.toMatchObject({ code: "INVALID_HYDRATION" })
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
     store.dispose()
   })
   test("retains bounded cumulative usage across missing updates and resets for a new execution", async () => {
@@ -365,6 +388,236 @@ describe("APC frontend application state", () => {
     expect(next.execution.executionKey).not.toBe(completed.execution.executionKey)
     expect(next.execution.usage).toBeUndefined()
     expect(next.execution.activity).toHaveLength(1)
+    store.dispose()
+  })
+  test("retains monotonic per-run topology statuses beyond the bounded inspector history", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const respondActivity = (
+      correlationId: string,
+      phase: "started" | "progress",
+      runIndex: number,
+      runStatus: "pending" | "running" | "completed" | "failed" | "cancelled" | "timed-out" | "skipped",
+    ): void => {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId,
+        sequence: transport.nextSequence(),
+        payload: {
+          executionId: "execution-topology",
+          presetId: PRESET_A,
+          kind: "run",
+          phase,
+          terminal: false,
+          stageIndex: 0,
+          stageCount: 1,
+          runIndex,
+          runCount: 64,
+          runStatus,
+        },
+      })
+    }
+
+    respondActivity("topology-start", "started", 0, "running")
+    respondActivity("topology-completed", "progress", 0, "completed")
+    respondActivity("topology-failed", "progress", 1, "failed")
+    for (let runIndex = 2; runIndex < 42; runIndex += 1) {
+      respondActivity(`topology-later-${runIndex}`, "progress", runIndex, "running")
+    }
+
+    const bounded = store.getSnapshot().execution
+    expect(bounded.activity).toHaveLength(32)
+    expect(bounded.topologyActivity).toHaveLength(42)
+    expect(bounded.topologyActivity.find((entry) => entry.runIndex === 0)?.status).toBe("completed")
+    expect(bounded.topologyActivity.find((entry) => entry.runIndex === 1)?.status).toBe("failed")
+
+    respondActivity("topology-downgrade", "progress", 2, "pending")
+    respondActivity("topology-conflicting-terminal", "progress", 0, "failed")
+    respondActivity("topology-conflicting-terminal-2", "progress", 1, "completed")
+    const guarded = store.getSnapshot().execution
+    expect(guarded.topologyActivity.find((entry) => entry.runIndex === 0)?.status).toBe("completed")
+    expect(guarded.topologyActivity.find((entry) => entry.runIndex === 1)?.status).toBe("failed")
+    expect(guarded.topologyActivity.find((entry) => entry.runIndex === 2)?.status).toBe("running")
+    expect(guarded.activity.at(-1)?.status).toBe("completed")
+    store.dispose()
+  })
+  test("preserves current run context when a terminal activity omits indexed fields", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "terminal-context-start",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-terminal-context",
+        presetId: PRESET_A,
+        kind: "run",
+        phase: "started",
+        terminal: false,
+        provider: "safe-provider",
+        model: "safe-model",
+        stageIndex: 1,
+        stageCount: 2,
+        runIndex: 3,
+        runCount: 4,
+        completedRuns: 2,
+        totalRuns: 4,
+        remainingBudgetMs: 9_000,
+        runStatus: "running",
+        usage: { input: 10, output: 3, total: 13 },
+      },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "terminal-context-progress",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-terminal-context",
+        presetId: PRESET_A,
+        kind: "run",
+        phase: "progress",
+        terminal: false,
+        stageIndex: 1,
+        stageCount: 2,
+        runIndex: 3,
+        runCount: 4,
+        completedRuns: 3,
+        totalRuns: 4,
+        remainingBudgetMs: 7_000,
+        runStatus: "running",
+        usage: { input: 20, output: 6, total: 26 },
+      },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "terminal-context-failed",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-terminal-context",
+        presetId: PRESET_A,
+        kind: "execution-terminal",
+        phase: "failed",
+        terminal: true,
+        outcome: "selected-final-failure",
+        errorCategory: "provider",
+        errorMessageKey: "PROVIDER_FAILURE",
+      },
+    })
+
+    const snapshot = store.getSnapshot()
+    expect(snapshot.execution.status).toBe("failed")
+    expect(snapshot.execution.terminal).toBe(true)
+    expect(snapshot.busy).toBe(false)
+    expect(snapshot.busyReason).toBe(null)
+    expect(snapshot.executionMutationLocked).toBe(false)
+    expect(snapshot.execution.stageIndex).toBe(1)
+    expect(snapshot.execution.stageCount).toBe(2)
+    expect(snapshot.execution.runIndex).toBe(3)
+    expect(snapshot.execution.runCount).toBe(4)
+    expect(snapshot.execution.provider).toBe("safe-provider")
+    expect(snapshot.execution.model).toBe("safe-model")
+    expect(snapshot.execution.completedRuns).toBe(3)
+    expect(snapshot.execution.totalRuns).toBe(4)
+    expect(snapshot.execution.remainingBudgetMs).toBe(7_000)
+    expect(snapshot.execution.usage).toEqual({ input: 20, output: 6, total: 26 })
+    expect(snapshot.execution.outcome).toBe("selected-final-failure")
+    expect(snapshot.execution.errorCategory).toBe("provider")
+    expect(snapshot.execution.errorMessageKey).toBe("PROVIDER_FAILURE")
+    expect(snapshot.execution.activity.at(-1)).toMatchObject({
+      phase: "failed",
+      status: "failed",
+      errorCategory: "provider",
+      errorMessageKey: "PROVIDER_FAILURE",
+      stageIndex: 1,
+      runIndex: 3,
+      provider: "safe-provider",
+      model: "safe-model",
+    })
+    store.dispose()
+  })
+  test("invalidates topology after local terminal edits and clean external active-run changes", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const respond = (executionId: string, phase: "started" | "progress" | "completed", terminal: boolean, runIndex: number, runStatus: "running" | "completed"): void => {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId: `${executionId}-${phase}-${runIndex}`,
+        sequence: transport.nextSequence(),
+        payload: {
+          executionId,
+          presetId: PRESET_A,
+          kind: "run",
+          phase,
+          terminal,
+          stageIndex: 0,
+          stageCount: 1,
+          runIndex,
+          runCount: 1,
+          runStatus,
+          ...(phase === "completed" ? { outcome: "success" as const } : {}),
+        },
+      })
+    }
+
+    respond("execution-terminal-topology", "started", false, 0, "running")
+    respond("execution-terminal-topology", "progress", false, 0, "completed")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "execution-terminal-topology-terminal",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-terminal-topology",
+        presetId: PRESET_A,
+        kind: "execution",
+        phase: "completed",
+        terminal: true,
+        outcome: "success",
+      },
+    })
+    const terminal = store.getSnapshot()
+    expect(terminal.execution.topologyApplicable).toBe(true)
+    expect(terminal.execution.topologyActivity[0]?.status).toBe("completed")
+
+    store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))
+    const edited = store.getSnapshot()
+    expect(edited.execution.topologyApplicable).toBe(false)
+    expect(edited.execution.topologyActivity).toEqual([])
+    expect(edited.execution.activity.at(-1)?.status).toBe("completed")
+    await store.flush()
+    expect(store.getSnapshot().dirty).toBe(false)
+
+    respond("execution-after-edit", "started", false, 0, "running")
+    const fresh = store.getSnapshot()
+    expect(fresh.execution.topologyApplicable).toBe(true)
+    expect(fresh.execution.topologyActivity).toHaveLength(1)
+    expect(fresh.execution.topologyActivity[0]?.status).toBe("running")
+
+    editor.switchPreset(PRESET_A, graphConfig("sequential"))
+    const externallyChanged = store.getSnapshot()
+    expect(externallyChanged.config?.activeMode).toBe("sequential")
+    expect(externallyChanged.execution.topologyApplicable).toBe(false)
+    expect(externallyChanged.execution.topologyActivity).toEqual([])
+
+    respond("execution-after-edit", "progress", false, 0, "running")
+    const laterProgress = store.getSnapshot()
+    expect(laterProgress.execution.activity.at(-1)?.phase).toBe("progress")
+    expect(laterProgress.execution.topologyApplicable).toBe(false)
+    expect(laterProgress.execution.topologyActivity).toEqual([])
     store.dispose()
   })
   test("hydrates safe binding and consent views without raw metadata or revisions", async () => {
@@ -701,6 +954,177 @@ describe("APC frontend application state", () => {
     expect(store.getSnapshot().busy).toBe(true)
     store.dispose()
   })
+  test("locks config and mode mutation during nonterminal execution without staging and unlocks at settlement", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-lock-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    const running = store.getSnapshot()
+    expect(running.executionMutationLocked).toBe(true)
+    expect(running.execution.phase).toBe("started")
+    const beforeConfig = running.config
+    const beforeRevision = running.revision
+    const beforeMetadataUpdates = editor.metadataUpdates.length
+
+    let updateError: unknown
+    try {
+      store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))
+    } catch (error) {
+      updateError = error
+    }
+    expect(updateError).toMatchObject({ code: "EXECUTION_LOCKED" })
+    await expect(store.setActiveMode("parallel")).rejects.toMatchObject({ code: "EXECUTION_LOCKED" })
+    expect(editor.metadataUpdates).toHaveLength(beforeMetadataUpdates)
+    expect(store.getSnapshot().config).toEqual(beforeConfig)
+    expect(store.getSnapshot().revision).toBe(beforeRevision)
+
+    store.setSelection({ kind: "thread", threadId: THREAD_ID })
+    await store.refreshConnections()
+    const traces = store.loadTraces()
+    const traceRequest = transport.sent.filter((message) => message.type === "list_traces").at(-1)
+    expect(traceRequest?.type).toBe("list_traces")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: traceRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { traces: [] },
+    })
+    await traces
+    expect(store.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_ID })
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-lock-progress",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "execution-draining", phase: "progress", terminal: false },
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(true)
+    const drainingMetadataUpdates = editor.metadataUpdates.length
+    expect(() => store.updateConfig((config) => ({ ...config, activeMode: "sequential" }))).toThrow()
+    await expect(store.setActiveMode("sequential")).rejects.toMatchObject({ code: "EXECUTION_LOCKED" })
+    expect(editor.metadataUpdates).toHaveLength(drainingMetadataUpdates)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-lock-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "execution-terminal", phase: "completed", terminal: true, outcome: "success" },
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
+
+    store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))
+    expect(editor.metadataUpdates.length).toBeGreaterThan(beforeMetadataUpdates)
+    await store.flush()
+    expect(store.getSnapshot().dirty).toBe(false)
+    editor.switchPreset(null, null)
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
+    store.dispose()
+  })
+
+  test("ignores malformed activity and stale execution identities without changing the phase lock", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-malformed-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-malformed", presetId: PRESET_A, kind: "graph", phase: "completed", terminal: false } as never,
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
+    for (const [correlationId, executionId] of [
+      ["activity-missing-key-start", undefined],
+      ["activity-empty-key-start", ""],
+      ["activity-oversized-key-start", "x".repeat(129)],
+      ["activity-control-key-start", "execution-\u0000-lock"],
+    ] as const) {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId,
+        sequence: transport.nextSequence(),
+        payload: {
+          ...(executionId === undefined ? {} : { executionId }),
+          presetId: PRESET_A,
+          kind: "graph",
+          phase: "started",
+          terminal: false,
+        } as never,
+      })
+    }
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-malformed-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(true)
+    const lockedRevision = store.getSnapshot().revision
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-malformed-progress",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "graph", phase: "progress", terminal: true } as never,
+    })
+    for (const [correlationId, executionId] of [
+      ["activity-missing-key-terminal", undefined],
+      ["activity-empty-key-terminal", ""],
+      ["activity-oversized-key-terminal", "x".repeat(129)],
+      ["activity-control-key-terminal", "execution-\u0000-lock"],
+    ] as const) {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId,
+        sequence: transport.nextSequence(),
+        payload: {
+          ...(executionId === undefined ? {} : { executionId }),
+          presetId: PRESET_A,
+          kind: "graph",
+          phase: "completed",
+          terminal: true,
+          outcome: "success",
+        } as never,
+      })
+    }
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-stale-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-other", presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(true)
+    expect(store.getSnapshot().revision).toBe(lockedRevision)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-valid-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-lock", presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    expect(store.getSnapshot().executionMutationLocked).toBe(false)
+    store.dispose()
+  })
  
   test("retains the last connection list when an explicit refresh fails", async () => {
     const editor = new FakeEditor()
@@ -931,6 +1355,184 @@ describe("APC frontend application state", () => {
     const reloaded = await store.hydrate(PRESET_A)
     expect(reloaded.stale).toBe(false)
     expect(reloaded.activeMode).toBe("parallel")
+    store.dispose()
+  })
+
+  test("projects current-execution trace summaries and rejects cross-preset stale responses", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const executionId = "550e8400-e29b-41d4-a716-446655440020"
+    const traceId = "550e8400-e29b-41d4-a716-446655440021"
+    transport.respond(createBackendActivityResponse({
+      correlationId: "550e8400-e29b-41d4-a716-446655440022",
+      sequence: transport.nextSequence(),
+      executionId,
+      presetId: PRESET_A,
+      kind: "execution",
+      phase: "started",
+      terminal: false,
+      traceId,
+      provider: "safe-provider",
+      model: "safe-model",
+      stageIndex: 0,
+      stageCount: 1,
+      runIndex: 0,
+      runCount: 1,
+      runStatus: "running",
+    }))
+    const executionKey = store.getSnapshot().execution.executionKey
+    expect(executionKey).toBe("execution-1")
+    if (executionKey === null) throw new Error("Expected an active execution")
+
+    const pending = store.loadTraces({ executionKey })
+    const listRequest = transport.sent.filter((message) => message.type === "list_traces").at(-1)
+    if (listRequest?.type !== "list_traces") throw new Error("list_traces request was not sent")
+    expect(listRequest.payload).toEqual({ presetId: PRESET_A, executionId })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: listRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: {
+        traces: [{
+          traceId,
+          executionId,
+          presetId: PRESET_A,
+          status: "completed",
+          startedAt: 1_000,
+          finishedAt: 2_000,
+          eventCount: 1,
+          preview: "Safe trace summary",
+        }],
+      },
+    })
+    const traces = await pending
+    const summary = traces.summaries[0]
+    if (summary === undefined) throw new Error("Expected a trace summary")
+    expect(summary.preview).toBe("Safe trace summary")
+    expect(summary.key).not.toContain(traceId)
+    expect(summary.key).not.toContain(executionId)
+    expect(JSON.stringify(traces)).not.toContain(traceId)
+    expect(JSON.stringify(traces)).not.toContain(executionId)
+
+    const detailPending = store.loadTrace(summary.key, { executionKey })
+    const detailRequest = transport.sent.filter((message) => message.type === "get_trace").at(-1)
+    if (detailRequest?.type !== "get_trace") throw new Error("get_trace request was not sent")
+    expect(detailRequest.payload).toEqual({ presetId: PRESET_A, executionId, traceId })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: detailRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: {
+        trace: {
+          traceId,
+          executionId,
+          presetId: PRESET_A,
+          status: "completed",
+          startedAt: 1_000,
+          finishedAt: 2_000,
+          eventCount: 1,
+          preview: "Safe trace summary",
+          events: [{
+            kind: "dispatch",
+            sequence: 1,
+            timestamp: 1_500,
+            status: "provider-internal",
+            preview: "Safe trace event",
+          }],
+        },
+      },
+    })
+    const detail = await detailPending
+    expect(detail.preview).toBe("Safe trace summary")
+    expect(detail.events[0]?.preview).toBe("Safe trace event")
+    expect(JSON.stringify(detail)).not.toContain(traceId)
+    expect(JSON.stringify(detail)).not.toContain(executionId)
+
+    const staleDetailPending = store.loadTrace(summary.key, { executionKey })
+    const staleDetailRequest = transport.sent.filter((message) => message.type === "get_trace").at(-1)
+    if (staleDetailRequest?.type !== "get_trace") throw new Error("stale get_trace request was not sent")
+    transport.respond(createBackendActivityResponse({
+      correlationId: "550e8400-e29b-41d4-a716-446655440023",
+      sequence: transport.nextSequence(),
+      executionId,
+      presetId: PRESET_A,
+      kind: "execution-terminal",
+      phase: "completed",
+      terminal: true,
+      outcome: "success",
+    }))
+    const replacementExecutionId = "550e8400-e29b-41d4-a716-446655440024"
+    transport.respond(createBackendActivityResponse({
+      correlationId: "550e8400-e29b-41d4-a716-446655440025",
+      sequence: transport.nextSequence(),
+      executionId: replacementExecutionId,
+      presetId: PRESET_A,
+      kind: "execution",
+      phase: "started",
+      terminal: false,
+    }))
+    expect(store.getSnapshot().execution.executionKey).toBe("execution-2")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: staleDetailRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: {
+        trace: {
+          traceId,
+          executionId,
+          presetId: PRESET_A,
+          status: "completed",
+          startedAt: 1_000,
+          finishedAt: 2_000,
+          eventCount: 1,
+          preview: "STALE DETAIL SHOULD NOT PROJECT",
+          events: [{
+            kind: "dispatch",
+            sequence: 1,
+            timestamp: 1_500,
+            status: "failed",
+            preview: "STALE DETAIL EVENT SHOULD NOT PROJECT",
+          }],
+        },
+      },
+    })
+    await expect(staleDetailPending).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(JSON.stringify(store.getSnapshot().traces)).not.toContain("STALE DETAIL")
+
+    const stalePending = store.loadTraces({ executionKey })
+    const staleRequest = transport.sent.filter((message) => message.type === "list_traces").at(-1)
+    if (staleRequest?.type !== "list_traces") throw new Error("stale list_traces request was not sent")
+    editor.switchPreset(PRESET_B, graphConfig())
+    await settleMicrotasks()
+    await settleMicrotasks()
+    expect(store.getSnapshot().presetId).toBe(PRESET_B)
+    expect(store.getSnapshot().hydrated).toBe(true)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: staleRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: {
+        traces: [{
+          traceId,
+          executionId,
+          presetId: PRESET_A,
+          status: "completed",
+          startedAt: 1_000,
+          finishedAt: 2_000,
+          eventCount: 1,
+          preview: "STALE TRACE SHOULD NOT PROJECT",
+        }],
+      },
+    })
+    await expect(stalePending).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(store.getSnapshot().traces).toEqual({ summaries: [], details: {} })
     store.dispose()
   })
 

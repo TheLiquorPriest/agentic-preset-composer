@@ -102,8 +102,8 @@ interface NormalizedEvent {
   readonly sequence: number
   readonly kind: string
   readonly metadata: TraceMetadata
-  readonly sourcePreview: string
   readonly preview: string
+  readonly previewTruncated: boolean
 }
 
 interface EventFit {
@@ -115,6 +115,8 @@ const MAX_RECORD_KEYS = 16
 const MAX_METADATA_KEYS = 64
 const MAX_METADATA_KEY_BYTES = 256
 const MAX_METADATA_VALUE_BYTES = MAX_TRACE_BYTES - 1_024
+// A fixed UTF-16 prefix prevents attacker-sized input from reaching truncateUtf8.
+const MAX_SOURCE_PREVIEW_CHARS = TRACE_PREVIEW_BYTES + 1
 
 const DANGEROUS_KEYS: ReadonlySet<string> = new Set(["prototype", "constructor"])
 const FORBIDDEN_METADATA_KEYS: Readonly<Record<string, true>> = {
@@ -276,6 +278,17 @@ function valueAt(values: ReadonlyMap<string, unknown>, key: string): unknown {
   return values.get(key)
 }
 
+function boundedPreview(source: string): Readonly<{ preview: string; truncated: boolean }> {
+  const boundedSource = source.length > MAX_SOURCE_PREVIEW_CHARS
+    ? source.slice(0, MAX_SOURCE_PREVIEW_CHARS)
+    : source
+  const preview = truncateUtf8(boundedSource, TRACE_PREVIEW_BYTES)
+  return Object.freeze({
+    preview,
+    truncated: boundedSource.length < source.length || preview.length < source.length,
+  })
+}
+
 function normalizeEvent(value: unknown): NormalizedEvent | undefined {
   const record = readRecord(value, EVENT_KEYS)
   if (!record.valid) return undefined
@@ -297,13 +310,13 @@ function normalizeEvent(value: unknown): NormalizedEvent | undefined {
   if (!metadata) return undefined
   const rawPreview = valueAt(record.values, "preview")
   if (rawPreview !== undefined && typeof rawPreview !== "string") return undefined
-  const sourcePreview = rawPreview ?? ""
+  const normalizedPreview = boundedPreview(rawPreview ?? "")
   return Object.freeze({
     sequence,
     kind: kindValue,
     metadata,
-    sourcePreview,
-    preview: truncateUtf8(sourcePreview, TRACE_PREVIEW_BYTES),
+    preview: normalizedPreview.preview,
+    previewTruncated: normalizedPreview.truncated,
   })
 }
 
@@ -313,7 +326,7 @@ function entryFrom(event: NormalizedEvent, preview: string): TraceEntry {
     kind: event.kind,
     metadata: event.metadata,
     preview,
-    previewTruncated: preview !== event.sourcePreview,
+    previewTruncated: event.previewTruncated || preview !== event.preview,
   })
 }
 
@@ -373,6 +386,7 @@ function admissionReason(result: AdmissionResult): TraceRejectionReason {
 }
 
 function fitEvent(trace: StoredTrace, event: NormalizedEvent, maxBytes: number): EventFit {
+  // Preview fitting only scans the already bounded preview, never raw input.
   const initial = entryFrom(event, event.preview)
   if (encodedBytes(wireTrace(trace, trace.status, trace.entries.concat(initial))) <= maxBytes) {
     return { accepted: true, event: initial }
@@ -383,7 +397,7 @@ function fitEvent(trace: StoredTrace, event: NormalizedEvent, maxBytes: number):
   let best: TraceEntry | undefined
   while (low <= high) {
     const byteLimit = Math.floor((low + high) / 2)
-    const candidate = entryFrom(event, truncateUtf8(event.sourcePreview, byteLimit))
+    const candidate = entryFrom(event, truncateUtf8(event.preview, byteLimit))
     const size = encodedBytes(wireTrace(trace, trace.status, trace.entries.concat(candidate)))
     if (size <= maxBytes) {
       best = candidate

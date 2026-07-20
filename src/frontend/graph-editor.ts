@@ -12,7 +12,9 @@ import type {
 import { createDefaultApcConfig } from "../config/schema"
 import { deriveModeAvailability, validateConfigForMode } from "../config/validate"
 import {
+  MAX_BINDINGS_PER_RUN,
   MAX_CONNECTION_SLOTS,
+  MAX_FINAL_INPUTS,
   MAX_NAME_CHARS,
   MAX_PARALLEL_WIDTH,
   MAX_RUNS_PER_PIPELINE,
@@ -22,6 +24,7 @@ import {
 } from "../config/limits"
 import type { ApcCatalogKey, ApcTranslate } from "../i18n/catalogs"
 import type {
+  ApcRunActivityStatus,
   ApcSaveErrorSurface,
   ApcSelection,
   ApcUiMessage,
@@ -39,6 +42,27 @@ const MODE_KEYS: Record<ApcMode, ApcCatalogKey> = {
   parallel: "mode.parallel",
 }
 const DEFAULT_RUN_TIMEOUT_MS = 60_000
+const RUN_STATUSES: readonly ApcRunActivityStatus[] = [
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "timed-out",
+  "skipped",
+]
+
+export type GraphEditorSurface = "all" | "navigation" | "topology"
+export type GraphEditorExecutionActivity = Readonly<{
+  stageIndex: number
+  runIndex: number
+  status: ApcRunActivityStatus
+}>
+export type GraphEditorExecutionProjection = Readonly<{
+  terminal: boolean
+  outcome?: "graph-fallback"
+  activity: readonly GraphEditorExecutionActivity[]
+}>
 
 /** Read-only data consumed by the embedded graph module. */
 export interface GraphEditorSnapshot {
@@ -57,6 +81,10 @@ export interface GraphEditorSnapshot {
   readonly stale?: boolean
   readonly finalResponseAvailable?: boolean
   readonly finalResponseBlockedReason?: ApcUiMessage
+  /** Safe, identity-free execution state used only to project topology status. */
+  readonly execution?: GraphEditorExecutionProjection
+  /** Explicit state-owner authority for rejecting every graph/config mutation. */
+  readonly mutationLocked?: boolean
   readonly locale?: string
 }
 
@@ -113,7 +141,9 @@ export interface GraphEditorOptions extends GraphEditorMutationCallbacks {
   readonly idFactory?: () => string | undefined
   readonly document?: Document
   readonly snapshot?: GraphEditorSnapshot
-  /** Optional generic host root for the single owned execution-mode toolbar. */
+  /** Defaults to all; split mounts use navigation on the left and topology in the center. */
+  readonly surface?: GraphEditorSurface
+  /** Optional host root for the navigation/all surface's single execution-mode toolbar. */
   readonly toolbarHost?: HTMLElement
   readonly state?: GraphEditorStateReader
   readonly liveRegion?: GraphEditorLiveRegion
@@ -125,6 +155,8 @@ export interface GraphEditorOptions extends GraphEditorMutationCallbacks {
   readonly threadFinalBlockedReason?: ApcUiMessage
   /** Emits navigation only. The state owner decides which separate detail pane to mount. */
   readonly onSelectionChange?: (selection: ApcSelection) => void | Promise<void>
+  /** Opens the selected thread's host-controlled Loom workspace without mutating graph state. */
+  readonly onOpenLoom?: (threadId: string) => void | Promise<void>
 }
 
 export interface GraphEditorHandle {
@@ -486,6 +518,30 @@ function runCount(pipeline: ApcPipelineV1): number {
   return pipeline.stages.reduce((total, stage) => total + stage.runs.length, 0)
 }
 
+type ParallelRunAttachment =
+  | Readonly<{ kind: "downstream"; runId: string }>
+  | Readonly<{ kind: "final" }>
+
+function parallelRunAttachment(
+  pipeline: ApcPipelineV1,
+  stageIndex: number,
+  reachableRunIds: ReadonlySet<string>,
+): ParallelRunAttachment | null {
+  for (let index = stageIndex + 1; index < pipeline.stages.length; index += 1) {
+    const stage = pipeline.stages[index]
+    if (stage === undefined) continue
+    for (const run of stage.runs) {
+      if (reachableRunIds.has(run.id) && run.inputs.length < MAX_BINDINGS_PER_RUN) {
+        return { kind: "downstream", runId: run.id }
+      }
+    }
+  }
+  if (pipeline.finalResponse.source === "main" && pipeline.finalResponse.inputs.length >= MAX_FINAL_INPUTS) {
+    return null
+  }
+  return { kind: "final" }
+}
+
 function canonicalMainFinalRunId(pipeline: ApcPipelineV1): string | undefined {
   if (pipeline.finalResponse.source !== "main" || pipeline.finalResponse.inputs.length !== 1) return undefined
   const input = pipeline.finalResponse.inputs[0]
@@ -540,13 +596,23 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   const document = options.document ?? globalThis.document
   if (!document) throw new Error("A document is required to mount the Agent Graph editor")
   const t = options.t
+  const surface: GraphEditorSurface =
+    options.surface === "navigation" || options.surface === "topology" ? options.surface : "all"
   const element = htmlElement(document, "section", "apc-graph-editor")
   element.dataset.apcGraphEditor = "true"
+  element.dataset.apcGraphRoot = "true"
   element.dataset.apcModule = "graph-editor"
+  element.dataset.apcGraphSurface = surface
   element.setAttribute("aria-label", t("graph.editorAria"))
-  const toolbarRoot = options.toolbarHost
+  const editorStatus = htmlElement(document, "div", "apc-editor-status")
+  editorStatus.dataset.apcEditorStatus = "true"
+  editorStatus.tabIndex = -1
+  editorStatus.setAttribute("aria-live", "polite")
+  let lastEditorStatusText: string | undefined
+  const toolbarRoot = surface !== "topology" && options.toolbarHost
     ? htmlElement(document, "div", "apc-graph-toolbar-contribution")
     : null
+  const ownsLiveRegion = surface !== "topology"
   if (toolbarRoot) {
     toolbarRoot.dataset.apcGraphToolbarOwned = "true"
     options.toolbarHost?.append(toolbarRoot)
@@ -608,8 +674,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     action,
     [`apc${kind[0].toUpperCase()}${kind.slice(1)}Key`]: uiKeyFor(kind, id),
   })
-
-  if (!liveRegion && options.dom?.createLiveRegion) {
+  if (ownsLiveRegion && !liveRegion && options.dom?.createLiveRegion) {
     liveRegion = options.dom.createLiveRegion(element, { priority: "polite", label: t("graph.editorAria") })
   }
 
@@ -641,6 +706,8 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
 
   const locked = (): boolean =>
     connectionSlotMutationPending ||
+    current.mutationLocked === true ||
+    (current.execution !== undefined && !current.execution.terminal) ||
     current.busy === true ||
     current.stale === true ||
     (current.blockedReasons?.length ?? 0) > 0
@@ -803,7 +870,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     )
   }
   const addConnectionSlot = (): void => {
-    if (!current.config || selectedMode() === "single") return
+    if (!current.config || selectedMode() !== "parallel") return
     if (current.config.connectionSlots.length >= MAX_CONNECTION_SLOTS) {
       announce(limitMessage(t("agentGraph.slot"), MAX_CONNECTION_SLOTS), "assertive")
       return
@@ -824,7 +891,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   }
 
   const renameConnectionSlot = (slotId: string, value: string): void => {
-    if (!current.config || selectedMode() === "single") return
+    if (!current.config || selectedMode() !== "parallel") return
     const label = sanitizeConnectionSlotLabel(value)
     if (label === null) {
       announce(t("validation.invalid"), "assertive")
@@ -850,7 +917,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   }
 
   const removeConnectionSlot = (slotId: string): void => {
-    if (!current.config || selectedMode() === "single") return
+    if (!current.config || selectedMode() !== "parallel") return
     const slot = current.config.connectionSlots.find((candidate) => candidate.id === slotId)
     if (!slot) return
     if (current.config.threads.some((thread) => thread.connectionSlotId === slotId)) {
@@ -885,12 +952,36 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const config = clone(current.config)
     const runId = allocateId(config)
     const stageId = allocateId(config, [runId])
+    const existingStageNames = new Set(pipeline.stages.map((stage) => stage.name))
+    let defaultStageIndex = pipeline.stages.length + 1
+    let defaultStageName = t("graph.defaultStageName", { index: defaultStageIndex })
+    for (let attempts = 0; existingStageNames.has(defaultStageName) && attempts <= pipeline.stages.length; attempts += 1) {
+      defaultStageIndex += 1
+      defaultStageName = t("graph.defaultStageName", { index: defaultStageIndex })
+    }
+    const runsById = new Map(pipeline.stages.flatMap((stage) => stage.runs).map((run) => [run.id, run]))
+    const priorFinalRunIds = pipeline.finalResponse.source === "thread"
+      ? [pipeline.finalResponse.runId]
+      : pipeline.finalResponse.inputs.map((input) => input.runId)
+    const inputs: ApcInputBindingV1[] = priorFinalRunIds.map((sourceRunId) => ({
+      source: "output",
+      runId: sourceRunId,
+      role: "user",
+      onMissing: runsById.get(sourceRunId)?.required === true ? "fail-graph" : "omit-binding",
+    }))
     const stage: ApcStageV1 = {
       id: stageId,
-      name: t("graph.defaultStageName", { index: pipeline.stages.length + 1 }),
-      runs: [defaultRun(thread.id, runId)],
+      name: defaultStageName,
+      runs: [{ ...defaultRun(thread.id, runId), inputs }],
     }
-    const next = updatePipeline(config, mode, (value) => ({ ...value, stages: [...value.stages, stage] }))
+    const finalResponse: ApcFinalResponseV1 = pipeline.finalResponse.source === "thread"
+      ? { source: "thread", runId }
+      : { source: "main", inputs: [{ source: "output", runId, onMissing: "fail-graph" }] }
+    const next = updatePipeline(config, mode, (value) => ({
+      ...value,
+      stages: [...value.stages, stage],
+      finalResponse,
+    }))
     emitMutation(next, { type: "config", config: clone(next), reason: "stage-added" }, "a11y.changeStageAdded", "Stage added.")
   }
 
@@ -906,13 +997,59 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const used = new Set(stage.runs.map((run) => run.threadId))
     const thread = current.config.threads.find((candidate) => !used.has(candidate.id))
     if (!thread) return
+    const stageIndex = pipeline.stages.findIndex((candidate) => candidate.id === stageId)
+    const reachableRunIds = validateConfigForMode(current.config, "parallel").reachableRunIds
+    const attachment = parallelRunAttachment(pipeline, stageIndex, reachableRunIds)
+    if (attachment === null) {
+      announce(limitMessage(t("graph.finalResponse"), MAX_FINAL_INPUTS), "assertive")
+      return
+    }
     const config = clone(current.config)
     const runId = allocateId(config)
+    const priorFinalResponse = pipeline.finalResponse
+    const priorFinalRun = priorFinalResponse.source === "thread"
+      ? pipeline.stages.flatMap((candidate) => candidate.runs)
+        .find((candidate) => candidate.id === priorFinalResponse.runId)
+      : undefined
+    const finalResponse: ApcFinalResponseV1 = attachment.kind === "downstream"
+      ? priorFinalResponse
+      : priorFinalResponse.source === "main"
+        ? {
+            source: "main",
+            inputs: [
+              ...priorFinalResponse.inputs,
+              { source: "output", runId, onMissing: "fail-graph" },
+            ],
+          }
+        : {
+            source: "main",
+            inputs: [
+              {
+                source: "output",
+                runId: priorFinalResponse.runId,
+                onMissing: priorFinalRun?.required === true ? "fail-graph" : "omit-binding",
+              },
+              { source: "output", runId, onMissing: "fail-graph" },
+            ],
+          }
     const next = updatePipeline(config, "parallel", (value) => ({
       ...value,
-      stages: value.stages.map((candidate) => candidate.id === stageId
-        ? { ...candidate, runs: [...candidate.runs, defaultRun(thread.id, runId)] }
-        : candidate),
+      stages: value.stages.map((candidate) => ({
+        ...candidate,
+        runs: [
+          ...candidate.runs.map((run) => attachment.kind === "downstream" && run.id === attachment.runId
+            ? {
+                ...run,
+                inputs: [
+                  ...run.inputs,
+                  { source: "output" as const, runId, role: "user" as const, onMissing: "fail-graph" as const },
+                ],
+              }
+            : run),
+          ...(candidate.id === stageId ? [defaultRun(thread.id, runId)] : []),
+        ],
+      })),
+      finalResponse,
     }))
     emitMutation(next, { type: "config", config: clone(next), reason: "run-added" }, "a11y.changeRunAdded", "Run added.")
   }
@@ -1189,6 +1326,58 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
 
   const runLabel = (config: ApcPresetConfigV1, run: ApcRunV1): string =>
     threadForRun(config, run)?.name || t("graph.missingThread")
+  type ProjectedStatus = ApcRunActivityStatus
+  let projectedRunStatuses = new Map<string, ProjectedStatus>()
+  const statusLabel = (status: ProjectedStatus): string => {
+    if (status === "running") return t("inspector.statusRunning")
+    if (status === "completed") return t("inspector.statusCompleted")
+    if (status === "failed") return t("inspector.statusFailed")
+    if (status === "cancelled") return t("inspector.statusCancelled")
+    if (status === "timed-out") return t("inspector.statusTimedOut")
+    if (status === "skipped") return t("inspector.statusSkipped")
+    return t("inspector.statusPending")
+  }
+  const projectExecutionStatuses = (pipeline: ApcPipelineV1 | undefined): void => {
+    const projected = new Map<string, ProjectedStatus>()
+    const execution = current.execution
+    if (!pipeline || !execution) {
+      projectedRunStatuses = projected
+      return
+    }
+    for (const stage of pipeline.stages) {
+      for (const run of stage.runs) projected.set(run.id, "pending")
+    }
+    for (const activity of execution.activity) {
+      const stageIndex = activity.stageIndex
+      const runIndex = activity.runIndex
+      if (
+        stageIndex === undefined ||
+        runIndex === undefined ||
+        !Number.isSafeInteger(stageIndex) ||
+        !Number.isSafeInteger(runIndex) ||
+        stageIndex < 0 ||
+        runIndex < 0
+      ) continue
+      if (!RUN_STATUSES.includes(activity.status)) continue
+      const run = pipeline.stages[stageIndex]?.runs[runIndex]
+      if (run) projected.set(run.id, activity.status)
+    }
+    projectedRunStatuses = projected
+  }
+  const stageStatus = (stage: ApcStageV1): ProjectedStatus | undefined => {
+    const statuses = stage.runs
+      .map((run) => projectedRunStatuses.get(run.id))
+      .filter((status): status is ProjectedStatus => status !== undefined)
+    if (!statuses.length) return undefined
+    if (statuses.includes("running")) return "running"
+    if (statuses.includes("failed")) return "failed"
+    if (statuses.includes("timed-out")) return "timed-out"
+    if (statuses.includes("cancelled")) return "cancelled"
+    if (statuses.every((status) => status === "completed" || status === "skipped")) {
+      return statuses.every((status) => status === "skipped") ? "skipped" : "completed"
+    }
+    return "pending"
+  }
 
   const bindingLabel = (config: ApcPresetConfigV1, pipeline: ApcPipelineV1, input: ApcInputBindingV1): string => {
     if (input.source === "literal") return t("binding.literal")
@@ -1262,24 +1451,41 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   }
 
   const renderStatus = (parent: HTMLElement): void => {
-    const status = htmlElement(document, "div", "apc-editor-status")
-    status.dataset.apcEditorStatus = "true"
-    status.tabIndex = -1
-    status.dataset.busy = String(current.busy === true)
-    status.dataset.dirty = String(current.dirty === true)
-    status.dataset.stale = String(current.stale === true)
+    editorStatus.dataset.busy = String(current.busy === true)
+    editorStatus.dataset.dirty = String(current.dirty === true)
+    editorStatus.dataset.stale = String(current.stale === true)
     const blockedReasons = current.blockedReasons ?? []
-    const executionLocked = blockedReasons.some((reason) => reason.key === "execution.running" || reason.key === "execution.starting")
-    status.dataset.lockState = current.stale ? "stale" : current.busy ? "saving" : executionLocked ? "execution" : blockedReasons.length ? "blocked" : "none"
-    status.setAttribute("aria-live", "polite")
-    status.setAttribute("role", current.saveError || current.stale ? "alert" : "status")
-    if (current.busy) status.textContent = t("status.busy")
-    else if (current.saveError) status.textContent = localizeMessage(current.saveError.message, t)
-    else if (current.stale) status.textContent = t("error.staleConfigReload")
-    else if (executionLocked) status.textContent = t("execution.running")
-    else if (current.dirty) status.textContent = t("status.unsavedChanges")
-    else status.textContent = t("status.saved")
-    parent.append(status)
+    const executionLocked =
+      (current.execution !== undefined && !current.execution.terminal) ||
+      blockedReasons.some((reason) => reason.key === "execution.running" || reason.key === "execution.starting")
+    editorStatus.dataset.lockState = current.stale
+      ? "stale"
+      : current.busy
+        ? "saving"
+        : executionLocked
+          ? "execution"
+          : current.mutationLocked || blockedReasons.length
+            ? "blocked"
+            : "none"
+    editorStatus.setAttribute("role", current.saveError || current.stale ? "alert" : "status")
+    const nextText = current.busy
+      ? t("status.busy")
+      : current.saveError
+        ? localizeMessage(current.saveError.message, t)
+        : current.stale
+          ? t("error.staleConfigReload")
+          : executionLocked
+            ? t("execution.running")
+            : current.mutationLocked
+              ? t("status.editorBusyOrBlocked")
+              : current.dirty
+                ? t("status.unsavedChanges")
+                : t("status.saved")
+    if (nextText !== lastEditorStatusText) {
+      editorStatus.textContent = nextText
+      lastEditorStatusText = nextText
+    }
+    parent.append(editorStatus)
     if (blockedReasons.length) {
       const blocked = htmlElement(document, "p", "apc-blocked-status")
       blocked.setAttribute("role", "alert")
@@ -1312,7 +1518,21 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       actionButton(document, copy(t, "action.createParallelGraph", "Create Parallel graph"), "create-graph", { mode: "parallel" }, true),
       actionButton(document, copy(t, "action.createSequentialGraph", "Create Sequential graph"), "create-graph", { mode: "sequential" }, true),
     )
-    empty.append(heading, description, steps, consent, actions)
+    const unavailableActions = htmlElement(document, "div", "apc-card-actions")
+    unavailableActions.dataset.apcUnavailableGraphActions = "true"
+    const unavailableStage = actionButton(document, t("action.addStage"), "add-stage", {}, true)
+    unavailableStage.disabled = true
+    unavailableStage.setAttribute("aria-disabled", "true")
+    unavailableStage.dataset.apcUnavailableGraphAction = "true"
+    const unavailableRun = actionButton(document, t("action.addRun"), "add-run", {}, true)
+    unavailableRun.disabled = true
+    unavailableRun.setAttribute("aria-disabled", "true")
+    unavailableRun.dataset.apcUnavailableGraphAction = "true"
+    const unavailableReason = htmlElement(document, "p", "apc-disabled-reason")
+    unavailableReason.setAttribute("role", "note")
+    unavailableReason.textContent = t("status.blockedReason", { reason: t("graph.emptyStepThread") })
+    unavailableActions.append(unavailableStage, unavailableRun)
+    empty.append(heading, description, steps, consent, actions, unavailableActions, unavailableReason)
     parent.append(empty)
   }
 
@@ -1390,25 +1610,31 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     parent.append(section)
   }
 
-  const renderThreadNavigation = (parent: HTMLElement, config: ApcPresetConfigV1): void => {
+  const renderThreadNavigation = (
+    parent: HTMLElement,
+    config: ApcPresetConfigV1,
+    pipeline?: ApcPipelineV1,
+  ): void => {
     const nav = htmlElement(document, "nav", "apc-thread-list")
     nav.dataset.apcThreadNavigation = "true"
     nav.setAttribute("aria-label", copy(t, "graph.threadNavigation", "Threads"))
-    const heading = htmlElement(document, "h3")
+    const heading = htmlElement(document, "h2")
     heading.textContent = t("graph.threads")
     const list = document.createElement("ul")
     config.threads.forEach((thread, index) => {
       const item = document.createElement("li")
       const threadKey = uiKeyFor("thread", thread.id)
       const selected = current.selection?.kind === "thread" && current.selection.threadId === thread.id
-      const control = actionButton(document, thread.name || t("graph.defaultThreadName", { index: index + 1 }), "select-thread", { apcThreadKey: threadKey })
+      const label = thread.name || t("graph.defaultThreadName", { index: index + 1 })
+      const control = actionButton(document, label, "select-thread", { apcThreadKey: threadKey })
       control.dataset.apcThreadSelect = "true"
       control.dataset.selected = String(selected)
       control.setAttribute("aria-pressed", String(selected))
-      control.setAttribute("aria-label", copy(t, "graph.selectThread", "Select thread {{thread}}", { thread: control.textContent ?? "" }))
+      control.setAttribute("aria-label", copy(t, "graph.selectThread", "Select thread {{thread}}", { thread: label }))
       const source = htmlElement(document, "span", "apc-thread-source")
       source.textContent = thread.workspaceSource === "native-blocks" ? t("workspace.nativeBlocks") : t("workspace.mainContext")
       const actions = htmlElement(document, "div", "apc-card-actions")
+      item.append(control, source, actions)
       const up = actionButton(document, t("action.moveUp"), "move-thread", { apcThreadKey: threadKey, direction: "up" }, true)
       const down = actionButton(document, t("action.moveDown"), "move-thread", { apcThreadKey: threadKey, direction: "down" }, true)
       up.disabled = index === 0
@@ -1417,8 +1643,13 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       const pipelineBlocked = threadOwnsEveryRunInPipeline(config, thread.id)
       const remove = actionButton(document, t("action.removeThread"), "remove-thread", { apcThreadKey: threadKey }, true)
       remove.disabled = config.threads.length <= 1 || finalBlocked || pipelineBlocked
+      if (options.onOpenLoom) {
+        const openLoomLabel = t("threadEditor.workspaceAria", { name: label })
+        const openLoom = actionButton(document, openLoomLabel, "open-loom", { apcThreadKey: threadKey })
+        openLoom.setAttribute("aria-label", openLoomLabel)
+        actions.append(openLoom)
+      }
       actions.append(up, down, remove)
-      item.append(control, source, actions)
       if (finalBlocked || pipelineBlocked) {
         const note = htmlElement(document, "span", "apc-disabled-reason")
         note.setAttribute("role", "note")
@@ -1438,6 +1669,44 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       note.setAttribute("role", "note")
       note.textContent = limitMessage(t("graph.threads"), MAX_THREADS)
       nav.append(note)
+    }
+    if (pipeline) {
+      const runsHeading = htmlElement(document, "h3")
+      runsHeading.textContent = t("agentGraph.run")
+      const orderedRuns = document.createElement("ol")
+      orderedRuns.dataset.apcRunNavigation = "true"
+      pipeline.stages.forEach((stage, stageIndex) => {
+        stage.runs.forEach((run, runIndex) => {
+          const item = document.createElement("li")
+          const runKey = uiKeyFor("run", run.id)
+          const selected = current.selection?.kind === "run" && current.selection.runId === run.id
+          const label = runLabel(config, run)
+          const control = actionButton(document, label, "select-run", { apcRunKey: runKey })
+          control.dataset.apcRunSelect = "true"
+          control.dataset.selected = String(selected)
+          control.setAttribute("aria-pressed", String(selected))
+          control.setAttribute("aria-label", copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", {
+            run: label,
+            stage: stageIndex + 1,
+          }))
+          const position = htmlElement(document, "span", "apc-run-meta")
+          position.textContent = copy(t, "graph.runStagePosition", "Run {{run}} · Stage {{stage}}", {
+            run: runIndex + 1,
+            stage: stageIndex + 1,
+          })
+          const status = projectedRunStatuses.get(run.id)
+          item.append(control, position)
+          if (status) {
+            item.dataset.status = status
+            item.dataset.activityStatus = status
+            const statusText = htmlElement(document, "span", "apc-run-status")
+            statusText.textContent = statusLabel(status)
+            item.append(statusText)
+          }
+          orderedRuns.append(item)
+        })
+      })
+      nav.append(runsHeading, orderedRuns)
     }
     parent.append(nav)
   }
@@ -1459,22 +1728,36 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     card.dataset.apcRunKey = runKey
     card.dataset.selected = String(selected)
     card.dataset.apcRunCard = "true"
+    if (mode === "sequential") {
+      card.dataset.apcMainDispatch = "true"
+      card.dataset.connectionSource = "main"
+    }
     const selectRun = actionButton(document, label, "select-run", { apcRunKey: runKey })
     selectRun.dataset.apcRunSelect = "true"
     selectRun.dataset.selected = String(selected)
     selectRun.setAttribute("aria-pressed", String(selected))
     selectRun.setAttribute("aria-label", copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", { run: label, stage: stageIndex + 1 }))
+    const runHeading = htmlElement(document, "h4")
+    runHeading.append(selectRun)
     const meta = htmlElement(document, "p", "apc-run-meta")
     meta.textContent = mode === "sequential"
-      ? stageIndex === 0
+      ? `${stageIndex === 0
         ? copy(t, "graph.startsWithPreset", "Starts with preset context")
         : copy(t, "graph.startsAfter", "Starts after {{thread}}", {
             thread: runLabel(config, pipeline.stages[stageIndex - 1].runs[0]),
-          })
+          })} · ${t("privacy.mainSource")}`
       : copy(t, "graph.parallelPosition", "Run {{run}} of stage {{stage}}", { run: runIndex + 1, stage: stageIndex + 1 })
     const flags = htmlElement(document, "p", "apc-run-flags")
     flags.textContent = `${run.required ? t("binding.required") : t("binding.optional")} · ${t("validation.timeoutValue", { seconds: run.timeoutMs / 1_000 })}`
-    card.append(selectRun, meta, flags)
+    card.append(runHeading, meta, flags)
+    const projectedStatus = projectedRunStatuses.get(run.id)
+    if (projectedStatus) {
+      card.dataset.status = projectedStatus
+      card.dataset.activityStatus = projectedStatus
+      const status = htmlElement(document, "p", "apc-run-status")
+      status.textContent = statusLabel(projectedStatus)
+      card.append(status)
+    }
     if (run.inputs.length) {
       const inputs = document.createElement("ul")
       inputs.className = "apc-run-inputs"
@@ -1516,17 +1799,29 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     mode: "sequential" | "parallel",
     stage: ApcStageV1,
     stageIndex: number,
+    reachableRunIds: ReadonlySet<string>,
   ): void => {
     const stageKey = uiKeyFor("stage", stage.id)
     const card = htmlElement(document, "section", "apc-stage-card")
     card.dataset.apcStageKey = stageKey
     card.dataset.apcStage = "true"
     card.dataset.stagePosition = String(stageIndex + 1)
+    if (mode === "sequential") {
+      card.dataset.apcCausalStage = "true"
+      card.setAttribute("role", "listitem")
+    }
     const heading = htmlElement(document, "h3")
     heading.textContent = copy(t, "graph.stageHeading", "Stage {{index}} · {{name}}", {
       index: stageIndex + 1,
       name: stage.name || t("graph.defaultStageName", { index: stageIndex + 1 }),
     })
+    const projectedStageStatus = stageStatus(stage)
+    const status = projectedStageStatus ? htmlElement(document, "p", "apc-stage-status") : null
+    if (projectedStageStatus && status) {
+      card.dataset.status = projectedStageStatus
+      card.dataset.activityStatus = projectedStageStatus
+      status.textContent = statusLabel(projectedStageStatus)
+    }
     const actions = htmlElement(document, "div", "apc-card-actions")
     const up = actionButton(document, t("action.moveUp"), "move-stage", { apcStageKey: stageKey, direction: "up" }, true)
     const down = actionButton(document, t("action.moveDown"), "move-stage", { apcStageKey: stageKey, direction: "down" }, true)
@@ -1544,9 +1839,11 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     }
     if (mode === "parallel") {
       const used = new Set(stage.runs.map((run) => run.threadId))
+      const attachment = parallelRunAttachment(pipeline, stageIndex, reachableRunIds)
       const canAdd = stage.runs.length < MAX_PARALLEL_WIDTH
         && runCount(pipeline) < MAX_RUNS_PER_PIPELINE
         && config.threads.some((thread) => !used.has(thread.id))
+        && attachment !== null
       const add = actionButton(document, t("action.addRun"), "add-run", { apcStageKey: stageKey }, true)
       add.disabled = !canAdd
       actions.append(add)
@@ -1557,13 +1854,17 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
           ? limitMessage(t("agentGraph.run"), MAX_RUNS_PER_PIPELINE)
           : stage.runs.length >= MAX_PARALLEL_WIDTH
             ? limitMessage(t("graph.parallelRuns"), MAX_PARALLEL_WIDTH)
-            : copy(t, "graph.noAvailableThreadForRun", "Add another thread before adding a distinct run to this stage.")
+            : !config.threads.some((thread) => !used.has(thread.id))
+              ? copy(t, "graph.noAvailableThreadForRun", "Add another thread before adding a distinct run to this stage.")
+              : limitMessage(t("graph.finalResponse"), MAX_FINAL_INPUTS)
         actions.append(note)
       }
     }
     const runs = htmlElement(document, "div", "apc-stage-runs")
     stage.runs.forEach((run, runIndex) => renderRunCard(runs, config, pipeline, mode, stage, stageIndex, run, runIndex))
-    card.append(heading, actions, runs)
+    card.prepend(heading)
+    if (status) heading.after(status)
+    card.append(actions, runs)
     renderConfirmation(card, "stage", stage.id, stage.name)
     parent.append(card)
   }
@@ -1596,6 +1897,25 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const actions = htmlElement(document, "div", "apc-card-actions")
     actions.append(main, thread)
     section.append(heading, actions)
+    const fallbackDelivered = current.execution?.terminal === true && current.execution.outcome === "graph-fallback"
+    const routeStatus = fallbackDelivered
+      ? "completed"
+      : currentFinalRun === undefined
+        ? undefined
+        : projectedRunStatuses.get(currentFinalRun.id)
+    if (routeStatus) {
+      section.dataset.status = routeStatus
+      section.dataset.activityStatus = routeStatus
+      const status = htmlElement(document, "p", "apc-final-route-status")
+      status.textContent = fallbackDelivered
+        ? `${t("fallback.title")} · ${t("fallback.main")}`
+        : statusLabel(routeStatus)
+      if (fallbackDelivered) {
+        section.dataset.outcome = "graph-fallback"
+        section.dataset.outcomeClass = "graph-fallback"
+      }
+      section.append(status)
+    }
     if (route.source === "thread") {
       const finalRun = pipeline.stages.flatMap((stage) => stage.runs).find((run) => run.id === route.runId)
       const output = htmlElement(document, "p", "apc-final-output")
@@ -1693,45 +2013,63 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   const renderGraph = (parent: HTMLElement, mode: "sequential" | "parallel", config: ApcPresetConfigV1, pipeline: ApcPipelineV1): void => {
     const workspace = htmlElement(document, "div", "apc-graph-workspace")
     workspace.dataset.apcGraphWorkspace = mode
-    renderConnectionSlots(workspace, config)
-    renderThreadNavigation(workspace, config)
-    const topology = htmlElement(document, "section", "apc-stage-list")
-    topology.dataset.apcTopology = mode
-    topology.setAttribute("aria-label", mode === "sequential"
-      ? copy(t, "graph.sequentialFlow", "Sequential agent flow")
-      : copy(t, "graph.parallelTopology", "Parallel agent graph"))
-    const heading = htmlElement(document, "h2")
-    heading.textContent = mode === "sequential"
-      ? copy(t, "graph.sequentialFlow", "Sequential agent flow")
-      : copy(t, "graph.parallelTopology", "Parallel agent graph")
-    const description = htmlElement(document, "p")
-    description.textContent = mode === "sequential"
-      ? copy(t, "graph.sequentialDescription", "Runs execute one at a time in configured stage order.")
-      : copy(t, "graph.parallelDescription", "Runs may overlap within a stage; stages remain ordered.")
-    const warning = htmlElement(document, "p", "apc-council-warning")
-    warning.setAttribute("role", "note")
-    warning.textContent = t("council.effects")
-    topology.append(heading, description, warning)
-    pipeline.stages.forEach((stage, stageIndex) => renderStage(topology, config, pipeline, mode, stage, stageIndex))
-    const graphActions = htmlElement(document, "div", "apc-card-actions")
-    const addStage = actionButton(document, t("action.addStage"), "add-stage", {}, true)
-    const stageLimitReached = pipeline.stages.length >= MAX_STAGES_PER_PIPELINE
-    const runLimitReached = runCount(pipeline) >= MAX_RUNS_PER_PIPELINE
-    addStage.disabled = stageLimitReached || runLimitReached
-    renderMissingGraphActions(topology, config)
-    graphActions.append(addStage)
-    if (stageLimitReached || runLimitReached) {
-      const note = htmlElement(document, "span", "apc-disabled-reason")
-      note.setAttribute("role", "note")
-      note.textContent = stageLimitReached
-        ? limitMessage(t("graph.stages"), MAX_STAGES_PER_PIPELINE)
-        : limitMessage(t("agentGraph.run"), MAX_RUNS_PER_PIPELINE)
-      graphActions.append(note)
+    if (surface === "navigation") renderThreadNavigation(workspace, config, pipeline)
+    else if (surface === "all") renderThreadNavigation(workspace, config)
+    if (surface !== "navigation") {
+      if (mode === "parallel") renderConnectionSlots(workspace, config)
+      const topology = htmlElement(document, "section", "apc-stage-list")
+      topology.dataset.apcTopology = mode
+      topology.setAttribute("aria-label", mode === "sequential"
+        ? copy(t, "graph.sequentialFlow", "Sequential agent flow")
+        : copy(t, "graph.parallelTopology", "Parallel agent graph"))
+      const heading = htmlElement(document, "h2")
+      heading.textContent = mode === "sequential"
+        ? copy(t, "graph.sequentialFlow", "Sequential agent flow")
+        : copy(t, "graph.parallelTopology", "Parallel agent graph")
+      const description = htmlElement(document, "p")
+      description.textContent = mode === "sequential"
+        ? `${copy(t, "graph.sequentialDescription", "Runs execute one at a time in configured stage order.")} ${t("privacy.mainSource")}.`
+        : copy(t, "graph.parallelDescription", "Runs may overlap within a stage; stages remain ordered.")
+      const warning = htmlElement(document, "section", "apc-council-warning")
+      warning.setAttribute("role", "note")
+      const warningHeading = htmlElement(document, "h3")
+      warningHeading.textContent = t("privacy.title")
+      const warningText = document.createElement("p")
+      warningText.textContent = t("council.effects")
+      warning.append(warningHeading, warningText)
+      topology.append(heading, description, warning)
+      const stages = htmlElement(document, "div", "apc-topology-stages")
+      if (mode === "sequential") {
+        stages.dataset.apcCausalChain = "true"
+        stages.dataset.connectionSource = "main"
+        stages.setAttribute("role", "list")
+      }
+      const reachableRunIds = mode === "parallel"
+        ? validateConfigForMode(config, "parallel").reachableRunIds
+        : new Set<string>()
+      pipeline.stages.forEach((stage, stageIndex) =>
+        renderStage(stages, config, pipeline, mode, stage, stageIndex, reachableRunIds))
+      topology.append(stages)
+      const graphActions = htmlElement(document, "div", "apc-card-actions")
+      const addStage = actionButton(document, t("action.addStage"), "add-stage", {}, true)
+      const stageLimitReached = pipeline.stages.length >= MAX_STAGES_PER_PIPELINE
+      const runLimitReached = runCount(pipeline) >= MAX_RUNS_PER_PIPELINE
+      addStage.disabled = stageLimitReached || runLimitReached
+      renderMissingGraphActions(topology, config)
+      graphActions.append(addStage)
+      if (stageLimitReached || runLimitReached) {
+        const note = htmlElement(document, "span", "apc-disabled-reason")
+        note.setAttribute("role", "note")
+        note.textContent = stageLimitReached
+          ? limitMessage(t("graph.stages"), MAX_STAGES_PER_PIPELINE)
+          : limitMessage(t("agentGraph.run"), MAX_RUNS_PER_PIPELINE)
+        graphActions.append(note)
+      }
+      topology.append(graphActions)
+      renderFinalRoute(topology, config, pipeline)
+      workspace.append(topology)
     }
-    topology.append(graphActions)
-    renderFinalRoute(topology, config, pipeline)
-    workspace.append(topology)
-    renderSelectionDetail(workspace, config, pipeline)
+    if (surface === "all") renderSelectionDetail(workspace, config, pipeline)
     parent.append(workspace)
   }
 
@@ -1801,15 +2139,21 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     renderRevision += 1
     const liveElement = liveRegion?.element
     element.replaceChildren()
-    if (toolbarRoot) {
-      toolbarRoot.replaceChildren()
-      renderToolbar(toolbarRoot)
-    } else {
-      renderToolbar(element)
+    if (surface !== "topology") {
+      if (toolbarRoot) {
+        toolbarRoot.replaceChildren()
+        renderToolbar(toolbarRoot)
+      } else {
+        renderToolbar(element)
+      }
+      renderStatus(element)
     }
-    renderStatus(element)
     const content = htmlElement(document, "div", "apc-graph-content")
     const mode = effectiveMode(current)
+    const pipeline = mode !== null && mode !== "single" && current.config
+      ? pipelineFor(current.config, mode)
+      : undefined
+    projectExecutionStatuses(pipeline)
     if (!mode) {
       const alert = htmlElement(document, "p", "apc-blocked")
       alert.setAttribute("role", "alert")
@@ -1822,23 +2166,28 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       content.append(alert)
     } else {
       const hasGraph = current.config.pipelines.sequential !== undefined || current.config.pipelines.parallel !== undefined
-      const pipeline = pipelineFor(current.config, mode)
-      if (!hasGraph || (mode !== "single" && !pipeline)) renderEmpty(content)
-      else if (mode === "single") {
-        const heading = htmlElement(document, "h2")
-        heading.textContent = t("mode.singleTitle")
-        const description = htmlElement(document, "p")
-        description.textContent = t("mode.singleDescription")
-        content.append(heading, description)
-        renderMissingGraphActions(content, current.config)
+      if (!hasGraph || (mode !== "single" && !pipeline)) {
+        if (surface === "navigation") renderThreadNavigation(content, current.config)
+        else renderEmpty(content)
+      } else if (mode === "single") {
+        if (surface === "navigation") {
+          renderThreadNavigation(content, current.config)
+        } else {
+          const heading = htmlElement(document, "h2")
+          heading.textContent = t("mode.singleTitle")
+          const description = htmlElement(document, "p")
+          description.textContent = t("mode.singleDescription")
+          content.append(heading, description)
+          renderMissingGraphActions(content, current.config)
+        }
       } else if (pipeline) {
         renderGraph(content, mode, current.config, pipeline)
       }
-      renderErrors(content, mode)
+      if (surface !== "navigation") renderErrors(content, mode)
     }
     element.append(content)
     applyMutationLocks()
-    if (liveElement && liveElement !== element) element.append(liveElement)
+    if (ownsLiveRegion && liveElement && liveElement !== element) element.append(liveElement)
     focusRequestedControl()
   }
 
@@ -1877,6 +2226,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       const mode = asMode(target.dataset.mode)
       if (mode === "sequential" || mode === "parallel") createGraph(mode, target.dataset.preserveMode !== "true")
     } else if (action === "select-thread" || action === "select-run") selectFromTarget(target)
+    else if (action === "open-loom" && threadId) invoke(() => options.onOpenLoom?.(threadId))
     else if (action === "add-thread") addThread()
     else if (action === "add-connection-slot") addConnectionSlot()
     else if (action === "add-stage") addStage()
@@ -2017,7 +2367,14 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     if (next.busy && !current.busy) announce(t("a11y.saving", { mode: modeLabel(effectiveMode(next) ?? "single", t) }))
     if (!next.busy && current.busy && !next.saveError) announce(t("a11y.saved", { mode: modeLabel(effectiveMode(next) ?? "single", t) }))
     if (next.stale && !current.stale) announce(t("error.staleConfigReload"), "assertive")
-    if (next.config !== current.config || next.busy || next.stale || (next.blockedReasons?.length ?? 0) > 0) {
+    if (
+      pendingConfirmation !== null ||
+      next.mutationLocked ||
+      (next.execution !== undefined && !next.execution.terminal) ||
+      next.busy ||
+      next.stale ||
+      (next.blockedReasons?.length ?? 0) > 0
+    ) {
       dismissPendingConfirmation()
     }
     current = next
@@ -2035,7 +2392,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     unsubscribeState = undefined
     pendingConfirmation = null
     graphIdCounter.value = 0
-    liveRegion?.cleanup?.()
+    if (ownsLiveRegion) liveRegion?.cleanup?.()
     liveRegion = undefined
     element.replaceChildren()
     toolbarRoot?.remove()
@@ -2072,6 +2429,8 @@ function normalizeSnapshot(snapshot: GraphEditorSnapshot | undefined): InternalS
     stale: snapshot?.stale ?? false,
     finalResponseAvailable: snapshot?.finalResponseAvailable,
     finalResponseBlockedReason: snapshot?.finalResponseBlockedReason,
+    execution: snapshot?.execution,
+    mutationLocked: snapshot?.mutationLocked ?? false,
     locale: snapshot?.locale,
   }
 }

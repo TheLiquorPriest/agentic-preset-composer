@@ -1,4 +1,6 @@
-import { MAX_CONNECTION_SLOTS } from "../config/limits"
+import { MAX_CONFIG_BYTES, MAX_CONNECTION_SLOTS } from "../config/limits"
+import { MAX_CONSENT_VIEWS } from "../protocol/messages"
+import { serializedUtf8Bytes } from "../config/plain-json"
 
 const SCHEMA_VERSION = 1 as const
 
@@ -9,7 +11,8 @@ export const INSTALL_RECORD_FILENAME = "install-record.json" as const
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const INSTALL_NONCE_PATTERN = /^[0-9a-f]{32}$/
 const OPAQUE_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/
-const PATH_SEGMENT_MAX_CHARS = 256
+export const PATH_SEGMENT_MAX_CHARS = 256
+const MAX_CONSENTS_PER_DOCUMENT = MAX_CONSENT_VIEWS
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"])
 const WORKSPACE_SOURCES = new Set(["native-blocks", "main-context"])
 
@@ -116,6 +119,16 @@ export class DocumentValidationError extends Error {
     super(message)
     this.name = "DocumentValidationError"
     Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+function assertDocumentByteLimit(value: unknown): void {
+  const serialized = serializedUtf8Bytes(value)
+  if (!serialized.ok) {
+    return fail(`Binding/consent document is not safe JSON (${serialized.error.code})`)
+  }
+  if (serialized.bytes > MAX_CONFIG_BYTES) {
+    return fail(`Binding/consent document exceeds ${MAX_CONFIG_BYTES} UTF-8 bytes`)
   }
 }
 
@@ -302,12 +315,19 @@ function freezeDocument(
   bindings: Record<string, BindingRecord>,
   consents: Record<string, ConsentRecord>,
 ): BindingConsentDocument {
-  return Object.freeze({
+  if (Object.keys(consents).length > MAX_CONSENTS_PER_DOCUMENT) {
+    return fail(
+      `Binding/consent document contains more than ${MAX_CONSENTS_PER_DOCUMENT} consents`,
+    )
+  }
+  const document = Object.freeze({
     schemaVersion: SCHEMA_VERSION,
     documentRevision,
     bindings: freezeMap(bindings),
     consents: freezeMap(consents),
   })
+  assertDocumentByteLimit(document)
+  return document
 }
 
 export function createEmptyBindingConsentDocument(): BindingConsentDocument {
@@ -418,13 +438,18 @@ function decodeMap<T>(
   decodeValue: (value: unknown) => T,
   expectedKey: (value: T) => string,
   seen: WeakSet<object>,
+  maxEntries?: number,
 ): Readonly<Record<string, T>> {
-  if (!isPlainRecord(value)) return fail(`${label} must be a plain JSON object`) 
+  if (!isPlainRecord(value)) return fail(`${label} must be a plain JSON object`)
   assertNoDangerousOwnKeys(value, label)
+  const names = Object.getOwnPropertyNames(value)
+  if (maxEntries !== undefined && names.length > maxEntries) {
+    return fail(`${label} contains more than ${maxEntries} entries`)
+  }
   assertNoCycles(value, seen, label)
   const output: Record<string, T> = {}
 
-  for (const key of Object.getOwnPropertyNames(value)) {
+  for (const key of names) {
     if (DANGEROUS_KEYS.has(key)) fail(`${label} contains a dangerous key: ${key}`)
     const decoded = decodeValue(property(value, key, label))
     if (key !== expectedKey(decoded)) fail(`${label} key does not match its value`)
@@ -444,6 +469,7 @@ function decodeBindingConsentDocumentInternal(
   if (property(value, "schemaVersion", "Binding/consent document") !== SCHEMA_VERSION) {
     return fail("Binding/consent document schemaVersion must be 1")
   }
+  assertDocumentByteLimit(value)
   const expectedPresetId =
     canonicalPresetId === undefined
       ? undefined
@@ -481,6 +507,7 @@ function decodeBindingConsentDocumentInternal(
     },
     (entry) => buildConsentKey(entry),
     seen,
+    MAX_CONSENTS_PER_DOCUMENT,
   )
   if (expectedPresetId !== undefined) {
     for (const binding of Object.values(bindings)) {

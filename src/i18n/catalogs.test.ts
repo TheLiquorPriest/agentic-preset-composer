@@ -11,9 +11,28 @@ import {
   interpolate,
   normalizeLocale,
   type ApcCatalog,
+  type ApcCatalogKey,
 } from "./catalogs"
 
 const PLACEHOLDER_PATTERN = /\{\{([A-Za-z][A-Za-z0-9_.-]*)\}\}/g
+
+const CONFORMANCE_KEYS = [
+  "graph.runPositionBindingImpact",
+  "consent.impactRequired",
+  "consent.impactOptional",
+  "consent.impactMixed",
+  "consent.impactUnscheduled",
+  "action.backToConfiguration",
+] as const satisfies readonly ApcCatalogKey[]
+
+const CONFORMANCE_PLACEHOLDERS = {
+  "graph.runPositionBindingImpact": [],
+  "consent.impactRequired": ["requiredCount"],
+  "consent.impactOptional": ["optionalCount"],
+  "consent.impactMixed": ["optionalCount", "requiredCount"],
+  "consent.impactUnscheduled": [],
+  "action.backToConfiguration": [],
+} as const satisfies Readonly<Record<(typeof CONFORMANCE_KEYS)[number], readonly string[]>>
 
 function keysOf(catalog: ApcCatalog): string[] {
   return Object.keys(catalog).sort()
@@ -32,6 +51,25 @@ describe("APC locale catalogs", () => {
     for (const [locale, catalog] of Object.entries(APC_CATALOGS)) {
       expect(APC_LOCALES).toContain(locale as (typeof APC_LOCALES)[number])
       expect(keysOf(catalog)).toEqual(expected)
+    }
+  })
+
+  test("keep conformance keys and placeholders aligned", () => {
+    const expected = [...CONFORMANCE_KEYS].sort()
+    const listed = APC_CATALOG_KEYS.filter((key) =>
+      CONFORMANCE_KEYS.includes(key as (typeof CONFORMANCE_KEYS)[number]),
+    ).sort()
+    expect(new Set(CONFORMANCE_KEYS).size).toBe(CONFORMANCE_KEYS.length)
+    expect(listed).toEqual(expected)
+
+    for (const locale of APC_LOCALES) {
+      const catalog = getCatalog(locale)
+      expect(keysOf(catalog).filter((key) =>
+        CONFORMANCE_KEYS.includes(key as (typeof CONFORMANCE_KEYS)[number]),
+      )).toEqual(expected)
+      for (const key of CONFORMANCE_KEYS) {
+        expect(placeholdersOf(catalog[key])).toEqual(CONFORMANCE_PLACEHOLDERS[key])
+      }
     }
   })
 

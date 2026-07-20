@@ -6,6 +6,7 @@ import type {
   ApcPresetConfigV1,
 } from "../config/schema"
 import { MAX_GUIDANCE_BYTES, MAX_THREAD_OUTPUT_BYTES } from "../config/limits"
+import { serializedUtf8Bytes } from "../config/plain-json"
 import {
   resolveFinalMainInputs,
   type SettledOutputs,
@@ -320,6 +321,26 @@ export function composeMainGuidance(
   }
 
   const frozenEntries = Object.freeze(entries)
+  const aggregateSize = serializedUtf8Bytes(frozenEntries)
+  if (!aggregateSize.ok || aggregateSize.bytes > MAX_GUIDANCE_BYTES) {
+    const aggregateFailure: GuidanceFailure = aggregateSize.ok
+      ? {
+          code: "GUIDANCE_LIMIT",
+          detail: "Final Main deferred guidance aggregate exceeds the guidance limit.",
+        }
+      : {
+          code: "OUTPUT_INVALID",
+          detail: "Final Main deferred guidance aggregate could not be serialized.",
+        }
+    return freeze({
+      mode,
+      applied: false,
+      entries: EMPTY_ENTRIES,
+      deferredGuidance: EMPTY_ENTRIES,
+      bindings: Object.freeze(bindings),
+      failure: freeze(aggregateFailure),
+    })
+  }
   return freeze({
     mode,
     applied: frozenEntries.length > 0,

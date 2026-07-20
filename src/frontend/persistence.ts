@@ -154,11 +154,14 @@ type SaveBatch = {
   waiters: SaveWaiter[]
 }
 
-type OwnedDraftTransaction = Readonly<{
+type OwnedDraftExpectation = Readonly<{
   lifecycle: number
   presetId: string
   metadata: string
 }>
+
+const MAX_OWNED_DRAFT_EXPECTATIONS = 64
+
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 type ApcRequestTimer = ReturnType<typeof setTimeout>
@@ -280,7 +283,7 @@ export class ApcPersistenceImpl implements ApcPersistence {
   #activeSaveBatch: SaveBatch | null = null
   #disposed = false
   readonly #flushLifecycleRejectors = new Set<(error: ApcPersistenceError) => void>()
-  #ownedTransaction: OwnedDraftTransaction | null = null
+  readonly #ownedExpectations: OwnedDraftExpectation[] = []
   #unsubscribeEditor: (() => void) | null
   #unsubscribeTransport: (() => void) | null = null
 
@@ -308,34 +311,60 @@ export class ApcPersistenceImpl implements ApcPersistence {
     }
   }
 
-  #beginOwnedTransaction(presetId: string, metadata: unknown): OwnedDraftTransaction | null {
+  #beginOwnedExpectation(presetId: string, metadata: unknown): OwnedDraftExpectation | null {
+    if (this.#ownedExpectations.some((expectation) =>
+      expectation.lifecycle !== this.#lifecycleGeneration || expectation.presetId !== presetId)) {
+      this.#ownedExpectations.length = 0
+    }
     const serialized = serializeJsonMetadata(metadata)
     if (serialized === null) return null
-    const transaction: OwnedDraftTransaction = {
+    for (let index = this.#ownedExpectations.length - 1; index >= 0; index -= 1) {
+      if (this.#ownedExpectations[index]?.metadata === serialized) this.#ownedExpectations.splice(index, 1)
+    }
+    const expectation: OwnedDraftExpectation = {
       lifecycle: this.#lifecycleGeneration,
       presetId,
       metadata: serialized,
     }
-    this.#ownedTransaction = transaction
-    return transaction
+    this.#ownedExpectations.push(expectation)
+    const excess = this.#ownedExpectations.length - MAX_OWNED_DRAFT_EXPECTATIONS
+    if (excess > 0) this.#ownedExpectations.splice(0, excess)
+    return expectation
   }
-
-  #endOwnedTransaction(transaction: OwnedDraftTransaction | null): void {
-    if (transaction !== null && this.#ownedTransaction === transaction) this.#ownedTransaction = null
+  #endOwnedExpectation(expectation: OwnedDraftExpectation | null): void {
+    if (expectation === null) return
+    const index = this.#ownedExpectations.indexOf(expectation)
+    if (index < 0) return
+    this.#ownedExpectations.splice(index, 1)
   }
 
   #ownedDraftEvent(state: ApcPresetEditorDraftState): boolean {
-    const transaction = this.#ownedTransaction
-    if (transaction === null) return false
-    if (transaction.lifecycle !== this.#lifecycleGeneration) {
-      this.#endOwnedTransaction(transaction)
+    const current = this.#editor.getState()
+    const activePresetId = current.presetId
+    if (
+      this.#ownedExpectations.some((expectation) =>
+        expectation.lifecycle !== this.#lifecycleGeneration || expectation.presetId !== activePresetId)
+    ) {
+      this.#ownedExpectations.length = 0
       return false
     }
+    if (state.presetId !== activePresetId) return false
     const serialized = serializeJsonMetadata(state.metadata)
-    if (state.presetId !== transaction.presetId || serialized !== transaction.metadata) {
-      this.#endOwnedTransaction(transaction)
+    const currentSerialized = serializeJsonMetadata(current.metadata)
+    const index = serialized === null
+      ? -1
+      : this.#ownedExpectations.findIndex((expectation) => expectation.metadata === serialized)
+    const matchesCurrent = serialized !== null && currentSerialized !== null && serialized === currentSerialized
+    if (!matchesCurrent) {
+      if (index < 0) return false
+      if (index > 0) this.#ownedExpectations.splice(0, index)
+      return true
+    }
+    if (index < 0 || index !== this.#ownedExpectations.length - 1) {
+      this.#ownedExpectations.length = 0
       return false
     }
+    if (index > 0) this.#ownedExpectations.splice(0, index)
     return true
   }
   handleInvalidMessage(raw: unknown): void {
@@ -423,12 +452,12 @@ export class ApcPersistenceImpl implements ApcPersistence {
     }
     const snapshot = cloneRollbackValue(raw)
     if (!snapshot.available) throw new TypeError("APC preset metadata must be cloneable")
-    const transaction = this.#beginOwnedTransaction(presetId, snapshot.value)
-    if (transaction === null) throw new TypeError("APC preset metadata must be JSON")
+    const expectation = this.#beginOwnedExpectation(presetId, snapshot.value)
+    if (expectation === null) throw new TypeError("APC preset metadata must be JSON")
     try {
       this.#editor.updateMetadata(() => snapshot.value)
     } catch (error) {
-      this.#endOwnedTransaction(transaction)
+      this.#endOwnedExpectation(expectation)
       throw error
     }
   }
@@ -569,7 +598,7 @@ export class ApcPersistenceImpl implements ApcPersistence {
     this.#lifecycleGeneration += 1
     this.#lastSequence = 0
     this.#retiredCorrelations.clear()
-    this.#ownedTransaction = null
+    this.#ownedExpectations.length = 0
     this.#saveScheduled = false
     this.#unsubscribeEditor?.()
     this.#unsubscribeEditor = null
@@ -740,17 +769,17 @@ export class ApcPersistenceImpl implements ApcPersistence {
         let mutated = false
         let failedBatchRaw: unknown = undefined
         let failedBatchRawAvailable = false
-        let transaction: OwnedDraftTransaction | null = null
+        let expectation: OwnedDraftExpectation | null = null
         try {
           before = this.#editor.getState()
           if (before.presetId !== batch.presetId) throw new ApcPersistenceError("NO_PRESET", "Preset editor changed before APC save")
           const snapshot = cloneRollbackValue(batch.raw)
-          transaction = snapshot.available ? this.#beginOwnedTransaction(batch.presetId, snapshot.value) : null
+          expectation = snapshot.available ? this.#beginOwnedExpectation(batch.presetId, snapshot.value) : null
           try {
             this.#editor.updateMetadata(() => snapshot.available ? snapshot.value : batch.raw)
             mutated = true
           } catch (error) {
-            this.#endOwnedTransaction(transaction)
+            this.#endOwnedExpectation(expectation)
             throw error
           }
           failedBatchRaw = snapshot.value
@@ -768,21 +797,21 @@ export class ApcPersistenceImpl implements ApcPersistence {
             mutated &&
             before !== null &&
             failedBatchRawAvailable &&
-            transaction !== null &&
-            this.#ownedTransaction === transaction
+            expectation !== null &&
+            this.#ownedExpectations.at(-1) === expectation
           ) {
             try {
               const current = this.#editor.getState()
               if (current.presetId === batch.presetId && sameJsonMetadata(current.metadata, failedBatchRaw)) {
-                this.#endOwnedTransaction(transaction)
-                transaction = this.#beginOwnedTransaction(batch.presetId, before.metadata)
-                if (transaction !== null) {
+                expectation = this.#beginOwnedExpectation(batch.presetId, before.metadata)
+                if (expectation !== null) {
                   try {
                     this.#editor.updateMetadata(() => before?.metadata)
-                    await this.#editor.flush()
-                  } finally {
-                    this.#endOwnedTransaction(transaction)
+                  } catch (rollbackError) {
+                    this.#endOwnedExpectation(expectation)
+                    throw rollbackError
                   }
+                  await this.#editor.flush()
                 }
               }
             } catch {
@@ -793,7 +822,6 @@ export class ApcPersistenceImpl implements ApcPersistence {
             for (const waiter of batch.waiters) waiter.reject(error)
           }
         } finally {
-          this.#endOwnedTransaction(transaction)
           if (this.#activeSaveBatch === batch) this.#activeSaveBatch = null
         }
       }

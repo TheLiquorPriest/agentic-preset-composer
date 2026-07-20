@@ -7,6 +7,8 @@ import { MAX_CONNECTION_SLOTS, MAX_THREADS } from "../config/limits"
 import {
   buildBindingKey,
   buildConsentKey,
+  DocumentValidationError,
+  PATH_SEGMENT_MAX_CHARS,
   reduceConsentIntent,
   type BindingConsentDocument,
   type ConsentRecord,
@@ -340,11 +342,24 @@ function text(value: unknown, label: string): string {
   return value
 }
 
-function uuid(value: unknown, label: string): string {
-  if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
-    return fail("INVALID_IDENTITY", `${label} must be a canonical lowercase UUID`)
+function identity(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > PATH_SEGMENT_MAX_CHARS ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return fail("INVALID_IDENTITY", `${label} must be a bounded non-empty path segment`)
   }
   return value
+}
+
+function uuid(value: unknown, label: string): string {
+  const candidate = identity(value, label)
+  if (!UUID_PATTERN.test(candidate)) {
+    return fail("INVALID_IDENTITY", `${label} must be a canonical lowercase UUID`)
+  }
+  return candidate
 }
 
 function revision(value: unknown): string {
@@ -438,7 +453,13 @@ function descriptorRevision(
 
 function mapStoreError(error: unknown): never {
   if (error instanceof ConsentError) throw error
+  if (error instanceof DocumentValidationError) {
+    return fail("STORAGE_FAILURE", "Consent document is outside persistence bounds", error)
+  }
   if (error instanceof AtomicJsonStoreError) {
+    if (error.code === "CORRUPT_DOCUMENT") {
+      return fail("STORAGE_FAILURE", "Persisted consent document is invalid", error)
+    }
     if (error.code === "REVISION_MISMATCH") return fail("STALE_DOCUMENT", error.message, error)
     if (error.code === "INSTALL_MISMATCH") return fail("INSTALL_MISMATCH", error.message, error)
     if (error.code === "STORAGE_FAILURE") return fail("STORAGE_FAILURE", error.message, error)
@@ -630,7 +651,7 @@ export class ConsentService {
   }
 
   private normalizeDisclosure(input: ConsentDisclosure): NormalizedConsentDisclosure {
-    const userId = text(input.userId, "disclosure.userId")
+    const userId = identity(input.userId, "disclosure.userId")
     const presetId = uuid(input.presetId, "disclosure.presetId")
     const threadId = text(input.threadId, "disclosure.threadId")
     const workspaceSource = workspace(input.workspaceSource)
@@ -672,7 +693,7 @@ export class ConsentService {
    * exposing the private installation, user, or dispatch fields to callers.
    */
   resolveDisclosure(userIdInput: string, selector: ConsentSelector): ConsentDisclosure | undefined {
-    const userId = text(userIdInput, "userId")
+    const userId = identity(userIdInput, "userId")
     const presetId = uuid(selector.presetId, "selector.presetId")
     const threadId = text(selector.threadId, "selector.threadId")
     const workspaceSource = selector.workspaceSource === undefined ? undefined : workspace(selector.workspaceSource)
@@ -708,7 +729,7 @@ export class ConsentService {
     descriptor?: HostDispatchDescriptor
     pendingDisclosure?: NormalizedConsentDisclosure
   } {
-    const userId = text(userIdInput, "userId")
+    const userId = identity(userIdInput, "userId")
     if (input.disclosure !== undefined) {
       const disclosure = this.normalizeDisclosure(input.disclosure)
       if (disclosure.userId !== userId) return fail("WRONG_USER", "Disclosure belongs to another user")
@@ -781,7 +802,8 @@ export class ConsentService {
 
 
   async grant(input: ConsentGrantInput): Promise<ConsentSnapshot> {
-    const userId = text(input.userId, "userId")
+    const userId = identity(input.userId, "userId")
+    const requestedPresetId = input.presetId === undefined ? undefined : uuid(input.presetId, "presetId")
     const normalizedDisclosure = input.disclosure === undefined
       ? undefined
       : this.normalizeDisclosure(input.disclosure)
@@ -791,11 +813,12 @@ export class ConsentService {
         : undefined
     const presetId = normalizedDisclosure?.presetId ?? normalizedConsent?.presetId
     if (presetId === undefined) return fail("MISSING_DISCLOSURE", "Grant requires a host disclosure")
-    const queuedInput: ConsentGrantInput = normalizedDisclosure === undefined
-      ? normalizedConsent === undefined
-        ? input
-        : { ...input, consent: normalizedConsent }
-      : { ...input, disclosure: normalizedDisclosure }
+    const queuedInput: ConsentGrantInput = {
+      ...input,
+      ...(requestedPresetId === undefined ? {} : { presetId: requestedPresetId }),
+      ...(normalizedDisclosure === undefined ? {} : { disclosure: normalizedDisclosure }),
+      ...(normalizedConsent === undefined ? {} : { consent: normalizedConsent }),
+    }
 
     return this.enqueueDocumentMutation(userId, presetId, async () => {
       const { record, pendingDisclosure } = this.disclosureToRecord(userId, queuedInput)
@@ -816,11 +839,16 @@ export class ConsentService {
       const key = buildConsentKey(record)
       if (initial.consents[key] !== undefined) return fail("DUPLICATE_CONSENT", "Consent is already granted")
       const pair = assertInstallPair(this.store.getInstallPair())
-      let replacement = reduceConsentIntent(initial, { type: "grant", consent: record })
-      const superseded = Object.values(replacement.consents)
-        .filter((candidate) => supersededBy(candidate, record))
-      for (const candidate of superseded) {
-        replacement = reduceConsentIntent(replacement, { type: "revoke", consent: candidate })
+      let replacement: BindingConsentDocument = initial
+      try {
+        const superseded = Object.values(initial.consents)
+          .filter((candidate) => supersededBy(candidate, record))
+        for (const candidate of superseded) {
+          replacement = reduceConsentIntent(replacement, { type: "revoke", consent: candidate })
+        }
+        replacement = reduceConsentIntent(replacement, { type: "grant", consent: record })
+      } catch (error) {
+        return mapStoreError(error)
       }
       let current: BindingConsentDocument
       try {
@@ -884,7 +912,7 @@ export class ConsentService {
     selector: ConsentSelector,
     expectedDocumentRevision?: number,
   ): Promise<ConsentSnapshot> {
-    const userId = text(userIdInput, "userId")
+    const userId = identity(userIdInput, "userId")
     const presetId = uuid(selector.presetId, "selector.presetId")
     const threadId = text(selector.threadId, "selector.threadId")
     const workspaceSource = selector.workspaceSource === undefined ? undefined : workspace(selector.workspaceSource)
@@ -917,7 +945,7 @@ export class ConsentService {
   }
 
   async revoke(input: ConsentRevokeInput): Promise<ConsentSnapshot> {
-    const userId = text(input.userId, "userId")
+    const userId = identity(input.userId, "userId")
     const selector = input.selector
     const presetId = uuid(selector.presetId, "selector.presetId")
     const threadId = text(selector.threadId, "selector.threadId")
@@ -1002,10 +1030,10 @@ export class ConsentService {
   }
 
   async listConsents(userIdInput: string, presetIdInput: string): Promise<ConsentSnapshot> {
-    const userId = text(userIdInput, "userId")
+    const userId = identity(userIdInput, "userId")
     const presetId = uuid(presetIdInput, "presetId")
     const pair = assertInstallPair(this.store.getInstallPair())
-    const document = await this.store.readLatest(userId, presetId)
+    const document = await this.store.readLatest(userId, presetId).catch(mapStoreError)
     return snapshotFromDocument(userId, presetId, pair, document)
   }
 
@@ -1014,7 +1042,7 @@ export class ConsentService {
   }
 
   async authorize(input: ConsentAuthorizationInput): Promise<AuthorizedConsent> {
-    const userId = text(input.userId, "userId")
+    const userId = identity(input.userId, "userId")
     const presetId = uuid(input.presetId, "presetId")
     const threadId = text(input.threadId, "threadId")
     const workspaceSource = workspace(input.workspaceSource)
@@ -1033,7 +1061,7 @@ export class ConsentService {
       return fail("STALE_CONSENT", "Authorization descriptor does not match the source")
     }
     const pair = assertInstallPair(this.store.getInstallPair())
-    const document = await this.store.readLatest(userId, presetId)
+    const document = await this.store.readLatest(userId, presetId).catch(mapStoreError)
     const record = document.consents[buildConsentKey(
       pair.extensionInstallationId,
       pair.installNonce,
@@ -1087,7 +1115,7 @@ export class ConsentService {
   }
 
   async status(input: ConsentAuthorizationInput): Promise<ConsentStatus> {
-    const userId = text(input.userId, "userId")
+    const userId = identity(input.userId, "userId")
     const presetId = uuid(input.presetId, "presetId")
     return this.enqueueDocumentMutation(userId, presetId, () => this.statusInternal(input))
   }

@@ -5,7 +5,8 @@ import {
   AtomicJsonStoreError,
   type StorageAdapter,
 } from "./atomic-json-store"
-import { MAX_CONNECTION_SLOTS } from "../config/limits"
+import { MAX_CONFIG_BYTES, MAX_CONNECTION_SLOTS } from "../config/limits"
+import { MAX_CONSENT_VIEWS } from "../protocol/messages"
 import {
   buildBindingDocumentKey,
   buildBindingKey,
@@ -14,6 +15,7 @@ import {
   createEmptyBindingConsentDocument,
   decodeBindingConsentDocument,
   decodeInstallRecord,
+  DocumentValidationError,
   reduceBindingIntent,
   reduceConsentIntent,
 } from "./documents"
@@ -158,6 +160,45 @@ function persistedBindingDocument(
     documentRevision,
     bindings,
     consents: {},
+  }
+}
+
+function persistedConsentDocument(
+  presetId: string,
+  count: number,
+  documentRevision = 0,
+): Record<string, unknown> {
+  const consents: Record<string, unknown> = {}
+  const sourceKeys = [
+    "main",
+    ...Array.from(
+      { length: MAX_CONNECTION_SLOTS },
+      (_, index) => `slot:${generatedUuid(0x400 + index)}`,
+    ),
+  ]
+  for (let index = 0; index < count; index += 1) {
+    const sourceKey = sourceKeys[index % sourceKeys.length]!
+    const threadIndex = Math.floor(index / sourceKeys.length)
+    const threadId = threadIndex === 0 ? "main" : generatedUuid(0x500 + threadIndex)
+    const connectionId = sourceKey === "main" ? null : generatedUuid(0x600 + index)
+    const consent = {
+      installId: HOST_A,
+      nonce: INSTALL_NONCE_A,
+      presetId,
+      threadId,
+      workspaceSource: "main-context" as const,
+      connectionSourceKey: sourceKey,
+      connectionId,
+      dispatchRevision: `revision-${index}`,
+      disclosureVersion: 1,
+    }
+    consents[buildConsentKey(consent)] = consent
+  }
+  return {
+    schemaVersion: 1,
+    documentRevision,
+    bindings: {},
+    consents,
   }
 }
 
@@ -629,6 +670,38 @@ describe("AtomicJsonStore", () => {
     const persisted = JSON.parse(storage.files.get(path)!)
     expect(persisted).toMatchObject({ documentRevision: 9 })
   })
+  it("bounds persisted consent cardinality and serialized document bytes", async () => {
+    const maxConsents = MAX_CONSENT_VIEWS
+    const atLimit = persistedConsentDocument(PRESET_ID, maxConsents, 3)
+    expect(Object.keys(decodeBindingConsentDocument(atLimit, PRESET_ID).consents)).toHaveLength(maxConsents)
+
+    const overCardinality = persistedConsentDocument(PRESET_ID, maxConsents + 1, 4)
+    expect(() => decodeBindingConsentDocument(overCardinality, PRESET_ID)).toThrow(DocumentValidationError)
+
+    const storage = new MemoryStorage()
+    const store = new AtomicJsonStore(storage, { nonceGenerator: nonceFactory("x", "a") })
+    await store.initialize(HOST_A)
+    const userId = "persisted-oversized-consent-document-user"
+    const path = buildBindingDocumentKey(userId, PRESET_ID)
+    const oversized = {
+      ...persistedConsentDocument(PRESET_ID, 0, 5),
+      documentRevision: "x".repeat(MAX_CONFIG_BYTES),
+    }
+    const bytes = JSON.stringify(oversized)
+    storage.files.set(path, bytes)
+
+    await expect(store.readDocument(userId, PRESET_ID)).rejects.toMatchObject<
+      Partial<AtomicJsonStoreError>
+    >({ code: "CORRUPT_DOCUMENT" })
+    expect(storage.files.get(path)).toBe(bytes)
+    const padded = `${" ".repeat(MAX_CONFIG_BYTES)}${JSON.stringify(createEmptyBindingConsentDocument())}`
+    storage.files.set(path, padded)
+    await expect(store.readDocument(userId, PRESET_ID)).rejects.toMatchObject<
+      Partial<AtomicJsonStoreError>
+    >({ code: "CORRUPT_DOCUMENT" })
+    expect(storage.files.get(path)).toBe(padded)
+  })
+
 
   it("accepts exactly MAX_CONNECTION_SLOTS persisted bindings", async () => {
     const storage = new MemoryStorage()

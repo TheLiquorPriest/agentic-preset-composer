@@ -1,10 +1,13 @@
 // @ts-ignore Bun provides the test module at runtime; extension bundles exclude tests.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import { JSDOM } from "jsdom"
-import type { ApcMode, ApcPresetConfigV1 } from "../config/schema"
+import type { ApcMode, ApcPresetConfigV1, ApcRunV1, ApcStageV1 } from "../config/schema"
 import {
+  MAX_BINDINGS_PER_RUN,
   MAX_CONNECTION_SLOTS,
+  MAX_FINAL_INPUTS,
   MAX_NAME_CHARS,
+  MIN_RUN_TIMEOUT_MS,
   MAX_RUNS_PER_PIPELINE,
   MAX_STAGES_PER_PIPELINE,
   MAX_THREADS,
@@ -135,6 +138,77 @@ function baseConfig(mode: ApcMode = "sequential"): ApcPresetConfigV1 {
 
 function generatedId(index: number): string {
   return `00000000-0000-4000-8000-${index.toString().padStart(12, "0")}`
+}
+
+function capacityBoundParallelConfig(kind: "downstream" | "final"): Readonly<{
+  config: ApcPresetConfigV1
+  targetStageName: string
+  finalRunId?: string
+}> {
+  const config = baseConfig("parallel")
+  config.threads = Array.from({ length: 4 }, (_, index) => ({
+    ...structuredClone(config.threads[index % config.threads.length]!),
+    id: generatedId(700 + index),
+    name: `Capacity thread ${index + 1}`,
+  }))
+  const sourceCounts = kind === "downstream"
+    ? [4, 4, 4, 4, 4, 4, 4, 1, 3]
+    : [4, 4, 4, 4, 4, 4, 4, 3, 1]
+  const sourceRuns: ApcRunV1[] = []
+  const stages: ApcStageV1[] = sourceCounts.map((count, stageIndex) => {
+    const runs = Array.from({ length: count }, (_, runIndex): ApcRunV1 => ({
+      id: generatedId(800 + sourceRuns.length + runIndex),
+      threadId: config.threads[runIndex]!.id,
+      required: true,
+      timeoutMs: MIN_RUN_TIMEOUT_MS,
+      inputs: [],
+    }))
+    sourceRuns.push(...runs)
+    return {
+      id: generatedId(900 + stageIndex),
+      name: `Capacity source ${stageIndex + 1}`,
+      runs,
+    }
+  })
+  const targetStageName = stages.at(-1)!.name
+  if (kind === "final") {
+    config.pipelines.parallel = {
+      id: generatedId(950),
+      stages,
+      finalResponse: {
+        source: "main",
+        inputs: sourceRuns.map((run) => ({
+          source: "output",
+          runId: run.id,
+          onMissing: "fail-graph",
+        })),
+      },
+    }
+    return { config, targetStageName }
+  }
+  const finalRunId = generatedId(960)
+  stages.push({
+    id: generatedId(959),
+    name: "Capacity final",
+    runs: [{
+      id: finalRunId,
+      threadId: config.threads[0]!.id,
+      required: true,
+      timeoutMs: MIN_RUN_TIMEOUT_MS,
+      inputs: sourceRuns.map((run) => ({
+        source: "output",
+        runId: run.id,
+        role: "user",
+        onMissing: "fail-graph",
+      })),
+    }],
+  })
+  config.pipelines.parallel = {
+    id: generatedId(950),
+    stages,
+    finalResponse: { source: "thread", runId: finalRunId },
+  }
+  return { config, targetStageName, finalRunId }
 }
 
 function collisionFactory(ids: readonly string[]): () => string {
@@ -275,6 +349,10 @@ describe("APC compact graph editor", () => {
     expect(mounted.root.querySelector('[data-mode="sequential"]')?.hasAttribute("disabled")).toBe(true)
     expect(mounted.root.querySelector('[data-mode="parallel"]')?.hasAttribute("disabled")).toBe(true)
     expect(mounted.root.querySelectorAll('[data-action="create-graph"]')).toHaveLength(2)
+    const unavailable = mounted.root.querySelectorAll<HTMLButtonElement>("[data-apc-unavailable-graph-action=true]")
+    expect(unavailable).toHaveLength(2)
+    expect([...unavailable].every((control) => control.disabled)).toBe(true)
+    expect(mounted.root.querySelector("[data-apc-unavailable-graph-actions=true] + [role=note]")?.textContent).not.toBe("")
     expect(mounted.getSnapshot().config?.threads).toHaveLength(0)
     expect(mounted.getSnapshot().config?.pipelines.parallel).toBeUndefined()
     expect(mounted.mutations).toHaveLength(0)
@@ -495,11 +573,20 @@ describe("APC compact graph editor", () => {
     expect(browser.window.document.activeElement?.getAttribute("data-action")).toBe("select-run")
     expect(browser.window.document.activeElement?.getAttribute("data-apc-run-key")).toBe(lockedRunKey)
 
+    const draftConfig = baseConfig("parallel")
+    const draftSnapshot = { ...configuredSnapshot("parallel"), config: draftConfig }
+    const draftDismissed = mount(draftSnapshot)
+    clickElement(runAction(draftDismissed.root, "Research", "Researcher", "remove-run"))
+    draftConfig.pipelines.parallel!.stages[0]!.name = "Externally changed"
+    draftDismissed.handle.render(draftSnapshot)
+    expect(draftDismissed.root.querySelector("[data-apc-confirmation=true]")).toBeNull()
+
     mounted.handle.destroy()
     stageMounted.handle.destroy()
     threadMounted.handle.destroy()
     mutationDismissed.handle.destroy()
     lockDismissed.handle.destroy()
+    draftDismissed.handle.destroy()
   })
 
   test("locks mutations for execution, saving, and stale state while preserving graph navigation", () => {
@@ -578,7 +665,50 @@ describe("APC compact graph editor", () => {
     click(mounted.root, '[data-action="add-stage"]')
 
     expect(mounted.mutations.at(-1)).toMatchObject({ type: "config", reason: "stage-added" })
+    const mutation = mounted.mutations.at(-1)
+    if (mutation?.type !== "config") throw new Error("stage mutation missing")
+    const pipeline = mutation.config.pipelines.parallel
+    const addedRun = pipeline?.stages.at(-1)?.runs[0]
+    expect(addedRun?.inputs).toEqual([{
+      source: "output",
+      runId: IDS.runC,
+      role: "user",
+      onMissing: "fail-graph",
+    }])
+    expect(pipeline?.finalResponse).toEqual({ source: "thread", runId: addedRun?.id })
+    expect(validateConfigForMode(mutation.config, "parallel").valid).toBe(true)
     expect(browser.window.document.activeElement?.getAttribute("data-action")).toBe("add-stage")
+    mounted.handle.destroy()
+  })
+
+  test("extends a Main-routed graph without orphaning the existing topology", () => {
+    const config = baseConfig("sequential")
+    const pipeline = config.pipelines.sequential
+    if (!pipeline) throw new Error("sequential pipeline missing")
+    pipeline.stages[1]!.name = "Stage 3"
+    pipeline.finalResponse = {
+      source: "main",
+      inputs: [{ source: "output", runId: IDS.runB, onMissing: "fail-graph" }],
+    }
+    const mounted = mount({ ...configuredSnapshot("sequential"), config })
+    click(mounted.root, '[data-action="add-stage"]')
+
+    const mutation = mounted.mutations.at(-1)
+    if (mutation?.type !== "config") throw new Error("stage mutation missing")
+    const updated = mutation.config.pipelines.sequential
+    const addedRun = updated?.stages.at(-1)?.runs[0]
+    expect(updated?.stages.at(-1)?.name).toBe("Stage 4")
+    expect(addedRun?.inputs).toEqual([{
+      source: "output",
+      runId: IDS.runB,
+      role: "user",
+      onMissing: "fail-graph",
+    }])
+    expect(updated?.finalResponse).toEqual({
+      source: "main",
+      inputs: [{ source: "output", runId: addedRun?.id, onMissing: "fail-graph" }],
+    })
+    expect(validateConfigForMode(mutation.config, "sequential").valid).toBe(true)
     mounted.handle.destroy()
   })
 
@@ -924,6 +1054,89 @@ describe("APC compact graph editor", () => {
     expect((mounted.root.querySelector('[data-action="add-connection-slot"]') as HTMLButtonElement).disabled).toBe(true)
     mounted.handle.destroy()
   })
+
+  test("keeps a newly added parallel sibling reachable from the final response", () => {
+    const config = baseConfig("parallel")
+    const spareThreadId = generatedId(905)
+    config.threads.push({ ...structuredClone(config.threads[1]), id: spareThreadId, name: "Spare thread" })
+    const mounted = mount(
+      { ...configuredSnapshot("parallel"), config },
+      { idFactory: () => generatedId(906) },
+    )
+    click(mounted.root, '[data-action="add-run"]')
+    const updated = mounted.getSnapshot().config
+    if (updated === null) throw new Error("parallel config disappeared")
+    const addedRun = updated.pipelines.parallel?.stages[0]?.runs.find(
+      (run) => run.threadId === spareThreadId,
+    )
+    expect(addedRun?.id).toBe(generatedId(906))
+    expect(updated.pipelines.parallel?.finalResponse).toEqual({
+      source: "thread",
+      runId: IDS.runC,
+    })
+    expect(updated.pipelines.parallel?.stages[1]?.runs[0]?.inputs).toContainEqual({
+      source: "output",
+      runId: generatedId(906),
+      role: "user",
+      onMissing: "fail-graph",
+    })
+    expect(validateConfigForMode(updated, "parallel").valid).toBe(true)
+    mounted.handle.destroy()
+  })
+
+  test("falls back to a bounded Main final route when every reachable downstream run is full", () => {
+    const { config, targetStageName, finalRunId } = capacityBoundParallelConfig("downstream")
+    expect(validateConfigForMode(config, "parallel").issues).toEqual([])
+    const mounted = mount(
+      { ...configuredSnapshot("parallel"), config },
+      { idFactory: () => generatedId(970) },
+    )
+    const add = actionIn(mounted.root, "[data-apc-stage=true]", targetStageName, "add-run") as HTMLButtonElement
+    expect(add.disabled).toBe(false)
+    clickElement(add)
+    const updated = mounted.getSnapshot().config
+    if (updated === null) throw new Error("parallel config disappeared")
+    const addedRunId = updated.pipelines.parallel?.stages
+      .find((stage) => stage.name === targetStageName)
+      ?.runs.find((run) => run.threadId === updated.threads[3]!.id)?.id
+    expect(addedRunId).toBeDefined()
+    const fullDownstreamRun = updated.pipelines.parallel?.stages.at(-1)?.runs[0]
+    expect(fullDownstreamRun?.inputs).toHaveLength(MAX_BINDINGS_PER_RUN)
+    expect(updated.pipelines.parallel?.finalResponse).toEqual({
+      source: "main",
+      inputs: [
+        { source: "output", runId: finalRunId, onMissing: "fail-graph" },
+        { source: "output", runId: addedRunId, onMissing: "fail-graph" },
+      ],
+    })
+    expect(validateConfigForMode(updated, "parallel").valid).toBe(true)
+    mounted.handle.destroy()
+  })
+
+  test("fails closed when a terminal Main route is already at input capacity", () => {
+    const { config, targetStageName } = capacityBoundParallelConfig("final")
+    expect(validateConfigForMode(config, "parallel").issues).toEqual([])
+    expect(config.pipelines.parallel?.finalResponse.source === "main"
+      ? config.pipelines.parallel.finalResponse.inputs
+      : []).toHaveLength(MAX_FINAL_INPUTS)
+    const announcements: string[] = []
+    const mounted = mount(
+      { ...configuredSnapshot("parallel"), config },
+      {
+        idFactory: () => generatedId(971),
+        accessibility: { announce: (message) => announcements.push(message) },
+      },
+    )
+    const add = actionIn(mounted.root, "[data-apc-stage=true]", targetStageName, "add-run") as HTMLButtonElement
+    expect(add.disabled).toBe(true)
+    expect(add.parentElement?.textContent).toContain(String(MAX_FINAL_INPUTS))
+    add.removeAttribute("disabled")
+    clickElement(add)
+    expect(mounted.mutations).toHaveLength(0)
+    expect(announcements.some((message) => message.includes(String(MAX_FINAL_INPUTS)))).toBe(true)
+    mounted.handle.destroy()
+  })
+
   test("does not reuse removed thread or run identifiers", () => {
     const threadConfig = baseConfig("parallel")
     const removedThreadId = generatedId(1)
@@ -1008,6 +1221,297 @@ describe("APC compact graph editor", () => {
     const input = mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")
 
     expect(input?.value).toBe(hostile)
+    expect(mounted.root.querySelector("img, svg, script, iframe, object, embed")).toBeNull()
+    mounted.handle.destroy()
+  })
+
+  test("ignores a detached Parallel slot control after the editor renders Sequential", () => {
+    const slotId = generatedId(905)
+    const parallelConfig = baseConfig("parallel")
+    parallelConfig.connectionSlots = [{ id: slotId, label: "Research route" }]
+    const mounted = mount({ ...configuredSnapshot("parallel"), config: parallelConfig })
+    const detachedInput = mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")
+    expect(detachedInput).not.toBeNull()
+
+    const sequentialConfig = structuredClone(parallelConfig)
+    sequentialConfig.activeMode = "sequential"
+    mounted.handle.render({ ...configuredSnapshot("sequential"), config: sequentialConfig })
+    expect(mounted.root.querySelector("[data-apc-connection-slots=true]")).toBeNull()
+
+    if (detachedInput) {
+      detachedInput.value = "Detached rename"
+      detachedInput.dispatchEvent(new browser.window.Event("change", { bubbles: true }))
+    }
+
+    expect(mounted.mutations).toHaveLength(0)
+    expect(mounted.getSnapshot().config?.connectionSlots).toEqual([{ id: slotId, label: "Research route" }])
+    mounted.handle.destroy()
+  })
+  test("splits navigation and topology ownership without duplicating the host toolbar", () => {
+    const toolbarHost = browser.window.document.createElement("div")
+    browser.window.document.body.append(toolbarHost)
+    const opened: string[] = []
+    const snapshot = configuredSnapshot("parallel", { kind: "run", runId: IDS.runC })
+    const combined = mount(snapshot)
+    expect(combined.handle.element.dataset.apcGraphSurface).toBe("all")
+    expect(combined.root.querySelectorAll('[data-apc-graph-surface="all"]')).toHaveLength(1)
+    expect(combined.root.querySelectorAll('[data-apc-graph-root="true"][data-apc-graph-surface="all"]')).toHaveLength(1)
+    expect(combined.handle.element.tagName).toBe("SECTION")
+    expect(combined.root.querySelector("[data-apc-thread-navigation=true]")).not.toBeNull()
+    expect(combined.root.querySelector("[data-apc-topology=parallel]")).not.toBeNull()
+    expect(combined.root.querySelector("[data-apc-final-route=true]")).not.toBeNull()
+    expect(combined.root.querySelector("[data-apc-connection-slots=true]")).not.toBeNull()
+    expect(combined.root.querySelector('[data-action="open-loom"]')).toBeNull()
+    expect(combined.root.querySelector("[data-apc-run-navigation=true]")).toBeNull()
+    expect(combined.root.querySelectorAll("[data-apc-run-select=true]")).toHaveLength(3)
+    const selectedRun = runAction(combined.root, "Synthesis", "Researcher", "select-run")
+    selectedRun.focus()
+    key(selectedRun, "ArrowUp")
+    expect(browser.window.document.activeElement?.textContent).toContain("Writer")
+    combined.handle.destroy()
+    const navigation = mount(snapshot, {
+      surface: "navigation",
+      toolbarHost,
+      onOpenLoom: (threadId) => { opened.push(threadId) },
+    })
+    const topology = mount(snapshot, { surface: "topology", toolbarHost })
+
+    expect(navigation.handle.element.dataset.apcGraphSurface).toBe("navigation")
+    expect(topology.handle.element.dataset.apcGraphSurface).toBe("topology")
+    expect(navigation.root.querySelectorAll('[data-apc-graph-surface="navigation"]')).toHaveLength(1)
+    expect(topology.root.querySelectorAll('[data-apc-graph-surface="topology"]')).toHaveLength(1)
+    expect(navigation.root.querySelectorAll(
+      '[data-apc-graph-root="true"][data-apc-graph-surface="navigation"]',
+    )).toHaveLength(1)
+    expect(topology.root.querySelectorAll(
+      '[data-apc-graph-root="true"][data-apc-graph-surface="topology"]',
+    )).toHaveLength(1)
+    expect(navigation.handle.element.tagName).toBe("SECTION")
+    expect(topology.handle.element.tagName).toBe("SECTION")
+    expect(toolbarHost.querySelectorAll("[data-apc-graph-toolbar-owned=true]")).toHaveLength(1)
+    expect(toolbarHost.querySelectorAll('[role="radiogroup"]')).toHaveLength(1)
+    expect(navigation.root.querySelector("[data-apc-thread-navigation=true]")).not.toBeNull()
+    expect(navigation.root.querySelector("[data-apc-topology]")).toBeNull()
+    expect(navigation.root.querySelector("[data-apc-final-route=true]")).toBeNull()
+    expect(navigation.root.querySelector("[data-apc-connection-slots=true]")).toBeNull()
+    expect(topology.root.querySelector("[data-apc-thread-navigation=true]")).toBeNull()
+    expect(topology.root.querySelector("[data-apc-topology=parallel]")).not.toBeNull()
+    expect(topology.root.querySelector("[data-apc-final-route=true]")).not.toBeNull()
+    expect(topology.root.querySelector("[data-apc-connection-slots=true]")).not.toBeNull()
+    expect(topology.root.querySelector('[role="radiogroup"]')).toBeNull()
+    expect(topology.root.querySelector("[data-apc-editor-status=true]")).toBeNull()
+
+    const runOrder = [...navigation.root.querySelectorAll<HTMLElement>("[data-apc-run-navigation=true] > li")]
+      .map((item) => item.querySelector("[data-apc-run-select=true]")?.textContent)
+    expect(runOrder).toEqual(["Researcher", "Writer", "Researcher"])
+    expect(navigation.root.querySelector("[data-apc-run-navigation=true] [data-selected=true]")?.textContent)
+      .toContain("Researcher")
+    clickElement(threadAction(navigation.root, "Writer", "open-loom"))
+    expect(opened).toEqual([IDS.threadB])
+
+    const callbacklessNavigation = mount(snapshot, { surface: "navigation" })
+    expect(callbacklessNavigation.root.querySelector('[data-action="open-loom"]')).toBeNull()
+    callbacklessNavigation.handle.destroy()
+
+    topology.handle.destroy()
+    navigation.handle.destroy()
+  })
+
+  test("renders Sequential as a Main-dispatch causal chain and Parallel with slot and final-route controls", () => {
+    const sequentialConfig = baseConfig("sequential")
+    const slotId = generatedId(920)
+    sequentialConfig.connectionSlots = [{ id: slotId, label: "Hidden override" }]
+    sequentialConfig.threads[0].connectionSlotId = slotId
+    const sequential = mount({ ...configuredSnapshot("sequential"), config: sequentialConfig }, { surface: "topology" })
+
+    expect(sequential.root.querySelector("[data-apc-connection-slots=true]")).toBeNull()
+    expect(sequential.root.querySelector("[data-apc-connection-slot-label=true]")).toBeNull()
+    expect(sequential.root.querySelector('[data-action="add-connection-slot"], [data-action="remove-connection-slot"]')).toBeNull()
+    const causalStages = [...sequential.root.querySelectorAll<HTMLElement>("[data-apc-causal-chain=true] > [data-apc-causal-stage=true]")]
+    expect(causalStages.map((stage) => stage.dataset.stagePosition)).toEqual(["1", "2"])
+    expect(causalStages.map((stage) => stage.querySelectorAll("[data-apc-run-card=true]").length)).toEqual([1, 1])
+    expect(causalStages.map((stage) => stage.querySelector("[data-apc-run-select=true]")?.textContent))
+      .toEqual(["Researcher", "Writer"])
+    expect(causalStages.map((stage) => stage.querySelector("[data-apc-main-dispatch=true]")?.textContent))
+      .toEqual([
+        expect.stringContaining(t("privacy.mainSource")),
+        expect.stringContaining(t("privacy.mainSource")),
+      ])
+    expect(sequential.root.querySelector("[data-apc-causal-chain=true]")?.getAttribute("data-connection-source")).toBe("main")
+    expect(sequential.root.querySelector("[data-apc-final-route=true]")).not.toBeNull()
+
+    const parallelConfig = baseConfig("parallel")
+    parallelConfig.connectionSlots = [{ id: slotId, label: "Research route" }]
+    const parallel = mount({ ...configuredSnapshot("parallel"), config: parallelConfig }, { surface: "topology" })
+    const slotSection = parallel.root.querySelector<HTMLElement>("[data-apc-connection-slots=true]")
+    expect(slotSection?.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")?.value)
+      .toBe("Research route")
+    expect(slotSection?.querySelector('[data-action="add-connection-slot"]')).not.toBeNull()
+    expect(slotSection?.querySelector('[data-action="remove-connection-slot"]')).not.toBeNull()
+    expect(parallel.root.outerHTML).not.toContain(slotId)
+    const finalRoute = parallel.root.querySelector<HTMLElement>("[data-apc-final-route=true]")
+    expect(finalRoute).not.toBeNull()
+    expect(finalRoute?.querySelector('[data-action="final-main"]')).not.toBeNull()
+    expect(finalRoute?.querySelector('[data-action="final-thread"]')).not.toBeNull()
+    expect(parallel.root.querySelector("[data-apc-run-card=true] .apc-run-inputs")).not.toBeNull()
+    expect(parallel.root.querySelector(".apc-council-warning h3")).not.toBeNull()
+    expect(parallel.root.querySelector("[data-apc-topology=parallel] h2")).not.toBeNull()
+
+    sequential.handle.destroy()
+    parallel.handle.destroy()
+  })
+
+  test("projects only bounded activity positions to textual data-status states and Main Graph-fallback delivery", () => {
+    const snapshot = configuredSnapshot("parallel")
+    const mounted = mount({
+      ...snapshot,
+      execution: {
+        terminal: false,
+        activity: [
+          { stageIndex: 0, runIndex: 0, status: "completed" },
+          { stageIndex: 0, runIndex: 1, status: "failed" },
+          { stageIndex: 99, runIndex: 99, status: "timed-out" },
+        ],
+      },
+    }, { surface: "topology" })
+    const card = (stage: string, thread: string): HTMLElement =>
+      runAction(mounted.root, stage, thread, "select-run").closest<HTMLElement>("[data-apc-run-card=true]")!
+
+    expect(card("Research", "Researcher").dataset.status).toBe("completed")
+    expect(card("Research", "Researcher").textContent).toContain(t("inspector.statusCompleted"))
+    expect(card("Research", "Writer").dataset.status).toBe("failed")
+    expect(card("Synthesis", "Researcher").dataset.status).toBe("pending")
+    expect(card("Research", "Writer").textContent).toContain(t("inspector.statusFailed"))
+    expect(mounted.root.querySelectorAll('[data-status="timed-out"]')).toHaveLength(0)
+    expect(card("Synthesis", "Researcher").textContent).toContain(t("inspector.statusPending"))
+
+    for (const status of ["running", "cancelled", "timed-out", "skipped"] as const) {
+      mounted.handle.render({
+        ...snapshot,
+        execution: { terminal: false, activity: [{ stageIndex: 1, runIndex: 0, status }] },
+      })
+      expect(card("Synthesis", "Researcher").dataset.status).toBe(status)
+      expect(card("Synthesis", "Researcher").textContent).toContain(
+        t(status === "running"
+          ? "inspector.statusRunning"
+          : status === "cancelled"
+            ? "inspector.statusCancelled"
+            : status === "timed-out"
+              ? "inspector.statusTimedOut"
+              : "inspector.statusSkipped"),
+      )
+    }
+
+    mounted.handle.render({
+      ...snapshot,
+      execution: { terminal: true, outcome: "graph-fallback", activity: [] },
+    })
+    const finalRoute = mounted.root.querySelector<HTMLElement>("[data-apc-final-route=true]")
+    expect(finalRoute?.dataset.status).toBe("completed")
+    expect(finalRoute?.dataset.outcome).toBe("graph-fallback")
+    expect(finalRoute?.dataset.outcomeClass).toBe("graph-fallback")
+    expect(finalRoute?.textContent).toContain(t("fallback.main"))
+    mounted.handle.destroy()
+  })
+
+  test("rejects explicit and nonterminal execution mutation locks without blocking selection or Open Loom", () => {
+    const snapshot = configuredSnapshot("parallel")
+    let configCalls = 0
+    let modeCalls = 0
+    let slotCalls = 0
+    const opened: string[] = []
+    const lockedSnapshot: GraphEditorSnapshot = {
+      ...snapshot,
+      mutationLocked: true,
+      execution: { terminal: false, activity: [{ stageIndex: 0, runIndex: 0, status: "running" }] },
+    }
+    const mounted = mount(lockedSnapshot, {
+      onConfigChange: () => { configCalls += 1 },
+      onModeChange: () => { modeCalls += 1 },
+      onAddConnectionSlot: () => { slotCalls += 1 },
+      onOpenLoom: (threadId) => { opened.push(threadId) },
+    })
+
+    expect([...mounted.root.querySelectorAll<HTMLButtonElement>("[data-apc-mutates=true]")]
+      .every((control) => control.disabled && control.getAttribute("aria-disabled") === "true")).toBe(true)
+    clickElement(runAction(mounted.root, "Synthesis", "Researcher", "select-run"))
+    clickElement(threadAction(mounted.root, "Writer", "open-loom"))
+    expect(mounted.selections.at(-1)).toEqual({ kind: "run", runId: IDS.runC })
+    expect(opened).toEqual([IDS.threadB])
+
+    for (const selector of [
+      '[data-action="add-stage"]',
+      '[data-action="add-connection-slot"]',
+      '[data-action="select-mode"][data-mode="sequential"]',
+    ]) {
+      const control = mounted.root.querySelector<HTMLButtonElement>(selector)
+      expect(control).not.toBeNull()
+      control?.removeAttribute("disabled")
+      control?.removeAttribute("aria-disabled")
+      if (control) clickElement(control)
+    }
+    expect(mounted.mutations).toHaveLength(0)
+    expect(configCalls).toBe(0)
+    expect(modeCalls).toBe(0)
+    expect(slotCalls).toBe(0)
+
+    mounted.handle.render({
+      ...snapshot,
+      mutationLocked: false,
+      execution: { terminal: false, activity: [{ stageIndex: 0, runIndex: 0, status: "running" }] },
+    })
+    const nonterminalAddStage = mounted.root.querySelector<HTMLButtonElement>('[data-action="add-stage"]')
+    expect(nonterminalAddStage?.disabled).toBe(true)
+    nonterminalAddStage?.removeAttribute("disabled")
+    nonterminalAddStage?.removeAttribute("aria-disabled")
+    if (nonterminalAddStage) clickElement(nonterminalAddStage)
+    expect(configCalls).toBe(0)
+
+    mounted.handle.render({
+      ...snapshot,
+      mutationLocked: false,
+      execution: { terminal: true, activity: [{ stageIndex: 1, runIndex: 0, status: "completed" }] },
+    })
+    expect(mounted.root.querySelector<HTMLButtonElement>('[data-action="add-stage"]')?.disabled).toBe(false)
+    click(mounted.root, '[data-action="add-stage"]')
+    expect(configCalls).toBe(1)
+    expect(mounted.mutations.at(-1)).toMatchObject({ type: "config", reason: "stage-added" })
+    mounted.handle.destroy()
+  })
+
+  test("keeps the editor status live node stable and silent across unchanged rerenders", () => {
+    const announcements: string[] = []
+    const liveElement = browser.window.document.createElement("div")
+    const snapshot = configuredSnapshot("parallel")
+    const mounted = mount(snapshot, {
+      liveRegion: {
+        element: liveElement,
+        announce: (message) => { announcements.push(message) },
+      },
+    })
+    const status = mounted.root.querySelector<HTMLElement>("[data-apc-editor-status=true]")
+    const observer = new browser.window.MutationObserver(() => undefined)
+    if (status) observer.observe(status, { childList: true, characterData: true, subtree: true })
+
+    mounted.handle.render({ ...snapshot })
+
+    expect(mounted.root.querySelector("[data-apc-editor-status=true]")).toBe(status)
+    expect(observer.takeRecords()).toHaveLength(0)
+    expect(announcements).toHaveLength(0)
+    observer.disconnect()
+    mounted.handle.destroy()
+  })
+
+  test("renders hostile long navigation and topology labels as text without creating markup", () => {
+    const hostile = `<img src=x onerror="window.__apcInjected=1">${"界".repeat(512)}`
+    const config = baseConfig("parallel")
+    config.threads[0].name = hostile
+    config.pipelines.parallel!.stages[0].name = `<svg onload="window.__apcInjected=2">${"長".repeat(512)}`
+    const mounted = mount({ ...configuredSnapshot("parallel"), config })
+
+    expect(threadAction(mounted.root, hostile, "select-thread").textContent).toBe(hostile)
+    expect(mounted.root.querySelector("[data-apc-stage=true] h3")?.textContent).toContain("<svg")
+    expect(mounted.root.textContent).toContain("界".repeat(512))
     expect(mounted.root.querySelector("img, svg, script, iframe, object, embed")).toBeNull()
     mounted.handle.destroy()
   })

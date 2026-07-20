@@ -201,6 +201,8 @@ export interface ExecutionInspectorSnapshot {
   readonly status: InspectorExecutionStatus
   readonly terminal?: boolean
   readonly selection?: InspectorSelectionSnapshot
+  /** Safe projection of the active or terminally relevant run. */
+  readonly inspectedRun?: InspectorRunSnapshot
   readonly outcome?: InspectorOutcomeInput
   readonly outcomes?: readonly InspectorOutcomeInput[]
   readonly stages?: readonly InspectorStageSnapshot[]
@@ -232,6 +234,8 @@ export interface ExecutionInspectorOptions {
   readonly onStop?: () => void | Promise<void>
   /** Explicitly changes configuration; it does not retry an execution. */
   readonly onUseMainFallback?: () => void | Promise<void>
+  /** Dismisses the terminal inspector view without changing execution state. */
+  readonly onBackToConfiguration?: () => void
   readonly onLoadTraces?: () => void | Promise<void>
   readonly onLoadTrace?: (key: string) => void | Promise<void>
 }
@@ -255,7 +259,6 @@ const ABSOLUTE_MAX_ITEMS = 32
 const MAX_STAGE_ITEMS = 32
 const MAX_RUN_ITEMS = 64
 const MAX_TRACE_EVENTS = 64
-const MAX_TRACE_PREVIEW_BYTES = 2_048
 const MAX_SAFE_TEXT_BYTES = 4_096
 const MAX_LABEL_BYTES = 256
 const MAX_TRACE_KEY_BYTES = 128
@@ -431,6 +434,59 @@ function badge(documentRef: Document, label: string, kind: string): HTMLElement 
   return node
 }
 
+function statusShape(kind: string): string {
+  if (kind === "completed" || kind === "success" || kind === "delivered") return "✓"
+  if (kind === "running") return "●"
+  if (kind === "failed" || kind === "timed-out" || kind === "unavailable") return "×"
+  if (kind === "graph-fallback") return "◆"
+  if (kind === "cancelled" || kind === "skipped") return "—"
+  return "○"
+}
+
+function statusToken(documentRef: Document, label: string, kind: string): HTMLElement {
+  const node = badge(documentRef, label, kind)
+  node.classList.add("apc-inspector-status-token")
+  node.dataset.statusKind = kind
+  node.setAttribute("aria-label", label)
+  const shape = createElement(documentRef, "span", "apc-inspector-status-shape", statusShape(kind))
+  shape.setAttribute("aria-hidden", "true")
+  node.replaceChildren(shape, createElement(documentRef, "span", "apc-inspector-status-label", label))
+  return node
+}
+
+function appendStatusField(
+  documentRef: Document,
+  parent: HTMLElement,
+  label: string,
+  value: string,
+  key: string,
+  kind: string,
+): void {
+  const row = createElement(documentRef, "p", "apc-inspector-field")
+  row.dataset.inspectorField = key
+  row.append(
+    createElement(documentRef, "span", "apc-inspector-field-label", label),
+    statusToken(documentRef, value, kind),
+  )
+  parent.append(row)
+}
+
+function createQuestionSection(documentRef: Document, key: string, title: string): HTMLElement {
+  const node = createSection(documentRef, `question-${key}`, title)
+  node.classList.add("apc-inspector-question")
+  node.dataset.inspectorQuestion = key
+  return node
+}
+
+function appendSubsection(documentRef: Document, parent: HTMLElement, child: HTMLElement): void {
+  const heading = child.firstElementChild
+  if (heading?.tagName === "H3") {
+    const subheading = createElement(documentRef, "h4", heading.className, heading.textContent ?? "")
+    heading.replaceWith(subheading)
+  }
+  parent.append(child)
+}
+
 function statusLabel(status: InspectorExecutionStatus | InspectorStageStatus, t: ApcTranslate): string {
   switch (status) {
     case "running": return t("inspector.statusRunning")
@@ -536,6 +592,35 @@ function currentRun(snapshot: ExecutionInspectorSnapshot): CurrentRunContext | u
   return undefined
 }
 
+function inspectedRun(snapshot: ExecutionInspectorSnapshot): CurrentRunContext | undefined {
+  if (snapshot.inspectedRun) {
+    const stageLabel = snapshot.inspectedRun.stageLabel
+    return {
+      stage: {
+        status: snapshot.inspectedRun.status,
+        ...(stageLabel === undefined ? {} : { label: stageLabel }),
+      },
+      run: snapshot.inspectedRun,
+    }
+  }
+  const active = currentRun(snapshot)
+  if (active) return active
+  for (const stage of (snapshot.stages ?? []).slice(0, MAX_STAGE_ITEMS)) {
+    const run = stage.runs?.slice(0, MAX_RUN_ITEMS).find((item) => {
+      return item.status === "failed" || item.status === "timed-out"
+    })
+    if (run) return { stage, run }
+  }
+  const stages = (snapshot.stages ?? []).slice(0, MAX_STAGE_ITEMS)
+  for (let stageIndex = stages.length - 1; stageIndex >= 0; stageIndex -= 1) {
+    const stage = stages[stageIndex]
+    const runs = stage?.runs?.slice(0, MAX_RUN_ITEMS) ?? []
+    const run = runs[runs.length - 1]
+    if (stage && run) return { stage, run }
+  }
+  return undefined
+}
+
 function runTitle(run: InspectorRunSnapshot, t: ApcTranslate): string {
   const label = optionalLabel(run.label, t)
   if (label) return label
@@ -589,6 +674,7 @@ class InspectorController implements ExecutionInspectorController {
   #stopRequested = false
   #fallbackPending = false
   #tracePending = new Set<string>()
+  #traceKeyByButton = new WeakMap<HTMLButtonElement, string>()
   #destroyed = false
   #generation = 0
   #wasTerminal = false
@@ -627,7 +713,10 @@ class InspectorController implements ExecutionInspectorController {
     const hadInspectorFocus = activeElement instanceof this.#document.defaultView!.HTMLElement &&
       this.element.contains(activeElement)
     const activeAction = hadInspectorFocus ? activeElement.dataset.inspectorAction : undefined
-    const activeTraceKey = hadInspectorFocus ? activeElement.dataset.inspectorTraceKey : undefined
+    const activeTracePosition = hadInspectorFocus ? activeElement.dataset.inspectorTracePosition : undefined
+    const activeTraceKey = activeAction === "load-trace"
+      ? this.#traceKeyByButton.get(activeElement as HTMLButtonElement)
+      : undefined
     const previousTitle = this.element.getAttribute("aria-label")
     const title = this.#options.t("inspector.title")
     if (previousTitle !== null && previousTitle !== title) this.#live.clear()
@@ -663,7 +752,7 @@ class InspectorController implements ExecutionInspectorController {
     this.element.setAttribute("aria-busy", snapshot.status === "running" ? "true" : "false")
 
     const content = createElement(this.#document, "div", "apc-inspector-content")
-    content.append(this.#renderHeader(snapshot))
+    content.append(this.#renderHeader(snapshot, outcome, terminal))
     content.dataset.inspectorContent = "true"
     if (view === "idle") content.append(this.#renderIdle())
     else if (view === "selected-thread") content.append(this.#renderSelectedThread(snapshot))
@@ -675,9 +764,11 @@ class InspectorController implements ExecutionInspectorController {
     if (hadInspectorFocus && !terminalTransition) {
       const replacement = activeAction === undefined
         ? null
-        : [...this.element.querySelectorAll<HTMLElement>("[data-inspector-action]")].find((candidate) => {
-            return candidate.dataset.inspectorAction === activeAction &&
-              (activeTraceKey === undefined || candidate.dataset.inspectorTraceKey === activeTraceKey)
+        : [...this.element.querySelectorAll<HTMLButtonElement>("[data-inspector-action]")].find((candidate) => {
+            if (candidate.dataset.inspectorAction !== activeAction) return false
+            if (activeTraceKey !== undefined) return this.#traceKeyByButton.get(candidate) === activeTraceKey
+            return activeTracePosition === undefined ||
+              candidate.dataset.inspectorTracePosition === activeTracePosition
           }) ?? null
       focusElement(replacement ?? this.element)
     }
@@ -714,13 +805,21 @@ class InspectorController implements ExecutionInspectorController {
     this.element.remove()
   }
 
-  #renderHeader(snapshot: ExecutionInspectorSnapshot): HTMLElement {
+  #renderHeader(
+    snapshot: ExecutionInspectorSnapshot,
+    outcome: InspectorOutcomeSnapshot,
+    terminal: boolean,
+  ): HTMLElement {
     const header = createElement(this.#document, "header", "apc-inspector-header")
     const heading = createElement(this.#document, "h2", "apc-inspector-title", this.#options.t("inspector.title"))
     header.append(heading)
     if (snapshot.status !== "idle") {
-      const status = badge(this.#document, statusLabel(snapshot.status, this.#options.t), snapshot.status)
-      status.dataset.inspectorStatus = snapshot.status
+      const isFallback = terminal && outcome.class === "graph-fallback"
+      const kind = isFallback ? "graph-fallback" : snapshot.status
+      const label = isFallback ? this.#options.t("fallback.title") : statusLabel(snapshot.status, this.#options.t)
+      const status = statusToken(this.#document, label, kind)
+      status.dataset.inspectorStatus = kind
+      if (isFallback) status.dataset.outcomeClass = "graph-fallback"
       header.append(status)
     }
     return header
@@ -802,12 +901,13 @@ class InspectorController implements ExecutionInspectorController {
         "run-position",
       )
     }
-    appendField(
+    appendStatusField(
       this.#document,
       node,
       this.#options.t("inspector.fieldStatus"),
       statusLabel(run.status, this.#options.t),
       "run-status",
+      run.status,
     )
     if (run.roleLabel) {
       appendField(this.#document, node, this.#options.t("binding.role"), displayLabel(run.roleLabel, this.#options.t), "run-role")
@@ -829,26 +929,56 @@ class InspectorController implements ExecutionInspectorController {
   ): HTMLElement {
     const fragment = createElement(this.#document, "div", "apc-inspector-execution")
     fragment.dataset.inspectorExecution = "true"
-    if (terminal) fragment.append(this.#renderOutcome(snapshot, outcome))
-    fragment.append(this.#renderProgress(snapshot))
-    if (Array.isArray(snapshot.stages)) fragment.append(this.#renderStages(snapshot))
-    const current = currentRun(snapshot)
-    if (current) fragment.append(this.#renderCurrentRun(current))
-    const dispatch = current?.run.dispatch ?? snapshot.currentDispatch ?? snapshot.finalRoute?.dispatch
-    if (dispatch) fragment.append(this.#renderDispatch(dispatch))
-    if (snapshot.deadline) fragment.append(this.#renderBudget(snapshot.deadline))
-    if (snapshot.usage) fragment.append(this.#renderUsage(snapshot.usage))
-    if (snapshot.cancellation?.requested === true) fragment.append(this.#renderCancellation(snapshot.cancellation))
-    fragment.append(this.#renderActivity(snapshot))
+    const run = inspectedRun(snapshot)
+
+    const ran = createQuestionSection(this.#document, "ran", this.#options.t("agentGraph.run"))
+    appendSubsection(this.#document, ran, this.#renderProgress(snapshot))
+    if (Array.isArray(snapshot.stages)) appendSubsection(this.#document, ran, this.#renderStages(snapshot))
+    if (run) appendSubsection(this.#document, ran, this.#renderCurrentRun(run))
+    const dispatch = run?.run.dispatch ?? snapshot.currentDispatch ?? snapshot.finalRoute?.dispatch
+    if (dispatch) appendSubsection(this.#document, ran, this.#renderDispatch(dispatch))
+    fragment.append(ran)
+
+    const inputs = createQuestionSection(this.#document, "inputs", this.#options.t("graph.inputs"))
+    appendSubsection(this.#document, inputs, this.#renderInputs(run?.run.inputSources ?? []))
+    if (snapshot.usage) appendSubsection(this.#document, inputs, this.#renderUsage(snapshot.usage))
+    fragment.append(inputs)
+
+    const happened = createQuestionSection(this.#document, "happened", this.#options.t("inspector.outcome"))
+    if (terminal) {
+      appendSubsection(this.#document, happened, this.#renderOutcome(outcome))
+    } else {
+      appendStatusField(
+        this.#document,
+        happened,
+        this.#options.t("inspector.fieldStatus"),
+        statusLabel(snapshot.status, this.#options.t),
+        "execution-status",
+        snapshot.status,
+      )
+    }
+    if (snapshot.deadline) appendSubsection(this.#document, happened, this.#renderBudget(snapshot.deadline))
+    if (snapshot.cancellation?.requested === true) {
+      appendSubsection(this.#document, happened, this.#renderCancellation(snapshot.cancellation))
+    }
+    appendSubsection(this.#document, happened, this.#renderActivity(snapshot))
     let errorCount = 0
     if (snapshot.error) {
-      fragment.append(this.#renderError(snapshot.error, "execution"))
+      appendSubsection(this.#document, happened, this.#renderError(snapshot.error, "execution"))
       errorCount += 1
     }
     for (const error of (snapshot.errors ?? []).slice(0, this.#maxItems - errorCount)) {
-      fragment.append(this.#renderError(error, "execution"))
+      appendSubsection(this.#document, happened, this.#renderError(error, "execution"))
     }
-    if (!terminal && this.#canStop(snapshot)) fragment.append(this.#stopButton())
+    if (!terminal && this.#canStop(snapshot)) happened.append(this.#stopControl())
+    fragment.append(happened)
+
+    const delivered = createQuestionSection(this.#document, "delivered", this.#options.t("inspector.finalRoute"))
+    appendSubsection(this.#document, delivered, this.#renderDelivery(snapshot, outcome, terminal))
+    fragment.append(delivered)
+    if (terminal && snapshot.status !== "idle" && this.#options.onBackToConfiguration) {
+      fragment.append(this.#backToConfigurationButton())
+    }
     return fragment
   }
 
@@ -953,7 +1083,7 @@ class InspectorController implements ExecutionInspectorController {
         "run-position",
       )
     }
-    appendField(this.#document, node, this.#options.t("inspector.fieldStatus"), statusLabel(run.status, this.#options.t), "run-status")
+    appendStatusField(this.#document, node, this.#options.t("inspector.fieldStatus"), statusLabel(run.status, this.#options.t), "run-status", run.status)
     node.append(badge(
       this.#document,
       run.optional === true ? this.#options.t("binding.optional") : this.#options.t("binding.required"),
@@ -985,7 +1115,8 @@ class InspectorController implements ExecutionInspectorController {
     const model = optionalLabel(dispatch.descriptor?.model, this.#options.t)
     if (model) appendField(this.#document, node, this.#options.t("inspector.fieldModel"), model, "model")
     if (dispatch.status) {
-      appendField(this.#document, node, this.#options.t("inspector.fieldStatus"), statusLabel(dispatch.status === "dispatched" ? "running" : dispatch.status, this.#options.t), "dispatch-status")
+      const status = dispatch.status === "dispatched" ? "running" : dispatch.status
+      appendStatusField(this.#document, node, this.#options.t("inspector.fieldStatus"), statusLabel(status, this.#options.t), "dispatch-status", status)
     }
     return node
   }
@@ -1079,12 +1210,13 @@ class InspectorController implements ExecutionInspectorController {
       "output-label",
     )
     if (output?.available !== undefined) {
-      appendField(
+      appendStatusField(
         this.#document,
         node,
         this.#options.t("inspector.fieldStatus"),
         output.available ? this.#options.t("terminal.ready") : this.#options.t("terminal.unavailable"),
         "output-availability",
+        output.available ? "completed" : "failed",
       )
     }
     return node
@@ -1100,10 +1232,10 @@ class InspectorController implements ExecutionInspectorController {
     for (const stage of stages) {
       if (stage === null || typeof stage !== "object") continue
       const item = createElement(this.#document, "li", "apc-inspector-stage")
-      item.dataset.stageStatus = statusLabel(stage.status, this.#options.t)
+      item.dataset.stageStatus = stage.status
       item.append(
         createElement(this.#document, "h4", "apc-inspector-stage-title", stageTitle(stage.label, stage.index, this.#options.t)),
-        createElement(this.#document, "span", "apc-inspector-stage-status", statusLabel(stage.status, this.#options.t)),
+        statusToken(this.#document, statusLabel(stage.status, this.#options.t), stage.status),
       )
       if (stage.error) item.append(this.#renderError(stage.error, "stage"))
       const runs = Array.isArray(stage.runs) ? stage.runs.slice(0, MAX_RUN_ITEMS) : []
@@ -1112,10 +1244,10 @@ class InspectorController implements ExecutionInspectorController {
         for (const run of runs) {
           if (run === null || typeof run !== "object") continue
           const runItem = createElement(this.#document, "li", "apc-inspector-run")
-          runItem.dataset.runStatus = statusLabel(run.status, this.#options.t)
+          runItem.dataset.runStatus = run.status
           runItem.append(
             createElement(this.#document, "span", "apc-inspector-run-title", runTitle(run, this.#options.t)),
-            createElement(this.#document, "span", "apc-inspector-run-status", statusLabel(run.status, this.#options.t)),
+            statusToken(this.#document, statusLabel(run.status, this.#options.t), run.status),
           )
           if (run.error) runItem.append(this.#renderError(run.error, "run"))
           runList.append(runItem)
@@ -1162,7 +1294,7 @@ class InspectorController implements ExecutionInspectorController {
       item.dataset.activityStatus = activityItem.status
       const label = optionalLabel(activityItem.runLabel ?? activityItem.threadLabel, this.#options.t)
       if (label) item.append(createElement(this.#document, "span", "apc-inspector-activity-label", label))
-      item.append(createElement(this.#document, "span", "apc-inspector-activity-status", statusLabel(activityItem.status, this.#options.t)))
+      item.append(statusToken(this.#document, statusLabel(activityItem.status, this.#options.t), activityItem.status))
       const elapsed = durationValue(activityItem.elapsedMs, activeLocale(this.#options.locale))
       if (elapsed !== undefined) item.append(createElement(this.#document, "span", "apc-inspector-activity-duration", elapsed))
       if (activityItem.error) item.append(createElement(this.#document, "span", "apc-inspector-activity-error", errorMessage(activityItem.error, this.#options.t)))
@@ -1173,7 +1305,7 @@ class InspectorController implements ExecutionInspectorController {
   }
   #renderTraces(snapshot: ExecutionInspectorSnapshot): HTMLElement {
     const node = createSection(this.#document, "traces", this.#options.t("inspector.traces"))
-    const refresh = createElement(this.#document, "button", "apc-inspector-trace-refresh", this.#options.t("action.refreshConnections"))
+    const refresh = createElement(this.#document, "button", "apc-inspector-trace-refresh", this.#options.t("inspector.traces"))
     refresh.type = "button"
     refresh.dataset.inspectorAction = "load-traces"
     refresh.disabled = this.#options.onLoadTraces === undefined || this.#tracePending.has("list")
@@ -1188,14 +1320,14 @@ class InspectorController implements ExecutionInspectorController {
       const key = safeTraceKey(summary.key)
       if (key === undefined) continue
       const item = createElement(this.#document, "li", "apc-inspector-trace")
-      item.dataset.inspectorTraceKey = key
+      item.dataset.inspectorTracePosition = String(rendered + 1)
       item.append(createElement(
         this.#document,
         "h4",
         "apc-inspector-trace-title",
         this.#options.t("inspector.fieldTrace"),
       ))
-      appendField(this.#document, item, this.#options.t("inspector.fieldStatus"), statusLabel(summary.status, this.#options.t), "trace-status")
+      appendStatusField(this.#document, item, this.#options.t("inspector.fieldStatus"), statusLabel(summary.status, this.#options.t), "trace-status", summary.status)
 
       const count = finiteNonNegative(summary.eventCount)
       appendField(
@@ -1210,13 +1342,6 @@ class InspectorController implements ExecutionInspectorController {
       if (started !== undefined && finished !== undefined && finished >= started) {
         const elapsed = durationValue(finished - started, activeLocale(this.#options.locale))
         if (elapsed !== undefined) appendField(this.#document, item, this.#options.t("inspector.fieldDetail"), elapsed, "trace-duration")
-      }
-      const preview = boundedText(summary.preview, MAX_TRACE_PREVIEW_BYTES)
-      if (preview.length > 0) {
-        item.append(createElement(this.#document, "p", "apc-inspector-trace-preview", preview))
-        if (summary.truncated === true || preview.endsWith("…")) {
-          item.append(createElement(this.#document, "span", "apc-inspector-trace-truncated", this.#options.t("inspector.previewTruncated")))
-        }
       }
 
       const detail = snapshot.traceDetails?.[key]
@@ -1235,10 +1360,11 @@ class InspectorController implements ExecutionInspectorController {
         item.append(details)
       }
 
-      const load = createElement(this.#document, "button", "apc-inspector-trace-load", this.#options.t("action.refreshConnections"))
+      const load = createElement(this.#document, "button", "apc-inspector-trace-load", this.#options.t("inspector.traceDetails"))
       load.type = "button"
       load.dataset.inspectorAction = "load-trace"
-      load.dataset.inspectorTraceKey = key
+      load.dataset.inspectorTracePosition = String(rendered + 1)
+      this.#traceKeyByButton.set(load, key)
       load.disabled = this.#options.onLoadTrace === undefined || this.#tracePending.has(`trace:${key}`)
       load.setAttribute("aria-disabled", load.disabled ? "true" : "false")
       item.append(load)
@@ -1256,24 +1382,34 @@ class InspectorController implements ExecutionInspectorController {
   #renderTraceEvent(event: InspectorTraceEvent): HTMLElement {
     const item = createElement(this.#document, "li", "apc-inspector-trace-event")
     if (event.kind) appendField(this.#document, item, this.#options.t("inspector.fieldKind"), displayLabel(event.kind, this.#options.t), "trace-event-kind")
-    if (event.status) appendField(this.#document, item, this.#options.t("inspector.fieldStatus"), statusLabel(event.status, this.#options.t), "trace-event-status")
+    if (event.status) appendStatusField(this.#document, item, this.#options.t("inspector.fieldStatus"), statusLabel(event.status, this.#options.t), "trace-event-status", event.status)
     const timestamp = finiteNonNegative(event.timestamp)
     if (timestamp !== undefined) appendField(this.#document, item, this.#options.t("inspector.fieldDetail"), String(Math.floor(timestamp)), "trace-event-time")
-    const preview = boundedText(event.preview, MAX_TRACE_PREVIEW_BYTES)
-    if (preview.length > 0) item.append(createElement(this.#document, "p", "apc-inspector-trace-event-preview", preview))
     return item
   }
 
-  #renderOutcome(snapshot: ExecutionInspectorSnapshot, outcome: InspectorOutcomeSnapshot): HTMLElement {
+  #renderOutcome(outcome: InspectorOutcomeSnapshot): HTMLElement {
     const node = createSection(this.#document, "outcome", this.#options.t("inspector.outcome"))
     node.tabIndex = -1
     node.dataset.inspectorOutcome = "true"
     node.dataset.outcomeClass = outcome.class
     node.dataset.outcomeCategory = outcome.category
-    appendField(this.#document, node, this.#options.t("inspector.fieldResult"), outcomeLabel(outcome.class, this.#options.t), "outcome-result")
-
+    const kind = outcome.class === "success"
+      ? "completed"
+      : outcome.class === "graph-fallback"
+        ? "graph-fallback"
+        : outcome.class === "parent-cancel"
+          ? "cancelled"
+          : "failed"
+    appendStatusField(
+      this.#document,
+      node,
+      this.#options.t("inspector.fieldResult"),
+      outcomeLabel(outcome.class, this.#options.t),
+      "outcome-result",
+      kind,
+    )
     if (outcome.class === "graph-fallback") {
-      node.append(createElement(this.#document, "p", "apc-inspector-fallback-main", this.#options.t("fallback.main")))
       appendField(
         this.#document,
         node,
@@ -1282,38 +1418,73 @@ class InspectorController implements ExecutionInspectorController {
         "fallback-cause",
       )
     }
+    return node
+  }
+
+  #renderDelivery(
+    snapshot: ExecutionInspectorSnapshot,
+    outcome: InspectorOutcomeSnapshot,
+    terminal: boolean,
+  ): HTMLElement {
+    const node = createSection(this.#document, "delivery", this.#options.t("inspector.finalRoute"))
     const route = snapshot.finalRoute
-    if (route) {
-      const routeLabel = optionalLabel(route.targetLabel, this.#options.t) ??
-        (route.target === "main" ? this.#options.t("agentGraph.finalMain") : this.#options.t("agentGraph.finalThread"))
-      appendField(this.#document, node, this.#options.t("inspector.finalRoute"), routeLabel, "final-route")
-      if (route.delivered !== undefined) {
-        appendField(
-          this.#document,
-          node,
-          this.#options.t("inspector.fieldResult"),
-          route.delivered ? this.#options.t("terminal.ready") : this.#options.t("terminal.unavailable"),
-          "final-delivery",
-        )
-      }
-      const retained = finiteNonNegative(route.retainedCompletedRuns)
-      if (retained !== undefined) {
-        appendField(this.#document, node, this.#options.t("inspector.statusCompleted"), String(retained), "retained-runs")
-      }
+    const isFallback = outcome.class === "graph-fallback"
+    if (isFallback) {
+      node.dataset.outcomeClass = "graph-fallback"
+      node.append(statusToken(this.#document, this.#options.t("fallback.title"), "graph-fallback"))
+      node.append(createElement(this.#document, "p", "apc-inspector-fallback-main", this.#options.t("fallback.main")))
     }
-    if (outcome.class === "graph-fallback") {
-      const mainResponded = snapshot.fallback?.mainResponded
-      appendField(
+    if (!route && !isFallback) {
+      node.append(createElement(this.#document, "p", "apc-inspector-empty", this.#options.t("inspector.noFinalRoute")))
+      return node
+    }
+    const routeLabel = isFallback
+      ? this.#options.t("agentGraph.finalMain")
+      : optionalLabel(route?.targetLabel, this.#options.t) ??
+        (route?.target === "main" ? this.#options.t("agentGraph.finalMain") : this.#options.t("agentGraph.finalThread"))
+    appendField(this.#document, node, this.#options.t("inspector.finalRoute"), routeLabel, "final-route")
+    const delivered = isFallback
+      ? snapshot.fallback?.mainResponded ?? route?.delivered
+      : route?.delivered
+    const deliveryKind = delivered === true
+      ? "completed"
+      : delivered === false
+        ? "failed"
+        : terminal
+          ? "pending"
+          : "running"
+    const deliveryLabel = delivered === true
+      ? this.#options.t("terminal.ready")
+      : delivered === false
+        ? this.#options.t("terminal.unavailable")
+        : terminal
+          ? this.#options.t("diagnostic.unknown")
+          : this.#options.t("terminal.finalizing")
+    appendStatusField(
+      this.#document,
+      node,
+      this.#options.t("inspector.fieldResult"),
+      deliveryLabel,
+      "final-delivery",
+      deliveryKind,
+    )
+    if (isFallback) {
+      appendStatusField(
         this.#document,
         node,
-        this.#options.t("inspector.fieldResult"),
-        mainResponded === true
+        this.#options.t("fallback.main"),
+        snapshot.fallback?.mainResponded === true
           ? this.#options.t("terminal.ready")
-          : mainResponded === false
+          : snapshot.fallback?.mainResponded === false
             ? this.#options.t("terminal.unavailable")
             : this.#options.t("diagnostic.unknown"),
         "main-fallback-result",
+        snapshot.fallback?.mainResponded === true ? "completed" : snapshot.fallback?.mainResponded === false ? "failed" : "pending",
       )
+    }
+    const retained = finiteNonNegative(route?.retainedCompletedRuns)
+    if (retained !== undefined) {
+      appendField(this.#document, node, this.#options.t("inspector.statusCompleted"), String(retained), "retained-runs")
     }
     if (snapshot.canUseMainFallback === true && this.#options.onUseMainFallback) node.append(this.#mainFallbackButton())
     return node
@@ -1329,12 +1500,22 @@ class InspectorController implements ExecutionInspectorController {
     return node
   }
 
-  #stopButton(): HTMLButtonElement {
+  #stopControl(): HTMLElement {
+    const control = createElement(this.#document, "div", "apc-inspector-stop-control")
+    control.dataset.inspectorStopControl = "true"
+    control.append(
+      createElement(this.#document, "p", "apc-inspector-stop-confirmation", this.#options.t("cancel.confirm")),
+      createElement(this.#document, "p", "apc-inspector-stop-warning", this.#options.t("council.effects")),
+    )
     const button = createElement(this.#document, "button", "apc-inspector-stop", this.#options.t("action.stop"))
     button.type = "button"
     button.dataset.inspectorAction = "stop"
-    button.setAttribute("aria-label", this.#options.t("action.stop"))
-    return button
+    button.setAttribute(
+      "aria-label",
+      `${this.#options.t("action.stop")}. ${this.#options.t("council.effects")}`,
+    )
+    control.append(button)
+    return control
   }
 
   #mainFallbackButton(): HTMLButtonElement {
@@ -1343,6 +1524,16 @@ class InspectorController implements ExecutionInspectorController {
     button.dataset.inspectorAction = "use-main-fallback"
     button.disabled = this.#fallbackPending
     button.setAttribute("aria-label", this.#options.t("fallback.main"))
+    return button
+  }
+
+  #backToConfigurationButton(): HTMLButtonElement {
+    const label = this.#options.t("action.backToConfiguration")
+    const button = createElement(this.#document, "button", "apc-inspector-back-to-configuration", label)
+    button.type = "button"
+    button.dataset.inspectorAction = "back-to-configuration"
+    button.setAttribute("data-apc-back-to-configuration", "")
+    button.setAttribute("aria-label", label)
     return button
   }
 
@@ -1364,9 +1555,10 @@ class InspectorController implements ExecutionInspectorController {
     const action = button.dataset.inspectorAction
     if (action === "stop") this.#requestStop()
     else if (action === "use-main-fallback") this.#requestMainFallback()
+    else if (action === "back-to-configuration") this.#requestBackToConfiguration()
     else if (action === "load-traces") this.#requestLoadTraces()
     else if (action === "load-trace") {
-      const key = safeTraceKey(button.dataset.inspectorTraceKey)
+      const key = this.#traceKeyByButton.get(button)
       if (key !== undefined) this.#requestLoadTrace(key)
     }
   }
@@ -1402,6 +1594,17 @@ class InspectorController implements ExecutionInspectorController {
       return
     }
     void Promise.resolve(result).catch(() => this.#settleFallbackFailure(generation))
+  }
+
+  #requestBackToConfiguration(): void {
+    const snapshot = this.#snapshot
+    const callback = this.#options.onBackToConfiguration
+    if (!snapshot || snapshot.status === "idle" || !isInspectorTerminal(snapshot) || !callback) return
+    try {
+      callback()
+    } catch {
+      // Host dismissal failures must not mutate or replace the read-only terminal view.
+    }
   }
 
   #requestLoadTraces(): void {
@@ -1472,7 +1675,7 @@ class InspectorController implements ExecutionInspectorController {
 
   #statusSignature(snapshot: ExecutionInspectorSnapshot): string {
     const progress = snapshot.progress
-    const run = currentRun(snapshot)
+    const run = inspectedRun(snapshot)
     return [
       snapshot.status,
       progress?.stageIndex ?? "",
@@ -1512,7 +1715,7 @@ class InspectorController implements ExecutionInspectorController {
         maximumFractionDigits: 0,
       }).format(Math.min(percent, 100) / 100))
     }
-    const current = currentRun(snapshot)
+    const current = inspectedRun(snapshot)
     if (current) {
       parts.push(this.#options.t("inspector.fieldValue", {
         label: runTitle(current.run, this.#options.t),

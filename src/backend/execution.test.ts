@@ -642,6 +642,25 @@ describe("executeAuxiliaryRun", () => {
       connectionDispatchRevision: "dispatch-1",
     })
   })
+
+  test("maps a thrown tracked generation request to a receipt-free terminal provider failure", async () => {
+    const result = await executeAuxiliaryRun(
+      input(),
+      deps({
+        quietTracked: async () => {
+          throw new Error("provider transport unavailable")
+        },
+      }),
+    )
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      code: "PROVIDER_CALL_FAILED",
+      phase: "provider",
+      message: "provider transport unavailable",
+    })
+    expect(result).not.toHaveProperty("receipt")
+  })
   test("rejects resolved tracked failures with extra top-level fields or malformed receipts", async () => {
     const resolvedFailure: QuietTrackedResultDTO = {
       ok: false,

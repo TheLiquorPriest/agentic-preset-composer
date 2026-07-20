@@ -288,6 +288,8 @@ describe("APC graph validation", () => {
     expect(hasCode(text, "single", "NAME_LIMIT")).toBe(false)
     text.connectionSlots[0].label = "x".repeat(MAX_NAME_CHARS + 1)
     expect(hasCode(text, "single", "NAME_LIMIT")).toBe(true)
+    text.connectionSlots[0].label = "Trailing newline\n"
+    expect(hasCode(text, "single", "TEXT_CONTROL")).toBe(true)
     text.threads[0].description = "x".repeat(MAX_DESCRIPTION_BYTES)
     expect(hasCode(text, "single", "DESCRIPTION_LIMIT")).toBe(false)
     text.threads[0].description = "x".repeat(MAX_DESCRIPTION_BYTES + 1)

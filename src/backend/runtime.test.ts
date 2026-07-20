@@ -256,8 +256,11 @@ function capturedRuntimeHost(options: {
   onSlotResolve?: (connectionId: string) => void
   onAssemble?: () => void
   onQuietTracked?: (request: unknown) => void
+  onConnectionList?: (userId: string | undefined) => void
+  requiredConnectionListUserId?: string
   slotDescriptor?: typeof SLOT_DESCRIPTOR
   throwActivityDelivery?: boolean
+  throwQuietTracked?: boolean
 } = {}): {
   spindle: SpindleAPI
   interceptor: () => InterceptorHandler | undefined
@@ -307,7 +310,13 @@ function capturedRuntimeHost(options: {
             created_at: 1,
             updated_at: 1,
           },
-      list: async () => [],
+      list: async (userId?: string) => {
+        options.onConnectionList?.(userId)
+        if (options.requiredConnectionListUserId !== undefined && userId !== options.requiredConnectionListUserId) {
+          throw new Error("operator-scoped connection list requires the authenticated user ID")
+        }
+        return []
+      },
     },
     generate: {
       assemble: async () => {
@@ -335,6 +344,7 @@ function capturedRuntimeHost(options: {
         const usage = response?.usage
         options.onRunStarted?.()
         if (options.runGate !== undefined) await options.runGate
+        if (options.throwQuietTracked) throw new Error("tracked generation request failed")
         return !runSucceeds
           ? {
               ok: false,
@@ -840,6 +850,41 @@ describe("APC runtime activity projection", () => {
       await runtime.dispose()
     }
   })
+  test("hydrates through an operator-scoped host using the authenticated callback user", async () => {
+    const authenticatedUserId = "operator-user"
+    const listedUserIds: Array<string | undefined> = []
+    const captured = capturedRuntimeHost({
+      onConnectionList: userId => { listedUserIds.push(userId) },
+      requiredConnectionListUserId: authenticatedUserId,
+    })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const frontend = captured.frontend()
+      if (frontend === undefined) throw new Error("runtime frontend handler is unavailable")
+      const beforeHydration = captured.outbound().length
+      await frontend({
+        version: 1,
+        type: "hydrate_preset",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID },
+      }, authenticatedUserId)
+      const responses = captured.outbound().slice(beforeHydration)
+      const hydration = responses.find((payload): payload is BackendHydrationResponse => {
+        if (payload === null || typeof payload !== "object" || !("type" in payload)) return false
+        return payload.type === "hydration"
+      })
+      expect(responses).toHaveLength(1)
+      expect(hydration).toBeDefined()
+      expect(hydration?.payload.presetId).toBe(PRESET_ID)
+      expect(hydration?.payload.bindings).toEqual([])
+      expect(hydration?.payload.consents).toEqual([])
+      expect(listedUserIds).toEqual([authenticatedUserId])
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
 
   test("routes valid Sequential calls through authoritative Main", async () => {
     const quietRequests: unknown[] = []
@@ -1100,6 +1145,51 @@ describe("APC runtime activity projection", () => {
       expect(activityMessages(ineligible.outbound())).toHaveLength(0)
     } finally {
       await ineligibleRuntime.dispose()
+    }
+  })
+
+  test("settles a thrown generation request and admits the next execution without a sticky run", async () => {
+    let runCalls = 0
+    const captured = capturedRuntimeHost({
+      throwQuietTracked: true,
+      onRunStarted: () => { runCalls += 1 },
+    })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const firstContext = runtimeContext(false)
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      await approveConsent(frontend)
+
+      const activityStart = captured.outbound().length
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      const firstTerminals = activityMessages(captured.outbound().slice(activityStart))
+        .filter((activity) => activity.payload.terminal)
+      expect(firstTerminals).toHaveLength(1)
+      expect(firstTerminals[0]?.payload).toMatchObject({
+        executionId: GENERATION_ID,
+        kind: "execution-terminal",
+        phase: "completed",
+        terminal: true,
+        outcome: "graph-fallback",
+      })
+      expect(runCalls).toBe(1)
+
+      const secondActivityStart = captured.outbound().length
+      const secondContext = { ...firstContext, generationId: REPLACEMENT_GENERATION_ID }
+      expect(await handler(messages, secondContext)).toEqual(messages)
+      const secondTerminals = activityMessages(captured.outbound().slice(secondActivityStart))
+        .filter((activity) => activity.payload.terminal)
+      expect(secondTerminals).toHaveLength(1)
+      expect(secondTerminals[0]?.payload.executionId).toBe(REPLACEMENT_GENERATION_ID)
+      expect(secondTerminals[0]?.payload.outcome).toBe("graph-fallback")
+      expect(runCalls).toBe(2)
+    } finally {
+      await runtime.dispose()
     }
   })
 
@@ -1374,6 +1464,42 @@ describe("APC backend runtime", () => {
       expect(traces[0]?.entries).toHaveLength(1)
       expect(traces[0]?.entries[0]?.kind).toBe("runtime-fallback")
       expect(traces[0]?.entries[0]?.preview).toBe("APC runtime failure; native messages returned.")
+    } finally {
+      await runtime.dispose()
+    }
+  })
+  test("blocks a successful generation replay after its trace is evicted", async () => {
+    let providerCalls = 0
+    const captured = capturedRuntimeHost({
+      onRunStarted: () => { providerCalls += 1 },
+    })
+    const runtime = setup({ spindle: captured.spindle, now: () => 123 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const firstContext = runtimeContext(false)
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      await approveConsent(frontend)
+      const activityStart = captured.outbound().length
+      expect(Array.isArray(await handler(messages, firstContext))).toBe(false)
+      for (let index = 0; index < MAX_RETAINED_TRACES_PER_USER_PRESET; index += 1) {
+        expect(Array.isArray(await handler(messages, {
+          ...firstContext,
+          generationId: fixtureGenerationId(index),
+        }))).toBe(false)
+      }
+      expect(getTrace(runtime.traces, firstContext.userId, PRESET_ID, firstContext.generationId)).toBeUndefined()
+      expect(providerCalls).toBe(MAX_RETAINED_TRACES_PER_USER_PRESET + 1)
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      expect(providerCalls).toBe(MAX_RETAINED_TRACES_PER_USER_PRESET + 1)
+      const terminals = activityMessages(captured.outbound().slice(activityStart)).filter(activity =>
+        activity.payload.terminal &&
+        activity.payload.executionId === firstContext.generationId
+      )
+      expect(terminals).toHaveLength(1)
     } finally {
       await runtime.dispose()
     }

@@ -7,7 +7,15 @@ import {
   type ConsentDisclosure,
 } from "./consent"
 import { AtomicJsonStore, type StorageAdapter } from "../state/atomic-json-store"
-import type { BindingConsentDocument, DocumentWriteExpectation } from "../state/documents"
+import { MAX_CONNECTION_SLOTS } from "../config/limits"
+import { MAX_CONSENT_VIEWS } from "../protocol/messages"
+import {
+  buildBindingDocumentKey,
+  buildBindingKey,
+  buildConsentKey,
+  type BindingConsentDocument,
+  type DocumentWriteExpectation,
+} from "../state/documents"
 
 const HOST_ID = "11111111-1111-4111-8111-111111111111"
 const USER_ID = "22222222-2222-4222-8222-222222222222"
@@ -205,6 +213,55 @@ function mainDisclosure(threadId = THREAD_B): ConsentDisclosure {
 }
 
 
+function generatedUuid(index: number): string {
+  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`
+}
+
+function maxConsentDocument(): Record<string, unknown> {
+  const maxConsents = MAX_CONSENT_VIEWS
+  const sourceKeys = [
+    `slot:${SLOT_ID}`,
+    "main",
+    `slot:${OTHER_SLOT_ID}`,
+    ...Array.from(
+      { length: MAX_CONNECTION_SLOTS - 2 },
+      (_, index) => `slot:${generatedUuid(0x400 + index)}`,
+    ),
+  ]
+  const consents: Record<string, unknown> = {}
+  for (let index = 0; index < maxConsents; index += 1) {
+    const sourceKey = sourceKeys[index % sourceKeys.length]!
+    const threadIndex = Math.floor(index / sourceKeys.length)
+    const threadId = threadIndex === 0 ? THREAD_ID : generatedUuid(0x500 + threadIndex)
+    const consent = {
+      installId: HOST_ID,
+      nonce: "a".repeat(32),
+      presetId: PRESET_ID,
+      threadId,
+      workspaceSource: "main-context" as const,
+      connectionSourceKey: sourceKey,
+      connectionId: sourceKey === "main" ? null : CONNECTION_ID,
+      dispatchRevision: index === 0 ? "revision-a" : `revision-${index}`,
+      disclosureVersion: 1,
+    }
+    consents[buildConsentKey(consent)] = consent
+  }
+  return {
+    schemaVersion: 1,
+    documentRevision: 5,
+    bindings: {
+      [buildBindingKey(PRESET_ID, SLOT_ID)]: {
+        presetId: PRESET_ID,
+        slotId: SLOT_ID,
+        connectionSourceKey: `slot:${SLOT_ID}`,
+        connectionId: CONNECTION_ID,
+        dispatchRevision: "revision-b",
+      },
+    },
+    consents,
+  }
+}
+
 function remember(service: ConsentService, value = disclosure()) {
 
   return service.rememberDisclosure(value)
@@ -230,6 +287,22 @@ describe("ConsentService", () => {
     await expect(service.grant({ userId: USER_ID, disclosure: disclosure() }))
       .rejects.toMatchObject<Partial<ConsentError>>({ code: "MISSING_DISCLOSURE" })
   })
+  it("rejects path-overlong user and preset identities as ConsentError", async () => {
+    const { service } = await setup()
+    for (const length of [257, 512]) {
+      const overlong = "x".repeat(length)
+      await expect(service.listConsents(overlong, PRESET_ID)).rejects.toMatchObject<
+        Partial<ConsentError>
+      >({ code: "INVALID_IDENTITY" })
+      await expect(service.listConsents(USER_ID, overlong)).rejects.toMatchObject<
+        Partial<ConsentError>
+      >({ code: "INVALID_IDENTITY" })
+      await expect(
+        Promise.resolve().then(() => service.rememberDisclosure(disclosure("revision-a", overlong))),
+      ).rejects.toMatchObject<Partial<ConsentError>>({ code: "INVALID_IDENTITY" })
+    }
+  })
+
 
   it("maps queued transaction read failures to ConsentError", async () => {
     const storage = new FailingReadStorage()
@@ -246,6 +319,28 @@ describe("ConsentService", () => {
         connectionId: CONNECTION_ID,
       },
     })).rejects.toMatchObject<Partial<ConsentError>>({ code: "STORAGE_FAILURE" })
+  })
+
+  it("supersedes an at-cap consent without exceeding the document bound", async () => {
+    const storage = new MemoryStorage()
+    const store = new AtomicJsonStore(storage, { nonceGenerator: () => "a".repeat(32) })
+    await store.initialize(HOST_ID)
+    const path = buildBindingDocumentKey(USER_ID, PRESET_ID)
+    storage.files.set(
+      path,
+      JSON.stringify(maxConsentDocument()),
+    )
+    const service = new ConsentService({ store })
+    const pending = remember(service, disclosure("revision-b"))
+
+    const granted = await service.grant({ userId: USER_ID, disclosure: pending })
+
+    expect(granted.consents).toHaveLength(MAX_CONSENT_VIEWS)
+    expect(granted.consents.some((consent) => (
+      consent.threadId === THREAD_ID &&
+      consent.connectionSourceKey === `slot:${SLOT_ID}` &&
+      consent.dispatchRevision === "revision-b"
+    ))).toBe(true)
   })
 
   it("grants, lists, authorizes, and revokes an exact disclosure", async () => {

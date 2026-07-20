@@ -196,7 +196,7 @@ function checkLabel(
   if (characterCount(trimmed) > MAX_NAME_CHARS) {
     addIssue(issues, path, "NAME_LIMIT", `Text exceeds ${MAX_NAME_CHARS} characters.`, mode)
   }
-  if (INVALID_LABEL_CHARACTERS.test(trimmed)) {
+  if (INVALID_LABEL_CHARACTERS.test(value)) {
     addIssue(issues, path, "TEXT_CONTROL", "Text contains a control character or newline.", mode)
   }
   return true

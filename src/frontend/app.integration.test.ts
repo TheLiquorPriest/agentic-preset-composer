@@ -14,13 +14,14 @@ import type {
   SpindlePresetEditorToolbarItemOptions,
 } from "lumiverse-spindle-types"
 import { setup } from "../frontend"
-import { createApcApp } from "./app"
+import { createApcApp, inspectorStatus } from "./app"
 import {
+  createBackendActivityResponse,
   PROTOCOL_VERSION,
   decodeFrontendIntent,
-  type BackendActivityResponse,
   type ActivityRunStatus,
   type BackendActivityUsage,
+  type BackendActivityResponse,
   type BackendBindingResponse,
   type BackendCancellationResponse,
   type BackendConnectionListResponse,
@@ -74,6 +75,10 @@ const STAGE_ID = "550e8400-e29b-41d4-a716-446655440006"
 const RUN_ID = "550e8400-e29b-41d4-a716-446655440007"
 const STAGE_B_ID = "550e8400-e29b-41d4-a716-446655440014"
 const RUN_B_ID = "550e8400-e29b-41d4-a716-446655440015"
+const THREAD_C = "550e8400-e29b-41d4-a716-446655440016"
+const RUN_C_ID = "550e8400-e29b-41d4-a716-446655440017"
+const RUN_D_ID = "550e8400-e29b-41d4-a716-446655440018"
+const EXECUTION_B_ID = "550e8400-e29b-41d4-a716-446655440019"
 const EXECUTION_ID = "550e8400-e29b-41d4-a716-446655440008"
 const TRACE_ID = "550e8400-e29b-41d4-a716-446655440013"
 const EVENT_CORRELATION_ID = "550e8400-e29b-41d4-a716-446655440009"
@@ -465,40 +470,46 @@ class FakeBackend {
     options: Readonly<{
       runStatus?: ActivityRunStatus
       usage?: BackendActivityUsage
+      stageIndex?: number
       runIndex?: number
       runCount?: number
+      errorCategory?: BackendActivityResponse["payload"]["errorCategory"]
+      runtimeTerminal?: boolean
+      executionId?: string
     }> = {},
   ): void {
     const terminal = phase === "completed" || phase === "failed" || phase === "cancelled"
-    const response: BackendActivityResponse = {
-      version: PROTOCOL_VERSION,
-      type: "activity",
+    const response = createBackendActivityResponse({
       correlationId: EVENT_CORRELATION_ID,
       sequence: ++this.#sequence,
-      payload: {
-        executionId: EXECUTION_ID,
-        presetId,
-        kind: "graph",
-        phase,
-        terminal,
-        traceId: TRACE_ID,
-        provider: "openai",
-        model: "gpt-5",
-        stageIndex: 1,
-        runIndex: options.runIndex ?? 0,
-        runCount: options.runCount ?? 1,
-        completedRuns: terminal ? 2 : 1,
-        totalRuns: 2,
-        remainingBudgetMs: terminal ? 0 : 30_000,
-        ...(options.runStatus === undefined ? {} : { runStatus: options.runStatus }),
-        ...(options.usage === undefined ? {} : { usage: options.usage }),
-        ...(outcome === undefined ? {} : { outcome }),
-        ...(phase === "failed" ? { errorCategory: "provider" as const } : {}),
-        ...(phase === "cancelled"
-          ? { cancellationSource: "stop" as const, outcome: "parent-cancel" as const }
-          : {}),
-      },
-    }
+      executionId: options.executionId ?? EXECUTION_ID,
+      presetId,
+      kind: "graph",
+      phase,
+      terminal,
+      traceId: TRACE_ID,
+      ...(options.runtimeTerminal
+        ? {}
+        : {
+            provider: "openai",
+            model: "gpt-5",
+            stageIndex: options.stageIndex ?? 1,
+            runIndex: options.runIndex ?? 0,
+            runCount: options.runCount ?? 1,
+            completedRuns: terminal ? 2 : 1,
+            totalRuns: 2,
+            remainingBudgetMs: terminal ? 0 : 30_000,
+          }),
+      ...(options.runStatus === undefined ? {} : { runStatus: options.runStatus }),
+      ...(options.usage === undefined ? {} : { usage: options.usage }),
+      ...(outcome === undefined ? {} : { outcome }),
+      ...(options.errorCategory !== undefined
+        ? { errorCategory: options.errorCategory }
+        : phase === "failed" ? { errorCategory: "provider" as const } : {}),
+      ...(phase === "cancelled"
+        ? { cancellationSource: "stop" as const, outcome: "parent-cancel" as const }
+        : {}),
+    })
     this.respond(response)
   }
 
@@ -531,6 +542,7 @@ class FakeEvents {
 class FakeLocale {
   #listeners = new Set<(locale: ApcLocale) => void>()
   #locale: ApcLocale = "en"
+  onSubscribe: (() => void) | null = null
   failSubscribe = false
 
   get(): ApcLocale {
@@ -540,6 +552,9 @@ class FakeLocale {
   subscribe(listener: (locale: ApcLocale) => void): () => void {
     if (this.failSubscribe) throw new Error("locale subscription failed")
     this.#listeners.add(listener)
+    const onSubscribe = this.onSubscribe
+    this.onSubscribe = null
+    onSubscribe?.()
     return () => this.#listeners.delete(listener)
   }
 
@@ -558,6 +573,7 @@ type LoomMount = {
   readonly options: SpindleLoomBlockEditorOptions
   handle: SpindleLoomBlockEditorHandle
   destroyed: boolean
+  destroyCount: number
 }
 
 class FakeUi {
@@ -565,6 +581,8 @@ class FakeUi {
   toolbar: SpindlePresetEditorToolbarItemHandle | null = null
   tabDestroyed = false
   toolbarDestroyed = false
+  onSetVisible: (() => void) | null = null
+  onActivateRegister: (() => void) | null = null
   tabDestroyCount = 0
   toolbarDestroyCount = 0
   tabActivateCount = 0
@@ -592,6 +610,9 @@ class FakeUi {
       },
       onActivate: (listener) => {
         this.#tabActivationListeners.add(listener)
+        const onActivateRegister = this.onActivateRegister
+        this.onActivateRegister = null
+        onActivateRegister?.()
         return () => this.#tabActivationListeners.delete(listener)
       },
     }
@@ -609,6 +630,9 @@ class FakeUi {
       setVisible: (visible) => {
         this.toolbarVisibility.push(visible)
         root.hidden = !visible
+        const onSetVisible = this.onSetVisible
+        this.onSetVisible = null
+        onSetVisible?.()
       },
       destroy: () => {
         this.toolbarDestroyCount += 1
@@ -628,6 +652,7 @@ class HostFixture {
   readonly locale = new FakeLocale()
   readonly ui = new FakeUi()
   readonly loomMounts: LoomMount[] = []
+  onLoomMount: (() => void) | null = null
   readyCalls = 0
   deferReadyCalls = 0
   grantedPermissions = ["interceptor", "generation", "presets", "final_response"]
@@ -649,6 +674,7 @@ class HostFixture {
         target: element,
         options,
         destroyed: false,
+        destroyCount: 0,
         handle: undefined as unknown as SpindleLoomBlockEditorHandle,
       }
       const handle: SpindleLoomBlockEditorHandle = {
@@ -657,12 +683,18 @@ class HostFixture {
         update: (patch) => {
           if (patch.value !== undefined) value = structuredClone(patch.value)
         },
-        destroy: () => { mount.destroyed = true },
+        destroy: () => {
+          mount.destroyCount += 1
+          mount.destroyed = true
+        },
         getValue: () => structuredClone(value),
         refreshMacros: async () => {},
       }
       mount.handle = handle
       this.loomMounts.push(mount)
+      const onLoomMount = this.onLoomMount
+      this.onLoomMount = null
+      onLoomMount?.()
       return handle
     }
 
@@ -843,6 +875,7 @@ function assertDisarmed(fixture: HostFixture): void {
   expect(fixture.locale.listenerCount()).toBe(0)
   expect(fixture.events.listenerCount()).toBe(0)
   expect(fixture.loomMounts.every((mount) => mount.destroyed)).toBe(true)
+  expect(fixture.loomMounts.every((mount) => mount.destroyCount === 1)).toBe(true)
   expect(browser.window.document.querySelector("[data-apc-app]")).toBeNull()
   expect(browser.window.document.querySelector("[data-apc-inspector]")).toBeNull()
   expect(browser.window.document.querySelector("[data-host-preset-tab]")).toBeNull()
@@ -911,7 +944,7 @@ describe("APC public frontend application", () => {
   })
   test("rejects and disposes a malformed controlled Loom handle at the mount boundary", async () => {
     const fixture = new HostFixture()
-    let malformedElement: HTMLElement | null = null
+    const malformedElements: HTMLElement[] = []
     const mountLoom = fixture.context.components.mountLoomBlockEditor.bind(fixture.context.components)
     Object.defineProperty(fixture.context.components, "mountLoomBlockEditor", {
       configurable: true,
@@ -920,7 +953,7 @@ describe("APC public frontend application", () => {
         const replacement = browser.window.document.createElement("div")
         const parent = typeof target === "string" ? browser.window.document.body : target.parentElement
         parent?.append(replacement)
-        malformedElement = replacement
+        malformedElements.push(replacement)
         Object.defineProperty(handle, "element", { configurable: true, value: replacement })
         Object.defineProperty(handle, "getValue", { configurable: true, value: undefined })
         return handle
@@ -932,10 +965,34 @@ describe("APC public frontend application", () => {
 
     app.state.setSelection({ kind: "thread", threadId: THREAD_A })
     await settle()
+    click(
+      app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]') as HTMLElement,
+      "[data-apc-open-workspace]",
+    )
+    await settle()
     expect(fixture.loomMounts).toHaveLength(1)
     expect(fixture.loomMounts[0]?.destroyed).toBe(true)
+    expect(fixture.loomMounts[0]?.destroyCount).toBe(1)
     expect(fixture.loomMounts[0]?.target.isConnected).toBe(false)
-    expect((malformedElement as unknown as HTMLElement).isConnected).toBe(false)
+    expect(malformedElements).toHaveLength(1)
+    expect(malformedElements[0]?.isConnected).toBe(false)
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface"))
+      .toBe("topology")
+    expect(app.root.querySelector('[data-apc-thread-surface="workspace"]')).toBeNull()
+
+    fixture.locale.set("fr")
+    await settle()
+    expect(fixture.loomMounts).toHaveLength(1)
+    click(
+      app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]') as HTMLElement,
+      "[data-apc-open-workspace]",
+    )
+    await settle()
+    expect(fixture.loomMounts).toHaveLength(2)
+    expect(fixture.loomMounts.every((mount) => mount.destroyed && mount.destroyCount === 1)).toBe(true)
+    expect(fixture.loomMounts.every((mount) => !mount.target.isConnected)).toBe(true)
+    expect(malformedElements).toHaveLength(2)
+    expect(malformedElements.every((element) => !element.isConnected)).toBe(true)
 
     await app.teardown()
     assertDisarmed(fixture)
@@ -1042,6 +1099,13 @@ describe("APC public frontend application", () => {
     expect(fixture.ui.toolbarVisibility.at(-1)).toBe(true)
     expect(toolbarRoot?.hidden).toBe(false)
     const appRoot = app.root
+    const panes = [...app.root.children]
+      .filter((element): element is HTMLElement => element instanceof browser.window.HTMLElement && element.hasAttribute("data-apc-pane"))
+    expect(panes.map((pane) => pane.dataset.apcPane)).toEqual(["navigation", "workspace", "configuration"])
+    expect(panes.every((pane) => pane.getAttribute("role") === "region")).toBe(true)
+    expect(panes.every((pane) => (pane.getAttribute("aria-label")?.length ?? 0) > 0)).toBe(true)
+    expect(app.root.querySelector('[data-apc-pane="configuration"] [data-apc-placeholder=true]')).not.toBeNull()
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
     const appScope = appRoot.getAttribute("data-apc-scope")
     const toolbarScope = toolbarRoot?.getAttribute("data-apc-scope")
     if (appScope === null || toolbarScope === null || toolbarRoot === undefined) {
@@ -1073,6 +1137,23 @@ describe("APC public frontend application", () => {
       () => fixture.ui.tabActivateCount === 1 && app.state.getSnapshot().activeMode === "parallel",
       "persisted Parallel surface activation",
     )
+    expect(app.root.querySelectorAll('[data-apc-graph-surface="navigation"]')).toHaveLength(1)
+    expect(app.root.querySelectorAll('[data-apc-graph-surface="topology"]')).toHaveLength(1)
+    expect(app.root.querySelectorAll(
+      '[data-apc-pane="navigation"] > [data-apc-graph-surface="navigation"]',
+    )).toHaveLength(1)
+    expect(app.root.querySelectorAll(
+      '[data-apc-pane="workspace"] > [data-apc-graph-surface="topology"]',
+    )).toHaveLength(1)
+    expect(app.root.querySelector(
+      '[data-apc-pane="navigation"] [data-apc-graph-surface="topology"], ' +
+      '[data-apc-pane="workspace"] [data-apc-graph-surface="navigation"]',
+    )).toBeNull()
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="configuration"]')).toHaveLength(1)
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="workspace"]')).toHaveLength(0)
+    expect(app.root.querySelector('[data-apc-pane="navigation"]')?.getAttribute("role")).toBe("region")
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("role")).toBe("region")
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("role")).toBe("region")
     const tabActivationsBeforeToolbar = fixture.ui.tabActivateCount
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
@@ -1122,6 +1203,12 @@ describe("APC public frontend application", () => {
         expect(toolbarRoot?.querySelector(`[data-mode="${mode}"]`)?.textContent).toContain(t(key))
       }
       expect(app.root.getAttribute("aria-label")).toBe(t("agentGraph.title"))
+      expect(app.root.querySelector('[data-apc-pane="navigation"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.threadNavigation"))
+      expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.stages"))
+      expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("aria-label"))
+        .toBe(t("threadEditor.ariaLabel"))
     }
 
     const result = app.teardown()
@@ -1142,6 +1229,8 @@ describe("APC public frontend application", () => {
       () => app.state.getSnapshot().hydrated && app.state.getSnapshot().presetId === PRESET_A,
       "trace workflow hydration",
     )
+    fixture.backend.respondActivity(PRESET_A, "started", undefined, { runStatus: "running" })
+    await settle()
     const inspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
     expect(inspector?.querySelector("[data-inspector-action=load-traces]")).not.toBeNull()
 
@@ -1149,6 +1238,7 @@ describe("APC public frontend application", () => {
     await settleUntil(() => fixture.backend.requests("list_traces").length === 1, "trace list request")
     const listRequest = fixture.backend.requests("list_traces")[0]
     if (listRequest?.type !== "list_traces") throw new Error("Expected a trace list request")
+    expect(listRequest.payload).toMatchObject({ presetId: PRESET_A, executionId: EXECUTION_ID })
     fixture.backend.respond({
       version: PROTOCOL_VERSION,
       type: "trace",
@@ -1168,16 +1258,23 @@ describe("APC public frontend application", () => {
       },
     })
     await settleUntil(
-      () => inspector?.querySelector(".apc-inspector-trace")?.textContent?.includes("Safe trace summary") === true,
+      () => {
+        const summary = app.state.getSnapshot().traces.summaries[0]
+        return summary?.preview === "Safe trace summary" &&
+          inspector?.querySelector(".apc-inspector-trace") !== null
+      },
       "safe trace summary projection",
     )
     const traceNode = inspector?.querySelector<HTMLElement>(".apc-inspector-trace")
-    const traceKey = traceNode?.dataset.inspectorTraceKey
+    expect(traceNode?.dataset.inspectorTracePosition).toBe("1")
+    const traceKey = app.state.getSnapshot().traces.summaries[0]?.key
     expect(typeof traceKey).toBe("string")
     if (typeof traceKey !== "string") throw new Error("Expected an opaque trace key")
-    expect(app.state.getSnapshot().traces.summaries[0]?.key).toBe(traceKey)
     expect(traceKey).not.toContain(TRACE_ID)
     expect(traceKey).not.toContain(EXECUTION_ID)
+    expect(JSON.stringify(app.state.getSnapshot().traces)).not.toContain(TRACE_ID)
+    expect(JSON.stringify(app.state.getSnapshot().traces)).not.toContain(EXECUTION_ID)
+    expect(traceNode?.textContent).not.toContain("Safe trace summary")
     expect(traceNode?.textContent).not.toContain(TRACE_ID)
     expect(traceNode?.textContent).not.toContain(EXECUTION_ID)
 
@@ -1216,9 +1313,11 @@ describe("APC public frontend application", () => {
       },
     })
     await settleUntil(
-      () => inspector?.querySelector(".apc-inspector-trace-event")?.textContent?.includes("Safe trace event") === true,
+      () => Object.values(app.state.getSnapshot().traces.details)
+        .some((detail) => detail.events.some((event) => event.preview === "Safe trace event")),
       "safe trace detail projection",
     )
+    expect(inspector?.textContent).not.toContain("Safe trace event")
     expect(inspector?.textContent).not.toContain("private-provider-state")
 
     click(inspector as HTMLElement, "[data-inspector-action=load-traces]")
@@ -1242,6 +1341,7 @@ describe("APC public frontend application", () => {
           presetId: PRESET_A,
           status: "completed",
           startedAt: 1_000,
+          finishedAt: 2_500,
           eventCount: 1,
           preview: "STALE TRACE SHOULD NOT RENDER",
         }],
@@ -1264,9 +1364,11 @@ describe("APC public frontend application", () => {
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
     await settle()
     const toolbar = fixture.ui.toolbar?.root as HTMLElement
+    browser.window.document.body.append(toolbar)
     const tabActivationBaseline = fixture.ui.tabActivateCount
     clickEnabled(toolbar, '[data-action="select-mode"][data-mode="parallel"]')
     await settle()
+    expect((browser.window.document.activeElement as HTMLElement | null)?.dataset.mode).toBe("parallel")
     expect(fixture.ui.tabActivateCount).toBe(tabActivationBaseline)
 
     fixture.editor.rejectNextFlush()
@@ -1280,6 +1382,8 @@ describe("APC public frontend application", () => {
     )
     expect(app.state.getSnapshot().activeMode).toBe("parallel")
     expect(toolbar.querySelector('[data-mode="parallel"]')?.getAttribute("aria-checked")).toBe("true")
+    expect((browser.window.document.activeElement as HTMLElement | null)?.dataset.mode).toBe("single")
+    toolbar.remove()
     expect(fixture.editor.builtinActivations).toHaveLength(0)
     expect(fixture.ui.tabActivateCount).toBe(tabActivationBaseline)
 
@@ -1367,6 +1471,56 @@ describe("APC public frontend application", () => {
     await teardown
   })
 
+  test("supersedes a save transition from keyboard radio arrows", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    fixture.editor.switchPreset(PRESET_A, graphConfig("A", "single"))
+    await settleUntil(
+      () => app.state.getSnapshot().hydrated && fixture.backend.requests("list_connections").length > 0,
+      "keyboard mode hydration",
+    )
+    const connectionRequest = fixture.backend.requests("list_connections").at(-1)
+    fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
+    const toolbar = fixture.ui.toolbar?.root as HTMLElement
+    browser.window.document.body.append(toolbar)
+    await settleUntil(
+      () => toolbar.querySelector<HTMLButtonElement>(
+        '[data-action="select-mode"][data-mode="sequential"]',
+      )?.disabled === false,
+      "keyboard mode availability",
+    )
+    const releaseFirstFlush = fixture.editor.blockFlush()
+    const releaseSecondFlush = fixture.editor.deferFlush()
+    clickEnabled(toolbar, '[data-action="select-mode"][data-mode="sequential"]')
+    const sequential = toolbar.querySelector<HTMLElement>('[data-action="select-mode"][data-mode="sequential"]')
+    expect(app.state.getSnapshot().busyReason).toBe("save")
+    sequential?.dispatchEvent(new browser.window.KeyboardEvent("keydown", {
+      bubbles: true,
+      key: "ArrowRight",
+    }))
+    expect(app.state.getSnapshot().activeMode).toBe("parallel")
+    expect((browser.window.document.activeElement as HTMLElement | null)?.dataset.mode).toBe("parallel")
+    releaseFirstFlush()
+    await settleUntil(
+      () => (fixture.editor.getState().metadata as Record<string, unknown>).activeMode === "parallel",
+      "keyboard superseding mode staged",
+    )
+    releaseSecondFlush()
+    await settleUntil(
+      () => {
+        const snapshot = app.state.getSnapshot()
+        return snapshot.activeMode === "parallel" &&
+          snapshot.config?.activeMode === "parallel" &&
+          !snapshot.dirty
+      },
+      "keyboard superseding mode persisted",
+    )
+    toolbar.remove()
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
   test("supersedes a pending transition when the same mode is requested again", async () => {
     const fixture = new HostFixture()
     const app = await createApcApp(fixture.context)
@@ -1440,9 +1594,13 @@ describe("APC public frontend application", () => {
     const app = await createApcApp(fixture.context)
     fixture.editor.switchPreset(PRESET_A, createDefaultApcConfig())
     await settle()
-    expect(app.root.querySelector("[data-apc-panel=threads] [data-apc-placeholder=true]")).not.toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"] [data-apc-placeholder=true]')).not.toBeNull()
     expect(app.state.getSnapshot().config?.threads).toHaveLength(0)
-    const firstUse = app.root.querySelector<HTMLElement>("[data-apc-graph-empty=true]")
+    const topology = app.root.querySelector<HTMLElement>(
+      '[data-apc-pane="workspace"] > [data-apc-graph-surface="topology"]',
+    )
+    expect(topology).not.toBeNull()
+    const firstUse = topology?.querySelector<HTMLElement>("[data-apc-graph-empty=true]")
     expect(firstUse).not.toBeNull()
     expect(firstUse?.querySelector(".apc-consent-note")?.textContent?.length ?? 0).toBeGreaterThan(0)
     click(firstUse as HTMLElement, '[data-action="create-graph"][data-mode="parallel"]')
@@ -1462,8 +1620,8 @@ describe("APC public frontend application", () => {
     const fixture = new HostFixture()
     const app = await createApcApp(fixture.context)
     const toolbarRoot = fixture.ui.toolbar?.root as HTMLElement
-    expect(app.root.querySelector("[data-apc-panel=threads] [data-apc-placeholder=true]")).not.toBeNull()
-    expect(app.root.querySelector<HTMLElement>("[data-apc-inspector]")?.dataset.inspectorView).toBe("idle")
+    expect(app.root.querySelector('[data-apc-pane="configuration"] [data-apc-placeholder=true]')).not.toBeNull()
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
 
     fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
     await settle()
@@ -1472,22 +1630,37 @@ describe("APC public frontend application", () => {
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
     await settle()
     expect(app.state.getSnapshot().hydrated).toBe(true)
-    expect(app.root.querySelector("[data-apc-panel=threads] [data-apc-placeholder=true]")).toBeNull()
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
-    let thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+    expect(app.root.querySelector('[data-apc-pane="configuration"] [data-apc-placeholder=true]')).toBeNull()
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    const topology = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
+    let thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
     expect(graph).not.toBeNull()
     expect(thread).not.toBeNull()
+    expect(topology).not.toBeNull()
+    expect(app.root.querySelectorAll("[data-apc-graph-editor]")).toHaveLength(2)
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="configuration"]')).toHaveLength(1)
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="workspace"]')).toHaveLength(0)
 
     actionByText(graph as HTMLElement, "select-thread", "A Research").click()
     await settle()
     expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_A })
     expect(thread?.querySelector<HTMLInputElement>("[data-apc-thread-name]")?.value).toBe("A Research")
-    expect(app.root.querySelector<HTMLElement>("[data-apc-inspector]")?.dataset.inspectorView).toBe("selected-thread")
-    expect(fixture.loomMounts.some((mount) => !mount.destroyed)).toBe(true)
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(fixture.loomMounts.some((mount) => !mount.destroyed)).toBe(false)
+    expect(app.root.querySelectorAll("[data-apc-open-workspace]")).toHaveLength(1)
+    expect(app.root.querySelectorAll("[data-apc-thread-name]")).toHaveLength(1)
+    expect(app.root.querySelectorAll("[data-apc-workspace-source-option]")).toHaveLength(2)
+    expect(app.root.querySelectorAll('[data-action="select-thread"]')).toHaveLength(2)
 
     const mainConsentBaseline = fixture.backend.requests("resolve_consent").length
-    const mainContext = [...thread!.querySelectorAll<HTMLInputElement>("[data-apc-workspace-source-option]")]
-      .find((control) => control.value === "main-context")
+    const workspaceSourceOptions = [
+      ...thread!.querySelectorAll<HTMLInputElement>("[data-apc-workspace-source-option]"),
+    ]
+    expect(workspaceSourceOptions.map((control) => control.value)).toEqual([
+      "workspace-choice-1",
+      "workspace-choice-2",
+    ])
+    const mainContext = workspaceSourceOptions.find((control) => !control.checked)
     expect(mainContext).toBeDefined()
     changeValue(mainContext as HTMLInputElement, true)
     await settleUntil(
@@ -1515,8 +1688,9 @@ describe("APC public frontend application", () => {
     )
 
     const nativeConsentBaseline = fixture.backend.requests("resolve_consent").length
-    const nativeBlocks = [...thread!.querySelectorAll<HTMLInputElement>("[data-apc-workspace-source-option]")]
-      .find((control) => control.value === "native-blocks")
+    const nativeBlocks = [
+      ...thread!.querySelectorAll<HTMLInputElement>("[data-apc-workspace-source-option]"),
+    ].find((control) => !control.checked)
     expect(nativeBlocks).toBeDefined()
     changeValue(nativeBlocks as HTMLInputElement, true)
     await settleUntil(
@@ -1543,6 +1717,17 @@ describe("APC public frontend application", () => {
       "native-blocks workspace settlement",
     )
 
+    click(thread as HTMLElement, "[data-apc-open-workspace]")
+    await settle()
+    const workspace = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="workspace"]')
+    expect(workspace).not.toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface")).toBe("loom")
+    expect(graph?.isConnected).toBe(true)
+    expect(thread?.isConnected).toBe(true)
+    expect(topology?.isConnected).toBe(false)
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="configuration"]')).toHaveLength(1)
+    expect(app.root.querySelectorAll('[data-apc-thread-surface="workspace"]')).toHaveLength(1)
+
     const loom = fixture.loomMounts.findLast((mount) => !mount.destroyed)
     const loomValue = { blocks: [], promptVariableValues: { "block-safe": { tone: "focused" } } }
     loom?.options.onChange?.(structuredClone(loomValue))
@@ -1552,6 +1737,24 @@ describe("APC public frontend application", () => {
     const flushesBeforeLoomSave = fixture.editor.flushCount
     await app.flushWorkspace()
     expect(fixture.editor.flushCount).toBe(flushesBeforeLoomSave + 1)
+    fixture.locale.set("fr")
+    await settle()
+    const frT = createApcTranslator(() => fixture.locale.get())
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("aria-label"))
+      .toBe(frT("threadEditor.workspaceAria", { name: "A Research" }))
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("aria-label"))
+      .toBe(frT("threadEditor.ariaLabel"))
+    expect(workspace?.isConnected).toBe(true)
+    fixture.locale.set("en")
+    await settle()
+    click(workspace as HTMLElement, "[data-apc-back-to-graph]")
+    await settle()
+    expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_A })
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface"))
+      .toBe("topology")
+    expect(topology?.isConnected).toBe(true)
+    expect(app.root.querySelector('[data-apc-thread-surface="workspace"]')).toBeNull()
+    expect(fixture.loomMounts.every((mount) => mount.destroyed)).toBe(true)
 
     const unbind = thread?.querySelector<HTMLButtonElement>("[data-apc-unbind]")
     expect(unbind).not.toBeNull()
@@ -1654,8 +1857,54 @@ describe("APC public frontend application", () => {
       "authoritative connection refresh",
     )
 
+    click(thread as HTMLElement, "[data-apc-open-workspace]")
+    await settle()
+    const reviewWorkspace = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="workspace"]')
+    const reviewLoom = fixture.loomMounts.findLast((mount) => !mount.destroyed)
+    expect(reviewWorkspace).not.toBeNull()
+    expect(reviewLoom).toBeDefined()
+    const selectionBeforeReview = structuredClone(app.state.getSnapshot().selection)
+    const promptValuesBeforeReview = structuredClone(
+      app.state.getSnapshot().config?.threads.find((candidate) => candidate.id === THREAD_A)?.promptVariableValues,
+    )
+    const modeBeforeReview = app.state.getSnapshot().activeMode
+    const flushesBeforeReview = fixture.editor.flushCount
+    const unrelatedToolbarContent = browser.window.document.createElement("span")
+    unrelatedToolbarContent.dataset.hostUnrelatedToolbar = "true"
+    toolbarRoot.append(unrelatedToolbarContent)
+    const navigationPane = app.root.querySelector<HTMLElement>('[data-apc-pane="navigation"]')
+    const workspacePane = app.root.querySelector<HTMLElement>('[data-apc-pane="workspace"]')
+    const configurationPane = app.root.querySelector<HTMLElement>('[data-apc-pane="configuration"]')
+    const ownedToolbar = toolbarRoot.querySelector<HTMLElement>("[data-apc-graph-toolbar-owned=true]")
+
+
     const consentRequestsBeforeReview = fixture.backend.requests("resolve_consent").length
     click(thread as HTMLElement, "[data-apc-open-consent-review]")
+    expect(navigationPane?.hasAttribute("inert")).toBe(true)
+    expect(navigationPane?.getAttribute("aria-hidden")).toBe("true")
+    expect(workspacePane?.hasAttribute("inert")).toBe(true)
+    expect(workspacePane?.getAttribute("aria-hidden")).toBe("true")
+    expect(ownedToolbar?.hasAttribute("inert")).toBe(true)
+    expect(ownedToolbar?.getAttribute("aria-hidden")).toBe("true")
+    expect(unrelatedToolbarContent.hasAttribute("inert")).toBe(false)
+    expect(configurationPane?.hasAttribute("inert")).toBe(false)
+    expect(configurationPane?.getAttribute("aria-hidden")).toBeNull()
+    expect([...ownedToolbar?.querySelectorAll<HTMLButtonElement>('[data-action="select-mode"]') ?? []]
+      .every((control) => control.disabled)).toBe(true)
+
+    actionByText(graph as HTMLElement, "select-thread", "A Context").click()
+    ownedToolbar?.querySelector<HTMLButtonElement>('[data-action="select-mode"][data-mode="sequential"]')?.click()
+    click(reviewWorkspace as HTMLElement, "[data-apc-back-to-graph]")
+    reviewLoom?.options.onChange?.({ blocks: [], promptVariableValues: { blocked: { state: "review-open" } } })
+    await app.flushWorkspace()
+    await settle()
+    expect(app.state.getSnapshot().selection).toEqual(selectionBeforeReview)
+    expect(app.state.getSnapshot().activeMode).toBe(modeBeforeReview)
+    expect(app.state.getSnapshot().config?.threads.find((candidate) => candidate.id === THREAD_A)?.promptVariableValues)
+      .toEqual(promptValuesBeforeReview)
+    expect(fixture.editor.flushCount).toBe(flushesBeforeReview)
+    expect(reviewWorkspace?.isConnected).toBe(true)
+
     await settleUntil(
       () => fixture.backend.requests("resolve_consent").length > consentRequestsBeforeReview,
       "fresh consent review resolution",
@@ -1677,6 +1926,7 @@ describe("APC public frontend application", () => {
     expect(review?.textContent).toContain(CONNECTION.name)
     expect(review?.textContent).toContain(CONNECTION.provider)
     expect(review?.textContent).toContain(CONNECTION.model)
+
     const t = createApcTranslator(() => fixture.locale.get())
     expect(review?.textContent).toContain(t("consent.disclosureSummary", {
       destination: CONNECTION.name,
@@ -1725,6 +1975,20 @@ describe("APC public frontend application", () => {
       () => thread?.querySelector("[data-apc-consent-status]")?.getAttribute("data-apc-consent-status") === "revoked",
       "revoked slot consent",
     )
+    expect(navigationPane?.hasAttribute("inert")).toBe(false)
+    expect(navigationPane?.getAttribute("aria-hidden")).toBeNull()
+    expect(workspacePane?.hasAttribute("inert")).toBe(false)
+    expect(workspacePane?.getAttribute("aria-hidden")).toBeNull()
+    expect(ownedToolbar?.hasAttribute("inert")).toBe(false)
+    expect(ownedToolbar?.getAttribute("aria-hidden")).toBeNull()
+    expect(unrelatedToolbarContent.hasAttribute("inert")).toBe(false)
+    expect(ownedToolbar?.querySelector<HTMLButtonElement>(
+      '[data-action="select-mode"][data-mode="sequential"]',
+    )?.disabled).toBe(false)
+    click(reviewWorkspace as HTMLElement, "[data-apc-back-to-graph]")
+    await settle()
+    expect(app.root.querySelector('[data-apc-thread-surface="workspace"]')).toBeNull()
+
 
     actionByText(graph as HTMLElement, "select-run", "A Context").click()
     await settleUntil(
@@ -1734,19 +1998,26 @@ describe("APC public frontend application", () => {
     )
     expect(app.state.getSnapshot().selection).toEqual({ kind: "run", runId: RUN_B_ID })
     expect(thread?.querySelector("[data-apc-run-configuration]")).not.toBeNull()
-    expect(app.root.querySelector<HTMLElement>("[data-apc-inspector]")?.dataset.inspectorView).toBe("selected-run")
-    const selectedRunInspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
     for (const locale of ["en", "zh", "zh-TW", "ja", "fr", "it"] as const) {
       fixture.locale.set(locale)
       await settle()
       const t = createApcTranslator(() => locale)
-      expect(selectedRunInspector?.querySelector("[data-inspector-field=output-label]")?.textContent)
+      expect(thread?.querySelector("[data-apc-run-output]")?.textContent)
         .toContain(t("graph.defaultFinalResponseName"))
+      expect(app.root.querySelector('[data-apc-pane="navigation"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.threadNavigation"))
+      expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.stages"))
+      expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("aria-label"))
+        .toBe(t("threadEditor.ariaLabel"))
     }
     fixture.locale.set("en")
     await settle()
     expect(thread?.querySelector<HTMLInputElement>("[data-apc-run-required]")?.disabled).toBe(true)
-    click(graph as HTMLElement, '[data-action="final-main"]')
+    click(topology as HTMLElement, '[data-action="final-main"]')
     await settleUntil(
       () => app.state.getSnapshot().config?.pipelines.parallel?.finalResponse.source === "main",
       "Main final route",
@@ -1759,7 +2030,7 @@ describe("APC public frontend application", () => {
     expect(app.state.getSnapshot().blockedReasons).toEqual([])
     await settleUntil(
       () => {
-        const currentThread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+        const currentThread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
         return app.state.getSnapshot().selection?.kind === "run" &&
           currentThread?.querySelector("[data-apc-run-configuration]") !== null &&
           currentThread?.querySelector<HTMLInputElement>("[data-apc-run-required]")?.disabled === true &&
@@ -1822,7 +2093,7 @@ describe("APC public frontend application", () => {
       },
       "restored final Main run",
     )
-    thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+    thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
     expect(thread?.querySelector("[data-apc-run-configuration]")).not.toBeNull()
     changeValue(thread?.querySelector<HTMLInputElement>("[data-apc-run-timeout]") as HTMLInputElement, "45")
     changeValue(thread?.querySelector<HTMLSelectElement>("[data-apc-binding-role]") as HTMLSelectElement, "assistant")
@@ -1840,7 +2111,7 @@ describe("APC public frontend application", () => {
       role: "user",
       onMissing: "fail-graph",
     }])
-    const currentGraph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const currentGraph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
     await settleUntil(
       () => currentGraph?.querySelector<HTMLButtonElement>('[data-action="final-thread"]')?.disabled === false,
       "current Thread final route action",
@@ -1851,29 +2122,49 @@ describe("APC public frontend application", () => {
       "Thread final route",
     )
 
-    thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
-    click(thread as HTMLElement, "[data-apc-back-to-graph]")
+    thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    actionByText(graph as HTMLElement, "select-thread", "A Research").click()
     await settle()
-    expect(app.state.getSnapshot().selection).toEqual({ kind: "main" })
-    expect(thread?.querySelector("[data-apc-thread-empty=true]")).not.toBeNull()
-    actionByText(currentGraph as HTMLElement, "select-thread", "A Research").click()
+    expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_A })
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
+
+    click(thread as HTMLElement, "[data-apc-open-workspace]")
     await settle()
-    const inspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
-    if (inspector === null) throw new Error("Expected the execution inspector")
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface"))
+      .toBe("loom")
+    expect(currentGraph?.isConnected).toBe(false)
 
     fixture.backend.respondActivity(PRESET_A, "started", undefined, {
       runStatus: "running",
       usage: { input: 10, output: 3, total: 13 },
     })
     await settle()
+    let inspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
+    if (inspector === null) throw new Error("Expected the execution inspector")
     fixture.backend.respondActivity(PRESET_A, "progress", undefined, {
       runStatus: "completed",
       usage: { input: 20, output: 4, total: 24 },
     })
     fixture.backend.respondActivity(PRESET_A, "progress", undefined, { runStatus: "failed" })
     await settle()
+    inspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
+    if (inspector === null) throw new Error("Expected the updated execution inspector")
+    expect(app.state.getSnapshot().executionMutationLocked).toBe(true)
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface"))
+      .toBe("topology")
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("execution")
+    expect(currentGraph?.isConnected).toBe(true)
+    expect(graph?.isConnected).toBe(true)
+    expect(app.root.querySelector('[data-apc-thread-surface="configuration"]')).toBeNull()
+    expect(fixture.loomMounts.every((mount) => mount.destroyed)).toBe(true)
+    expect([...currentGraph?.querySelectorAll<HTMLButtonElement>("[data-apc-mutates=true]") ?? []]
+      .every((control) => control.disabled)).toBe(true)
+    expect((actionByText(graph as HTMLElement, "select-thread", "A Context") as HTMLButtonElement).disabled).toBe(false)
     expect(inspector?.dataset.inspectorView).toBe("execution")
-    expect(inspector?.querySelector("[data-inspector-field=stage-progress]")?.textContent).toContain("2 / 2")
+    expect(inspector?.querySelector("[data-inspector-field=stage-progress]")).not.toBeNull()
     const activityItem = inspector?.querySelector<HTMLElement>(".apc-inspector-activity-item")
     expect(activityItem?.dataset.activityStatus).toBe("running")
     const activityItems = [...(inspector?.querySelectorAll<HTMLElement>(".apc-inspector-activity-item") ?? [])]
@@ -1886,7 +2177,6 @@ describe("APC public frontend application", () => {
     expect(activityItem?.textContent).toContain("A Context")
     expect(activityItem?.textContent).not.toContain(EXECUTION_ID)
     expect(activityItem?.textContent).not.toContain(TRACE_ID)
-    expect(thread?.dataset.apcMutationLocked).toBe("true")
     click(inspector, "[data-inspector-action=stop]")
     await settle()
     const cancellation = fixture.backend.requests("cancel_execution").at(-1)
@@ -1898,12 +2188,20 @@ describe("APC public frontend application", () => {
 
     fixture.backend.respondActivity(PRESET_A, "completed", "graph-fallback")
     await settle()
+    expect(app.state.getSnapshot().executionMutationLocked).toBe(false)
+    expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("data-apc-center-surface"))
+      .toBe("topology")
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("execution")
+    expect(currentGraph?.querySelector<HTMLButtonElement>('[data-action="final-main"]')?.disabled).toBe(false)
     expect(app.state.getSnapshot().execution.usage).toEqual({ input: 20, output: 4, total: 24 })
     expect(inspector?.querySelector("[data-inspector-section=usage]")?.textContent).toContain("total 24")
     expect(inspector?.querySelector("[data-inspector-field=main-fallback-result]")?.textContent)
       .toContain(createApcTranslator(() => fixture.locale.get())("diagnostic.unknown"))
-    expect(inspector?.querySelector("[data-inspector-action=use-main-fallback]")).not.toBeNull()
-    click(inspector, "[data-inspector-action=use-main-fallback]")
+    const fallback = inspector?.querySelector<HTMLButtonElement>("[data-inspector-action=use-main-fallback]")
+    expect(fallback).not.toBeNull()
+    fallback?.focus()
+    fallback?.click()
     await settle()
     expect(app.state.getSnapshot().config?.pipelines.parallel?.finalResponse).toEqual({
       source: "main",
@@ -1915,6 +2213,16 @@ describe("APC public frontend application", () => {
     })
     expect(app.state.getSnapshot().modeIssues.parallel).toEqual([])
     expect(app.state.getSnapshot().blockedReasons).toEqual([])
+    expect(app.state.getSnapshot().execution.topologyApplicable).toBe(false)
+    expect(app.state.getSnapshot().execution.outcome).toBe("graph-fallback")
+    expect(app.state.getSnapshot().execution.activity).toHaveLength(4)
+    expect(app.state.getSnapshot().execution.usage).toEqual({ input: 20, output: 4, total: 24 })
+    expect(inspector?.isConnected).toBe(false)
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
+    expect(app.root.querySelector('[data-apc-thread-surface="configuration"]')).not.toBeNull()
+    expect(browser.window.document.activeElement?.getAttribute("data-apc-thread-workspace-heading")).toBe("true")
 
     const preservedSelection = app.state.getSnapshot().selection
     const preservedConfig = structuredClone(app.state.getSnapshot().config)
@@ -1924,8 +2232,14 @@ describe("APC public frontend application", () => {
       const t = createApcTranslator(() => locale)
       expect(fixture.ui.tab?.root.dataset.hostTitle).toBe(t("agentGraph.title"))
       expect(toolbarRoot.querySelector('[data-mode="single"]')?.textContent).toContain(t("mode.single"))
-      expect(thread?.getAttribute("aria-label")).toBe(t("threadEditor.ariaLabel"))
-      expect(inspector?.querySelector("h2")?.textContent).toBe(t("inspector.title"))
+      expect(app.root.querySelector('[data-apc-pane="navigation"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.threadNavigation"))
+      expect(app.root.querySelector('[data-apc-pane="workspace"]')?.getAttribute("aria-label"))
+        .toBe(t("graph.stages"))
+      expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("aria-label"))
+        .toBe(t("threadEditor.ariaLabel"))
+      expect(app.root.querySelector('[data-apc-thread-surface="configuration"] h2')?.textContent?.length ?? 0)
+        .toBeGreaterThan(0)
       expect(app.state.getSnapshot().selection).toEqual(preservedSelection)
       expect(app.state.getSnapshot().config).toEqual(preservedConfig)
     }
@@ -1963,6 +2277,523 @@ describe("APC public frontend application", () => {
     await teardown
   })
 
+  test("projects consent dismissal impact for mixed, optional-only, and unscheduled selected threads", async () => {
+    for (const kind of ["mixed", "optional", "unscheduled"] as const) {
+      const fixture = new HostFixture()
+      const app = await createApcApp(fixture.context)
+      const config = graphConfig("A")
+      if (kind === "mixed") {
+        config.pipelines.parallel!.stages[1]!.runs.push({
+          id: RUN_C_ID,
+          threadId: THREAD_A,
+          required: false,
+          timeoutMs: 60_000,
+          inputs: [],
+        })
+      } else if (kind === "optional") {
+        config.pipelines.parallel!.stages[0]!.runs[0]!.required = false
+        config.pipelines.parallel!.stages[1]!.runs[0]!.inputs = []
+      } else {
+        config.threads.push({
+          ...structuredClone(config.threads[0]!),
+          id: THREAD_C,
+          name: "A Review",
+        })
+      }
+      fixture.editor.switchPreset(PRESET_A, config)
+      await settleUntil(() => app.state.getSnapshot().hydrated, `${kind} consent impact hydration`)
+      const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+      actionByText(
+        navigation as HTMLElement,
+        "select-thread",
+        kind === "unscheduled" ? "A Review" : "A Research",
+      ).click()
+      await settle()
+      const configuration = app.root.querySelector<HTMLElement>(
+        '[data-apc-thread-surface="configuration"]',
+      )
+      click(configuration as HTMLElement, "[data-apc-open-consent-review]")
+      expect(
+        app.root.querySelector("[data-apc-consent-dismissal-consequence]")
+          ?.getAttribute("data-apc-consent-dismissal-consequence"),
+      ).toBe(kind)
+      const teardown = app.teardown()
+      assertDisarmed(fixture)
+      await teardown
+    }
+  })
+
+  test("keeps bounded topology status authoritative until the first post-terminal config edit", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
+    await settleUntil(() => app.state.getSnapshot().hydrated, "topology activity hydration")
+
+    const topology = app.root.querySelector<HTMLElement>(
+      '[data-apc-pane="workspace"] > [data-apc-graph-surface="topology"]',
+    )
+    expect(topology).not.toBeNull()
+    expect(app.state.getSnapshot().execution.executionKey).toBeNull()
+    expect(app.state.getSnapshot().execution.topologyApplicable).toBe(false)
+    expect(topology?.querySelectorAll("[data-activity-status]")).toHaveLength(0)
+
+    fixture.backend.respondActivity(PRESET_A, "started", undefined, {
+      stageIndex: 0,
+      runIndex: 0,
+      runStatus: "completed",
+    })
+    for (let index = 0; index < 33; index += 1) {
+      fixture.backend.respondActivity(PRESET_A, "progress", undefined, {
+        stageIndex: 1,
+        runIndex: 0,
+        runStatus: "running",
+      })
+    }
+    await settle()
+
+    const activeExecution = app.state.getSnapshot().execution
+    expect(activeExecution.topologyApplicable).toBe(true)
+    expect(activeExecution.activity).toHaveLength(32)
+    expect(activeExecution.activity.every((activity) => activity.stageIndex === 1)).toBe(true)
+    expect(activeExecution.topologyActivity).toHaveLength(2)
+    const runCards = [...(topology?.querySelectorAll<HTMLElement>(".apc-run-card") ?? [])]
+    expect(runCards).toHaveLength(2)
+    expect(runCards[0]?.dataset.activityStatus).toBe("completed")
+    expect(runCards[1]?.dataset.activityStatus).toBe("running")
+    const inspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
+    expect(inspector).not.toBeNull()
+    const recentActivity = [...(inspector?.querySelectorAll<HTMLElement>(".apc-inspector-activity-item") ?? [])]
+    expect(recentActivity).toHaveLength(8)
+    const navigation = app.root.querySelector<HTMLElement>(
+      '[data-apc-pane="navigation"] > [data-apc-graph-surface="navigation"]',
+    )
+    actionByText(navigation as HTMLElement, "select-thread", "A Context").click()
+    await settle()
+    expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_B })
+    expect(inspector?.isConnected).toBe(true)
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("execution")
+    expect(recentActivity.every((item) => item.dataset.activityStatus === "running")).toBe(true)
+
+    fixture.backend.respondActivity(PRESET_A, "failed", "selected-final-failure", {
+      stageIndex: 1,
+      runIndex: 0,
+      runStatus: "failed",
+      runtimeTerminal: true,
+      errorCategory: "config",
+    })
+    await settle()
+    expect(app.state.getSnapshot().execution.terminal).toBe(true)
+    expect(app.state.getSnapshot().execution.outcome).toBe("selected-final-failure")
+    expect(app.state.getSnapshot().execution.stageIndex).toBe(1)
+    expect(app.state.getSnapshot().execution.runIndex).toBe(0)
+    expect(app.state.getSnapshot().execution.provider).toBe("openai")
+    expect(app.state.getSnapshot().execution.model).toBe("gpt-5")
+    expect(app.state.getSnapshot().execution.topologyApplicable).toBe(true)
+    expect(inspector?.querySelector('[data-error-category="graph"]')).not.toBeNull()
+
+    click(topology as HTMLElement, '[data-action="final-main"]')
+    await settleUntil(
+      () => app.state.getSnapshot().config?.pipelines.parallel?.finalResponse.source === "main",
+      "post-terminal topology mutation",
+    )
+    const editedExecution = app.state.getSnapshot().execution
+    expect(editedExecution.topologyApplicable).toBe(false)
+    expect(editedExecution.topologyActivity).toEqual([])
+    expect(editedExecution.outcome).toBe("selected-final-failure")
+    expect(editedExecution.activity).toHaveLength(32)
+    expect(topology?.querySelectorAll("[data-activity-status]")).toHaveLength(0)
+    expect(inspector?.isConnected).toBe(false)
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    const topologyIndependentProjection = inspectorStatus(
+      app.state.getSnapshot(),
+      createApcTranslator(() => fixture.locale.get()),
+    )
+    expect(topologyIndependentProjection.progress?.stageIndex).toBeUndefined()
+    expect(topologyIndependentProjection.progress?.stageCount).toBeUndefined()
+    expect(topologyIndependentProjection.progress?.completedRuns).toBe(editedExecution.completedRuns)
+    expect(topologyIndependentProjection.progress?.totalRuns).toBe(editedExecution.totalRuns)
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
+    expect(app.root.querySelector('[data-apc-thread-surface="configuration"]')).not.toBeNull()
+
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
+  test("returns terminal execution to configuration by button or explicit selection and restores new activity", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
+    await settleUntil(() => app.state.getSnapshot().hydrated, "terminal selection hydration")
+    const navigation = app.root.querySelector<HTMLElement>(
+      '[data-apc-pane="navigation"] > [data-apc-graph-surface="navigation"]',
+    )
+
+    actionByText(navigation as HTMLElement, "select-run", "A Research").click()
+    await settle()
+    fixture.backend.respondActivity(PRESET_A, "started", undefined, {
+      stageIndex: 0,
+      runIndex: 0,
+      runStatus: "running",
+    })
+    fixture.backend.respondActivity(PRESET_A, "progress", undefined, {
+      stageIndex: 1,
+      runIndex: 0,
+      runStatus: "running",
+    })
+    fixture.backend.respondActivity(PRESET_A, "failed", "selected-final-failure", {
+      runtimeTerminal: true,
+      errorCategory: "dispatch",
+    })
+    await settle()
+    const terminalExecution = app.state.getSnapshot().execution
+    const retainedTraces = structuredClone(app.state.getSnapshot().traces)
+    expect(terminalExecution.terminal).toBe(true)
+    expect(terminalExecution.topologyApplicable).toBe(true)
+    expect(app.root.querySelector("[data-apc-inspector]")).not.toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("execution")
+    expect(terminalExecution.stageIndex).toBe(1)
+    expect(terminalExecution.runIndex).toBe(0)
+    expect(terminalExecution.provider).toBe("openai")
+    expect(terminalExecution.model).toBe("gpt-5")
+    const terminalInspector = app.root.querySelector<HTMLElement>("[data-apc-inspector]")
+    const currentRun = terminalInspector?.querySelector<HTMLElement>("[data-inspector-section=current-run]")
+    const dispatch = terminalInspector?.querySelector<HTMLElement>("[data-inspector-section=dispatch]")
+    expect(currentRun?.dataset.currentRunStatus).toBe("running")
+    expect(currentRun?.textContent).toContain("A Context")
+    expect(currentRun?.querySelector("[data-error-category]")).toBeNull()
+    expect(terminalInspector?.querySelector('[data-error-category="provider"]')).toBeNull()
+    expect(terminalInspector?.querySelector('[data-error-category="connection"]')).not.toBeNull()
+    expect(dispatch?.dataset.dispatchSource).toBe("slot")
+    expect(dispatch?.querySelector("[data-inspector-field=provider]")?.textContent).toContain("openai")
+    expect(dispatch?.querySelector("[data-inspector-field=model]")?.textContent).toContain("gpt-5")
+    expect(terminalInspector?.innerHTML).not.toContain(EXECUTION_ID)
+    expect(terminalInspector?.innerHTML).not.toContain(TRACE_ID)
+    const backToConfiguration = terminalInspector?.querySelector<HTMLButtonElement>("[data-apc-back-to-configuration]")
+    expect(backToConfiguration).not.toBeNull()
+    backToConfiguration?.focus()
+    backToConfiguration?.click()
+    await settle()
+    expect(app.state.getSnapshot().execution).toEqual(terminalExecution)
+    expect(app.state.getSnapshot().traces).toEqual(retainedTraces)
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
+    expect(app.root.querySelector("[data-apc-run-configuration]")).not.toBeNull()
+    expect(browser.window.document.activeElement?.getAttribute("data-apc-thread-workspace-heading")).toBe("true")
+
+    fixture.backend.respondActivity(PRESET_A, "started", undefined, {
+      executionId: EXECUTION_B_ID,
+      stageIndex: 0,
+      runIndex: 0,
+      runStatus: "running",
+    })
+    await settle()
+    expect(app.state.getSnapshot().execution.executionKey).not.toBe(terminalExecution.executionKey)
+    expect(app.root.querySelector("[data-apc-inspector]")).not.toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("execution")
+    fixture.backend.respondActivity(PRESET_A, "failed", "selected-final-failure", {
+      executionId: EXECUTION_B_ID,
+      runtimeTerminal: true,
+    })
+    await settle()
+    const secondTerminal = app.state.getSnapshot().execution
+    const retainedSecondTraces = structuredClone(app.state.getSnapshot().traces)
+    expect(secondTerminal.terminal).toBe(true)
+    expect(app.root.querySelector("[data-apc-inspector]")).not.toBeNull()
+
+    actionByText(navigation as HTMLElement, "select-run", "A Context").click()
+    await settle()
+    expect(app.state.getSnapshot().selection).toEqual({ kind: "run", runId: RUN_B_ID })
+    expect(app.root.querySelector("[data-apc-inspector]")).toBeNull()
+    expect(app.root.querySelector('[data-apc-pane="configuration"]')?.getAttribute("data-apc-right-surface"))
+      .toBe("configuration")
+    const configuration = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    expect(configuration?.querySelector("[data-apc-run-configuration]")).not.toBeNull()
+
+    changeValue(
+      configuration?.querySelector<HTMLInputElement>("[data-apc-run-timeout]") as HTMLInputElement,
+      "45",
+    )
+    await settle()
+    expect(app.state.getSnapshot().config?.pipelines.parallel?.stages[1]?.runs[0]?.timeoutMs).toBe(45_000)
+    expect(app.state.getSnapshot().execution.topologyApplicable).toBe(false)
+    expect(app.state.getSnapshot().execution.executionKey).toBe(secondTerminal.executionKey)
+    expect(app.state.getSnapshot().execution.outcome).toBe(secondTerminal.outcome)
+    expect(app.state.getSnapshot().execution.activity).toEqual(secondTerminal.activity)
+    expect(app.state.getSnapshot().traces).toEqual(retainedSecondTraces)
+
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
+  test("moves Sequential and Parallel runs through opaque bounded position targets", async () => {
+    const sequentialFixture = new HostFixture()
+    const sequentialApp = await createApcApp(sequentialFixture.context)
+    const sequentialConfig = graphConfig("A", "sequential")
+    sequentialConfig.pipelines.sequential!.stages[1]!.runs[0]!.inputs = []
+    sequentialConfig.pipelines.sequential!.finalResponse = {
+      source: "main",
+      inputs: [
+        { source: "output", runId: RUN_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_B_ID, onMissing: "fail-graph" },
+      ],
+    }
+    sequentialFixture.editor.switchPreset(PRESET_A, sequentialConfig)
+    await settleUntil(() => sequentialApp.state.getSnapshot().hydrated, "Sequential position hydration")
+    const sequentialNavigation = sequentialApp.root.querySelector<HTMLElement>(
+      '[data-apc-graph-surface="navigation"]',
+    )
+    actionByText(sequentialNavigation as HTMLElement, "select-run", "A Context").click()
+    await settle()
+    const sequentialPosition = sequentialApp.root.querySelector<HTMLSelectElement>("[data-apc-run-position]")
+    expect(sequentialPosition).not.toBeNull()
+    expect([...sequentialPosition?.options ?? []]).toHaveLength(2)
+    changeValue(sequentialPosition as HTMLSelectElement, sequentialPosition?.options[0]?.value ?? "")
+    await settle()
+    expect(sequentialApp.state.getSnapshot().config?.pipelines.sequential?.stages
+      .map((stage) => stage.runs[0]?.id)).toEqual([RUN_B_ID, RUN_ID])
+    expect(validateConfigForMode(sequentialApp.state.getSnapshot().config!, "sequential").valid).toBe(true)
+    expect(sequentialPosition?.innerHTML).not.toContain(RUN_ID)
+    expect(sequentialPosition?.innerHTML).not.toContain(RUN_B_ID)
+    expect(sequentialApp.state.getSnapshot().config?.threads.map((thread) => thread.id))
+      .toEqual([THREAD_A, THREAD_B])
+    const mainConsentBaseline = sequentialFixture.backend.requests("resolve_consent").length
+    click(
+      sequentialApp.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]') as HTMLElement,
+      "[data-apc-open-consent-review]",
+    )
+    await settleUntil(
+      () => sequentialFixture.backend.requests("resolve_consent").length > mainConsentBaseline,
+      "Sequential Main consent projection",
+    )
+    expect(sequentialFixture.backend.requests("resolve_consent").at(-1)?.payload).toMatchObject({
+      threadId: THREAD_B,
+      connectionSourceKey: "main",
+    })
+    const sequentialTeardown = sequentialApp.teardown()
+    assertDisarmed(sequentialFixture)
+    await sequentialTeardown
+
+    const parallelFixture = new HostFixture()
+    const parallelApp = await createApcApp(parallelFixture.context)
+    const parallelConfig = graphConfig("A")
+    parallelConfig.threads.push({
+      ...structuredClone(parallelConfig.threads[0]!),
+      id: THREAD_C,
+      name: "A Review",
+    })
+    parallelConfig.pipelines.parallel!.stages[0]!.runs.push({
+      id: RUN_C_ID,
+      threadId: THREAD_C,
+      required: true,
+      timeoutMs: 60_000,
+      inputs: [],
+    })
+    parallelConfig.pipelines.parallel!.finalResponse = {
+      source: "main",
+      inputs: [
+        { source: "output", runId: RUN_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_B_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_C_ID, onMissing: "fail-graph" },
+      ],
+    }
+    parallelFixture.editor.switchPreset(PRESET_A, parallelConfig)
+    await settleUntil(() => parallelApp.state.getSnapshot().hydrated, "Parallel position hydration")
+    const parallelNavigation = parallelApp.root.querySelector<HTMLElement>(
+      '[data-apc-graph-surface="navigation"]',
+    )
+    actionByText(parallelNavigation as HTMLElement, "select-run", "A Review").click()
+    await settle()
+    const parallelPosition = parallelApp.root.querySelector<HTMLSelectElement>("[data-apc-run-position]")
+    expect([...parallelPosition?.options ?? []]).toHaveLength(4)
+    changeValue(parallelPosition as HTMLSelectElement, parallelPosition?.options[3]?.value ?? "")
+    await settle()
+    expect(parallelApp.state.getSnapshot().config?.pipelines.parallel?.stages).toHaveLength(2)
+    expect(parallelApp.state.getSnapshot().config?.pipelines.parallel?.stages[0]?.runs.map((run) => run.id))
+      .toEqual([RUN_ID])
+    expect(parallelApp.state.getSnapshot().config?.pipelines.parallel?.stages[1]?.runs.map((run) => run.id))
+      .toEqual([RUN_B_ID, RUN_C_ID])
+    actionByText(parallelNavigation as HTMLElement, "select-run", "A Research").click()
+    await settle()
+    const soleSourcePosition = parallelApp.root.querySelector<HTMLSelectElement>("[data-apc-run-position]")
+    expect([...soleSourcePosition?.options ?? []]).toHaveLength(1)
+    expect(soleSourcePosition?.disabled).toBe(true)
+    expect(parallelApp.state.getSnapshot().config?.pipelines.parallel?.stages).toHaveLength(2)
+    for (const privateId of [THREAD_C, RUN_C_ID]) {
+      expect(parallelPosition?.innerHTML).not.toContain(privateId)
+      expect(soleSourcePosition?.innerHTML).not.toContain(privateId)
+    }
+    const parallelTeardown = parallelApp.teardown()
+    assertDisarmed(parallelFixture)
+    await parallelTeardown
+  })
+
+  test("omits binding-order and repeated-thread Parallel destinations without exposing IDs", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    const config = graphConfig("A")
+    config.threads.push({
+      ...structuredClone(config.threads[0]!),
+      id: THREAD_C,
+      name: "A Review",
+    })
+    config.pipelines.parallel!.stages[0]!.runs.push(
+      {
+        id: RUN_C_ID,
+        threadId: THREAD_C,
+        required: true,
+        timeoutMs: 60_000,
+        inputs: [],
+      },
+      {
+        id: RUN_D_ID,
+        threadId: THREAD_B,
+        required: true,
+        timeoutMs: 60_000,
+        inputs: [],
+      },
+    )
+    config.pipelines.parallel!.finalResponse = {
+      source: "main",
+      inputs: [
+        { source: "output", runId: RUN_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_B_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_C_ID, onMissing: "fail-graph" },
+        { source: "output", runId: RUN_D_ID, onMissing: "fail-graph" },
+      ],
+    }
+    fixture.editor.switchPreset(PRESET_A, config)
+    await settleUntil(() => app.state.getSnapshot().hydrated, "Parallel restriction hydration")
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    const repeatedThreadRuns = [...navigation!.querySelectorAll<HTMLElement>('[data-action="select-run"]')]
+      .filter((control) => control.textContent?.includes("A Context"))
+    expect(repeatedThreadRuns).toHaveLength(2)
+    repeatedThreadRuns[0]?.click()
+    await settle()
+    const repeatedThreadPosition = app.root.querySelector<HTMLSelectElement>("[data-apc-run-position]")
+    expect([...repeatedThreadPosition?.options ?? []]).toHaveLength(3)
+    expect([...repeatedThreadPosition?.options ?? []].every((option) => !option.textContent?.includes("A synthesis")))
+      .toBe(true)
+    expect(app.root.querySelector("[data-apc-run-position-impact]")).not.toBeNull()
+
+    actionByText(navigation as HTMLElement, "select-run", "A Research").click()
+    await settle()
+    const bindingPosition = app.root.querySelector<HTMLSelectElement>("[data-apc-run-position]")
+    expect([...bindingPosition?.options ?? []]).toHaveLength(3)
+    expect([...bindingPosition?.options ?? []].every((option) => !option.textContent?.includes("A synthesis")))
+      .toBe(true)
+    const beforeRejectedMove = structuredClone(app.state.getSnapshot().config?.pipelines.parallel)
+    const liveTextBefore = [...app.root.querySelectorAll<HTMLElement>("[aria-live]")]
+      .map((region) => region.textContent)
+    changeValue(bindingPosition as HTMLSelectElement, "run-position-999")
+    await settle()
+    expect(app.state.getSnapshot().config?.pipelines.parallel).toEqual(beforeRejectedMove)
+    expect([...app.root.querySelectorAll<HTMLElement>("[aria-live]")].map((region) => region.textContent))
+      .toEqual(liveTextBefore)
+    expect(app.root.querySelector("[data-apc-run-position-impact]")?.textContent?.length ?? 0).toBeGreaterThan(0)
+    for (const privateId of [THREAD_A, THREAD_B, THREAD_C, RUN_ID, RUN_B_ID, RUN_C_ID, RUN_D_ID]) {
+      expect(repeatedThreadPosition?.innerHTML).not.toContain(privateId)
+      expect(bindingPosition?.innerHTML).not.toContain(privateId)
+    }
+
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
+  test("rejects REQUIRED_CLOSURE binding candidates before staging", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    const config = graphConfig("A")
+    config.pipelines.parallel!.stages[0]!.runs[0]!.required = false
+    const requiredClosureBinding = config.pipelines.parallel!.stages[1]!.runs[0]!.inputs[0]
+    if (requiredClosureBinding?.source !== "output") throw new Error("expected output binding")
+    requiredClosureBinding.onMissing = "omit-binding"
+    fixture.editor.switchPreset(PRESET_A, config)
+    await settleUntil(() => app.state.getSnapshot().hydrated, "required closure hydration")
+    const connectionRequest = fixture.backend.requests("list_connections").at(-1)
+    fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
+    await settle()
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    actionByText(navigation as HTMLElement, "select-run", "A Context").click()
+    await settle()
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    const missing = thread?.querySelector<HTMLSelectElement>("[data-apc-binding-missing]")
+    expect(missing?.value).toBe("omit-binding")
+    changeValue(missing as HTMLSelectElement, "fail-graph")
+    await settle()
+    const retainedRequiredClosureBinding =
+      app.state.getSnapshot().config?.pipelines.parallel?.stages[1]?.runs[0]?.inputs[0]
+    expect(retainedRequiredClosureBinding?.source === "output" ? retainedRequiredClosureBinding.onMissing : undefined)
+      .toBe("omit-binding")
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
+  test("rejects SKIP_REQUIRED binding candidates before staging", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
+    await settleUntil(() => app.state.getSnapshot().hydrated, "skip required hydration")
+    const connectionRequest = fixture.backend.requests("list_connections").at(-1)
+    fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
+    await settle()
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    actionByText(navigation as HTMLElement, "select-run", "A Context").click()
+    await settle()
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    const missing = thread?.querySelector<HTMLSelectElement>("[data-apc-binding-missing]")
+    expect(missing?.value).toBe("fail-graph")
+    changeValue(missing as HTMLSelectElement, "skip-run")
+    await settle()
+    const retainedRequiredBinding =
+      app.state.getSnapshot().config?.pipelines.parallel?.stages[1]?.runs[0]?.inputs[0]
+    expect(retainedRequiredBinding?.source === "output" ? retainedRequiredBinding.onMissing : undefined)
+      .toBe("fail-graph")
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
+  test("adds an optional earlier source with an omit-binding policy", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    const config = graphConfig("A")
+    config.pipelines.parallel!.stages[0]!.runs[0]!.required = false
+    const optionalSourceBinding = config.pipelines.parallel!.stages[1]!.runs[0]!.inputs[0]
+    if (optionalSourceBinding?.source !== "output") throw new Error("expected output binding")
+    optionalSourceBinding.onMissing = "omit-binding"
+    fixture.editor.switchPreset(PRESET_A, config)
+    await settleUntil(() => app.state.getSnapshot().hydrated, "optional source hydration")
+    const connectionRequest = fixture.backend.requests("list_connections").at(-1)
+    fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
+    await settle()
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    actionByText(navigation as HTMLElement, "select-run", "A Context").click()
+    await settle()
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    click(thread as HTMLElement, "[data-apc-add-run-binding]")
+    await settle()
+    const inputs = app.state.getSnapshot().config?.pipelines.parallel?.stages[1]?.runs[0]?.inputs ?? []
+    expect(inputs).toHaveLength(2)
+    expect(inputs.at(-1)).toEqual({
+      source: "output",
+      runId: RUN_ID,
+      role: "user",
+      onMissing: "omit-binding",
+    })
+    const teardown = app.teardown()
+    assertDisarmed(fixture)
+    await teardown
+  })
+
   test("creates a Parallel connection slot through graph UI and reaches the scoped bind flow", async () => {
     const fixture = new HostFixture()
     const app = await createApcApp(fixture.context)
@@ -1976,7 +2807,7 @@ describe("APC public frontend application", () => {
     )
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
     expect(graph).not.toBeNull()
     await settleUntil(
       () => graph?.querySelector<HTMLButtonElement>('[data-action="add-connection-slot"]')?.disabled === false,
@@ -1992,13 +2823,14 @@ describe("APC public frontend application", () => {
     expect(slot ? validateConfigForMode(app.state.getSnapshot().config!, "parallel").valid : false).toBe(true)
     expect(graph?.innerHTML).not.toContain(slot?.id ?? "")
 
-    const threadAction = actionByText(graph as HTMLElement, "select-thread", "A Research")
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    const threadAction = actionByText(navigation as HTMLElement, "select-thread", "A Research")
     threadAction.click()
     await settleUntil(
-      () => app.root.querySelector("[data-apc-thread-editor]") !== null,
+      () => app.root.querySelector('[data-apc-thread-surface="configuration"]') !== null,
       "selected thread editor",
     )
-    const thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
     const slotSelect = thread?.querySelector<HTMLSelectElement>("[data-apc-connection-slot]")
     expect(slotSelect?.querySelector('option[value="connection-source-1"]')?.textContent).toBe(slot?.label)
     changeValue(slotSelect as HTMLSelectElement, "connection-source-1")
@@ -2057,7 +2889,7 @@ describe("APC public frontend application", () => {
     )
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
     await settleUntil(
       () => graph?.querySelector<HTMLButtonElement>('[data-action="remove-connection-slot"]')?.disabled === false,
       "bound slot removal action",
@@ -2096,7 +2928,7 @@ describe("APC public frontend application", () => {
     )
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
     await settleUntil(
       () => graph?.querySelector<HTMLButtonElement>('[data-action="remove-connection-slot"]')?.disabled === false,
       "failed unbind removal action",
@@ -2131,7 +2963,7 @@ describe("APC public frontend application", () => {
     )
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
     await settleUntil(
       () => graph?.querySelector<HTMLButtonElement>('[data-action="remove-connection-slot"]')?.disabled === false,
       "unbound slot removal action",
@@ -2166,7 +2998,7 @@ describe("APC public frontend application", () => {
       "Sequential mode availability",
     )
 
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
     actionByText(graph as HTMLElement, "select-thread", "A Research").click()
     await settle()
     expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_A })
@@ -2180,9 +3012,9 @@ describe("APC public frontend application", () => {
     expect(app.state.getSnapshot().config?.activeMode).toBe("sequential")
     expect(app.state.getSnapshot().selection).toEqual({ kind: "thread", threadId: THREAD_A })
 
-    const thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
     const connectionSlot = thread?.querySelector<HTMLSelectElement>("[data-apc-connection-slot]")
-    expect([...connectionSlot?.options ?? []].map((option) => option.value)).toEqual(["main"])
+    expect([...connectionSlot?.options ?? []].map((option) => option.value)).toEqual(["connection-source-main"])
     await settleUntil(
       () => fixture.backend.requests("resolve_consent").some((request) =>
         request.type === "resolve_consent" && request.payload.connectionSourceKey === "main"
@@ -2281,8 +3113,9 @@ describe("APC public frontend application", () => {
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
     await settle()
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
-    actionByText(graph as HTMLElement, "select-run", "A Research").click()
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="topology"]')
+    actionByText(navigation as HTMLElement, "select-run", "A Research").click()
     await settle()
 
     expect(graph?.querySelector<HTMLButtonElement>('[data-action="final-thread"]')?.disabled).toBe(true)
@@ -2352,8 +3185,11 @@ describe("APC public frontend application", () => {
     const app = await createApcApp(fixture.context)
     fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
     await settle()
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
     actionByText(graph as HTMLElement, "select-thread", "A Research").click()
+    await settle()
+    const configuration = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    click(configuration as HTMLElement, "[data-apc-open-workspace]")
     await settle()
     const loom = fixture.loomMounts.findLast((mount) => !mount.destroyed)
     loom?.options.onChange?.({ blocks: [], promptVariableValues: { "block-safe": { tone: "durable" } } })
@@ -2382,10 +3218,10 @@ describe("APC public frontend application", () => {
     const connectionRequest = fixture.backend.requests("list_connections").at(-1)
     fixture.backend.respondConnections(connectionRequest?.correlationId ?? "", [CONNECTION])
     await settle()
-    const graph = app.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
     actionByText(graph as HTMLElement, "select-thread", "A Research").click()
     await settle()
-    const thread = app.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
+    const thread = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
     const consentBaseline = fixture.backend.requests("resolve_consent").length
     click(thread as HTMLElement, "[data-apc-unbind]")
     await settleUntil(
@@ -2435,6 +3271,47 @@ describe("APC public frontend application", () => {
     await app.teardown()
   })
 
+  test("cleans every resource when authority is lost in initial toolbar visibility", async () => {
+    const fixture = new HostFixture()
+    fixture.ui.onSetVisible = () => fixture.events.emit("EXTENSION_DISABLED", {})
+    await expect(setup(fixture.context)).rejects.toThrow(/cancelled/)
+    assertDisarmed(fixture)
+  })
+
+  test("cleans every resource when authority is lost during tab activation registration", async () => {
+    const fixture = new HostFixture()
+    fixture.ui.onActivateRegister = () => fixture.events.emit("EXTENSION_DISABLED", {})
+    await expect(setup(fixture.context)).rejects.toThrow(/cancelled/)
+    assertDisarmed(fixture)
+  })
+
+  test("immediately unregisters a locale listener when subscription loses authority", async () => {
+    const fixture = new HostFixture()
+    fixture.locale.onSubscribe = () => fixture.events.emit("EXTENSION_DISABLED", {})
+    await expect(setup(fixture.context)).rejects.toThrow(/cancelled/)
+    assertDisarmed(fixture)
+    expect(fixture.locale.listenerCount()).toBe(0)
+  })
+
+  test("destroys a Loom handle exactly once when authority is lost during mount", async () => {
+    const fixture = new HostFixture()
+    const app = await createApcApp(fixture.context)
+    fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
+    await settleUntil(() => app.state.getSnapshot().hydrated, "Loom authority hydration")
+    const navigation = app.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
+    actionByText(navigation as HTMLElement, "select-thread", "A Research").click()
+    await settle()
+    const configuration = app.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    fixture.onLoomMount = () => fixture.events.emit("EXTENSION_DISABLED", {})
+    click(configuration as HTMLElement, "[data-apc-open-workspace]")
+    await settle()
+    expect(fixture.loomMounts).toHaveLength(1)
+    expect(fixture.loomMounts[0]?.destroyed).toBe(true)
+    expect(fixture.loomMounts[0]?.destroyCount).toBe(1)
+    assertDisarmed(fixture)
+    await app.teardown()
+  })
+
   for (const event of ["EXTENSION_DISABLED", "EXTENSION_UPDATED", "EXTENSION_UPDATE", "EXTENSION_UNLOADED"]) {
     test(`synchronously disarms on ${event} and rejects late host responses`, async () => {
       const fixture = new HostFixture()
@@ -2444,11 +3321,13 @@ describe("APC public frontend application", () => {
       const pendingConnections = fixture.backend.requests("list_connections")[0]
       fixture.backend.respondConnections(pendingConnections?.correlationId ?? "", [CONNECTION])
       await settle()
-      const graph = fixture.ui.tab?.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+      const graph = fixture.ui.tab?.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
       actionByText(graph as HTMLElement, "select-thread", "A Research").click()
       await settle()
+      const thread = fixture.ui.tab?.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+      click(thread as HTMLElement, "[data-apc-open-workspace]")
+      await settle()
       expect(fixture.loomMounts.some((mount) => !mount.destroyed)).toBe(true)
-      const thread = fixture.ui.tab?.root.querySelector<HTMLElement>("[data-apc-thread-editor]")
       const consentBaseline = fixture.backend.requests("resolve_consent").length
       click(thread as HTMLElement, "[data-apc-open-consent-review]")
       await settleUntil(
@@ -2480,8 +3359,11 @@ describe("APC public frontend application", () => {
     const teardown = await setup(fixture.context)
     fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
     await settle()
-    const graph = fixture.ui.tab?.root.querySelector<HTMLElement>("[data-apc-graph-editor]")
+    const graph = fixture.ui.tab?.root.querySelector<HTMLElement>('[data-apc-graph-surface="navigation"]')
     actionByText(graph as HTMLElement, "select-thread", "A Research").click()
+    await settle()
+    const configuration = fixture.ui.tab?.root.querySelector<HTMLElement>('[data-apc-thread-surface="configuration"]')
+    click(configuration as HTMLElement, "[data-apc-open-workspace]")
     await settle()
     expect(fixture.loomMounts.some((mount) => !mount.destroyed)).toBe(true)
     const flushCount = fixture.editor.flushCount

@@ -11,6 +11,7 @@ import type { BackendHydrationResponse } from "../protocol/messages"
 import { PROTOCOL_VERSION } from "../protocol/messages"
 
 const PRESET_ID = "550e8400-e29b-41d4-a716-446655440000"
+const SECOND_PRESET_ID = "550e8400-e29b-41d4-a716-446655440010"
 const CORRELATION_ID = "550e8400-e29b-41d4-a716-446655440001"
 
 class FakeEditor implements ApcPresetEditorDraftAdapter {
@@ -24,6 +25,7 @@ class FakeEditor implements ApcPresetEditorDraftAdapter {
   failNextFlush = false
   flushFailureHook: (() => void) | null = null
   flushStartHook: (() => void) | null = null
+  deferNotifications = false
   #flushBlocked = false
   #flushRelease: (() => void) | null = null
   #flushStartWaiters = new Set<() => void>()
@@ -41,6 +43,7 @@ class FakeEditor implements ApcPresetEditorDraftAdapter {
     this.#flushRelease = null
   }
   #listeners = new Set<(state: ApcPresetEditorDraftState) => void>()
+  #deferredStates: ApcPresetEditorDraftState[] = []
 
   getState(): ApcPresetEditorDraftState {
     return this.state
@@ -54,7 +57,18 @@ class FakeEditor implements ApcPresetEditorDraftAdapter {
     return value
   }
   protected notify(): void {
-    for (const listener of this.#listeners) listener(this.state)
+    if (this.deferNotifications) {
+      this.#deferredStates.push(this.state)
+      return
+    }
+    this.emit()
+  }
+  emit(state: ApcPresetEditorDraftState = this.state): void {
+    for (const listener of this.#listeners) listener(state)
+  }
+  releaseNotifications(latestOnly = false): void {
+    const states = latestOnly ? this.#deferredStates.splice(-1) : this.#deferredStates.splice(0)
+    for (const state of states) this.emit(state)
   }
 
   updateMetadata(mutator: (metadata: unknown) => unknown): void {
@@ -184,6 +198,39 @@ describe("APC frontend persistence", () => {
     persistence.dispose()
   })
 
+  test("keeps delayed save publication owned after the save settles", async () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+
+    await persistence.saveConfig(PRESET_ID, config("parallel"))
+    expect(ownedEvents).toEqual([])
+    editor.releaseNotifications(true)
+
+    expect(ownedEvents).toEqual([true])
+    persistence.dispose()
+  })
+
+  test("keeps delayed rollback publication owned after a failed save settles", async () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    editor.failNextFlush = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+
+    const pending = persistence.saveConfig(PRESET_ID, config("parallel"))
+    await expect(pending).rejects.toThrow("draft flush failed")
+    expect(editor.state.metadata).toEqual(config("single"))
+    expect(ownedEvents).toEqual([])
+    editor.releaseNotifications(true)
+
+    expect(ownedEvents).toEqual([true])
+    persistence.dispose()
+  })
+
   test("keeps staged metadata owned through delayed host publication", async () => {
     const editor = new CloningEditor()
     const persistence = createApcPersistence({ editor })
@@ -209,6 +256,168 @@ describe("APC frontend persistence", () => {
     expect(ownedEvents).toEqual([true, true])
     editor.updateMetadata(() => config("external"))
     expect(ownedEvents[ownedEvents.length - 1]).toBe(false)
+    persistence.dispose()
+  })
+
+  test("matches delayed owned callbacks in order and rejects a stale earlier callback", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const first = config("parallel")
+    const second = config("sequential")
+
+    persistence.stageConfig(PRESET_ID, first)
+    persistence.stageConfig(PRESET_ID, second)
+    editor.emit({ presetId: PRESET_ID, metadata: first })
+    editor.emit({ presetId: PRESET_ID, metadata: second })
+    editor.emit({ presetId: PRESET_ID, metadata: first })
+
+    expect(ownedEvents).toEqual([true, true, false])
+    persistence.dispose()
+  })
+
+  test("accepts a coalesced callback for the newest owned draft", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const first = config("single")
+    const second = config("parallel")
+    const newest = config("sequential")
+
+    persistence.stageConfig(PRESET_ID, first)
+    persistence.stageConfig(PRESET_ID, second)
+    persistence.stageConfig(PRESET_ID, newest)
+    editor.emit({ presetId: PRESET_ID, metadata: newest })
+    editor.emit({ presetId: PRESET_ID, metadata: first })
+
+    expect(ownedEvents).toEqual([true, false])
+    persistence.dispose()
+  })
+
+  test("keeps delayed ownership expectations through interleaved foreign metadata", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const first = config("single")
+    const second = config("parallel")
+
+    persistence.stageConfig(PRESET_ID, first)
+    persistence.stageConfig(PRESET_ID, second)
+    editor.emit({ presetId: PRESET_ID, metadata: config("foreign") })
+    editor.emit({ presetId: PRESET_ID, metadata: second })
+    editor.emit({ presetId: PRESET_ID, metadata: first })
+
+    expect(ownedEvents).toEqual([false, true, false])
+    persistence.dispose()
+  })
+
+  test("preserves ownership for repeated equal metadata callbacks", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const repeated = config("parallel")
+
+    persistence.stageConfig(PRESET_ID, repeated)
+    persistence.stageConfig(PRESET_ID, repeated)
+    editor.emit({ presetId: PRESET_ID, metadata: repeated })
+    editor.emit({ presetId: PRESET_ID, metadata: repeated })
+
+    expect(ownedEvents).toEqual([true, true])
+    persistence.dispose()
+  })
+
+  test("clears ownership on a foreign current edit before an external revert", () => {
+    const editor = new CloningEditor()
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const owned = config("parallel")
+
+    persistence.stageConfig(PRESET_ID, owned)
+    editor.updateMetadata(() => config("foreign"))
+    editor.updateMetadata(() => owned)
+
+    expect(ownedEvents).toEqual([true, false, false])
+    persistence.dispose()
+  })
+
+  test("clears ownership when an authoritative regression matches an older expectation", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const first = config("parallel")
+    const second = config("sequential")
+
+    persistence.stageConfig(PRESET_ID, first)
+    persistence.stageConfig(PRESET_ID, second)
+    editor.state = { presetId: PRESET_ID, metadata: first }
+    editor.emit(editor.state)
+    editor.emit({ presetId: PRESET_ID, metadata: second })
+
+    expect(ownedEvents).toEqual([false, false])
+    persistence.dispose()
+  })
+
+  test("resets ownership when the observed preset changes", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const stale = config("parallel")
+    const current = config("sequential")
+
+    persistence.stageConfig(PRESET_ID, stale)
+    editor.state = { presetId: SECOND_PRESET_ID, metadata: config("external") }
+    editor.emit(editor.state)
+    editor.emit({ presetId: PRESET_ID, metadata: stale })
+    persistence.stageConfig(SECOND_PRESET_ID, current)
+    editor.emit({ presetId: PRESET_ID, metadata: stale })
+    editor.emit({ presetId: SECOND_PRESET_ID, metadata: current })
+
+    expect(ownedEvents).toEqual([false, false, false, true])
+    persistence.dispose()
+  })
+
+  test("drops expectations from an invalidated lifecycle on dispose", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const staged = config("parallel")
+
+    persistence.stageConfig(PRESET_ID, staged)
+    persistence.dispose()
+    editor.emit({ presetId: PRESET_ID, metadata: staged })
+
+    expect(persistence.disposed).toBe(true)
+    expect(ownedEvents).toEqual([])
+  })
+
+  test("bounds delayed ownership expectations to the newest entries", () => {
+    const editor = new CloningEditor()
+    editor.deferNotifications = true
+    const persistence = createApcPersistence({ editor })
+    const ownedEvents: boolean[] = []
+    persistence.subscribeDraft((event) => ownedEvents.push(event.owned))
+    const drafts = Array.from({ length: 80 }, (_, index) => config(`mode-${index}`))
+
+    for (const draft of drafts) persistence.stageConfig(PRESET_ID, draft)
+    editor.emit({ presetId: PRESET_ID, metadata: drafts[0] })
+    editor.emit({ presetId: PRESET_ID, metadata: drafts[drafts.length - 1] })
+
+    expect(ownedEvents).toEqual([false, true])
     persistence.dispose()
   })
 
@@ -240,6 +449,24 @@ describe("APC frontend persistence", () => {
     expect(editor.state.metadata).toEqual(config("single"))
     expect(editor.updateCount).toBe(2)
     expect(editor.flushCount).toBe(2)
+    persistence.dispose()
+  })
+
+  test("does not roll back over a newer equal-valued stage", async () => {
+    const editor = new CloningEditor()
+    editor.failNextFlush = true
+    const persistence = createApcPersistence({ editor })
+    const staged = config("parallel")
+    editor.flushFailureHook = () => {
+      persistence.stageConfig(PRESET_ID, staged)
+    }
+
+    const pending = persistence.saveConfig(PRESET_ID, staged)
+
+    await expect(pending).rejects.toThrow("draft flush failed")
+    expect(editor.state.metadata).toEqual(staged)
+    expect(editor.updateCount).toBe(2)
+    expect(editor.flushCount).toBe(1)
     persistence.dispose()
   })
 

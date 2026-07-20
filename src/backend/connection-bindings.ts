@@ -420,10 +420,9 @@ export class ConnectionBindings {
   }
 
   private async assertOwnedConnection(userId: string, connectionId: string): Promise<void> {
-    // `connections.get` is already scoped to the authenticated host request.
-    // Passing a user ID here is not part of the 0.6.6 contract and would make
-    // ownership depend on an extension-controlled argument.
-    const profile = await this.connections.get(connectionId)
+    // Operator-scoped hosts require the authenticated callback user ID.
+    // The host applies that scope before returning the profile.
+    const profile = await this.connections.get(connectionId, userId)
     if (profile === null) return fail("CONNECTION_NOT_FOUND", "Connection is missing or inaccessible to this user")
     if (profile.id !== connectionId) return fail("CONNECTION_NOT_FOUND", "Connection profile identity mismatch")
     if (!profileBelongsToUser(profile, userId)) return fail("WRONG_USER", "Connection belongs to another user")
@@ -616,9 +615,9 @@ export class ConnectionBindings {
 
   async listConnections(userIdInput: string): Promise<readonly ConnectionProfileDTO[]> {
     const userId = assertText(userIdInput, "userId")
-    // The host-scoped list has already applied the authenticated user scope.
+    // Operator-scoped hosts require the authenticated callback user ID.
     // Keep the local identity check for hosts that expose an owner hint.
-    const profiles = await this.connections.list()
+    const profiles = await this.connections.list(userId)
     const safe = profiles
       .filter((profile) => profileBelongsToUser(profile, userId))
       .map((profile) => safeConnectionProfile(profile))

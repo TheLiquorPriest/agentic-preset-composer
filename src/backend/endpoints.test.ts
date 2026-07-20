@@ -13,6 +13,7 @@ import type {
   BackendResponse,
 } from "../protocol/messages"
 import {
+  decodeBackendResponse,
   MAX_CONNECTIONS,
   MAX_BINDING_VIEWS,
   MAX_CONSENT_VIEWS,
@@ -509,6 +510,47 @@ describe("backend endpoint router", () => {
     })
   })
 
+  test("preserves the binding service receiver while resolving persisted slots", async () => {
+    let receiverChecks = 0
+    const fixture = createFixture({
+      startWithoutDisclosure: true,
+      initialConsent: false,
+      resolveSlot: async function (this: BackendBindingService) {
+        if (typeof this.listBindings !== "function") throw new Error("binding service receiver was lost")
+        receiverChecks += 1
+        return resolvedBinding()
+      },
+    })
+    const hydration = await fixture.router.handle(
+      { userId: "user-a" },
+      intent("hydrate_preset", { presetId: PRESET_ID }),
+    )
+    expect(hydration.type).toBe("hydration")
+    if (hydration.type !== "hydration") return
+    expect(hydration.payload.bindings[0]).toMatchObject({
+      slotId: SLOT_ID,
+      bound: true,
+      status: "bound",
+    })
+    const consent = await fixture.router.handle(
+      { userId: "user-a" },
+      intent("resolve_consent", {
+        presetId: PRESET_ID,
+        threadId: THREAD_ID,
+        workspaceSource: "native-blocks",
+        connectionSourceKey: `slot:${SLOT_ID}`,
+      }),
+    )
+    expect(consent.type).toBe("consent")
+    if (consent.type !== "consent") return
+    expect(consent.payload.destination).toEqual({
+      label: "Main connection",
+      provider: "openai",
+      model: "model-a",
+    })
+    expect(receiverChecks).toBe(2)
+  })
+
   test("hydrates only the current execution for the exact authenticated user and preset", async () => {
     const activity: BackendActivityResponse["payload"] = {
       executionId: EXECUTION_ID,
@@ -799,6 +841,8 @@ describe("backend endpoint router", () => {
       destination: { label: "Main connection", provider: "openai", model: "model-a" },
       disclosure: { version: 1 },
     })
+    expect(response.payload.consents[0]).not.toHaveProperty("presetId")
+    expect(() => decodeBackendResponse(response)).not.toThrow()
     expect(response.payload.consents[0]?.disclosure?.categories).toEqual([
       "thread",
       "workspace",

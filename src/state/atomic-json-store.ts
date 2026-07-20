@@ -1,3 +1,4 @@
+import { MAX_CONFIG_BYTES, utf8Bytes } from "../config/limits"
 import {
   buildBindingDocumentKey,
   buildInstallRecordKey,
@@ -119,6 +120,9 @@ function assertRevision(value: unknown): number {
 
 function parseStorageValue(value: unknown, path: string): unknown {
   if (typeof value === "string") {
+    if (utf8Bytes(value) > MAX_CONFIG_BYTES) {
+      return fail("CORRUPT_DOCUMENT", `Stored JSON at ${path} exceeds ${MAX_CONFIG_BYTES} UTF-8 bytes`)
+    }
     try {
       return JSON.parse(value) as unknown
     } catch (error) {
@@ -126,6 +130,9 @@ function parseStorageValue(value: unknown, path: string): unknown {
     }
   }
   if (value instanceof Uint8Array) {
+    if (value.byteLength > MAX_CONFIG_BYTES) {
+      return fail("CORRUPT_DOCUMENT", `Stored JSON at ${path} exceeds ${MAX_CONFIG_BYTES} UTF-8 bytes`)
+    }
     try {
       return JSON.parse(new TextDecoder().decode(value)) as unknown
     } catch (error) {
@@ -139,6 +146,9 @@ function serialize(value: object, path: string): string {
   try {
     const encoded = JSON.stringify(value)
     if (typeof encoded !== "string") return fail("CORRUPT_DOCUMENT", `Could not serialize ${path}`)
+    if (utf8Bytes(encoded) > MAX_CONFIG_BYTES) {
+      return fail("CORRUPT_DOCUMENT", `Serialized JSON at ${path} exceeds ${MAX_CONFIG_BYTES} UTF-8 bytes`)
+    }
     return encoded
   } catch (error) {
     return fail("CORRUPT_DOCUMENT", `Could not serialize ${path}`, error)
