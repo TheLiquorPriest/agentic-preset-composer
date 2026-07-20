@@ -17,6 +17,7 @@ export const REQUIRED_HOST_CAPABILITIES = Object.freeze({
   "generation-assembly-v1": 1,
   "interceptor-context-v1": 1,
   "interceptor-final-response-v1": 1,
+  "connection-dispatch-resolution-v1": 1,
 } as const)
 
 export type ParsedCanonicalSemver = Readonly<{

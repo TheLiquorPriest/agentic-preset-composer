@@ -1,193 +1,182 @@
 # Agentic Preset Composer
 
-Agentic Preset Composer (APC) is a design-only Spindle extension concept for
-Lumiverse: presets that run as a distributed agent graph, composing multiple
-role-specialized generations at generation time instead of relying on one
-monolithic prompt.
+Agentic Preset Composer (APC) is an opt-in Spindle extension for Lumiverse.
+It turns a preset into a bounded agent graph with reusable thread workspaces,
+ordered stages, explicit connection review, and a controlled final response.
+Single mode continues to use the native preset-generation path.
 
-## Status
+## Implementation status
 
-**Design-only, inert scaffold — APC cannot run today.**
+Gate G is implemented on `master`. Both extension entrypoints are live:
 
-Current staging now supplies reusable Spindle primitives: generic top-level
-`LoomPreset.passthroughMetadata`; native preset-editor tabs and draft helpers;
-`spindle.assemble`; nonrecursive `spindle.generate.quiet`; a 300-second
-interceptor budget; richer pre-assembly generation context; and post-assembly
-message, parameter, and Breakdown mutation. APC will reuse those primitives,
-not recreate their generic surfaces.
+- The backend validates the immutable host descriptor before creating APC
+  state, then starts the storage, endpoint router, frontend-message bridge,
+  permission watcher, lifecycle watchers, and interceptor registration.
+- The frontend validates the descriptor and required host surface, checks the
+  manifest permissions, registers the APC mode toolbar item and **Agent Graph**
+  preset-editor tab, and owns the graph, thread workspace, inspector, consent
+  review, locale subscription, and teardown lifecycle.
+- `package.json` and `bun.lock` pin `lumiverse-spindle-types` to exact `0.6.6`.
+  The checked-in source pin is the dependency record for this extension.
+This is source implementation status, not a production-readiness or publication
+claim. Isolated host testing requires the authenticated containment-fatal
+propagation contract described in `DESIGN.md`. The current test authority is
+Lumiverse PR #249 commit `90a7fdafec3fdc46d03f0764d30d9282f89ec649`;
+ordinary `staging` remains ineligible until that correction merges.
 
-The merged Gate B host capability is complete as a generic, inert surface:
-generic toolbar placement and registration roots, generic preset-editor
-tab/helper lifecycle and mount roots, activation of the built-in preset editor through the generic `blocks` API ID,
-namespace-scoped mutation and serialization, permission-revocation teardown,
-save coordination, and generation flushing. Core ships no APC-specific toolbar
-item or default UI.
+The descriptor must contain `descriptorVersion`, `lumiverseVersion`,
+`capabilities`, and `extensionInstallationId`. APC requires Lumiverse `1.0.8`
+or newer and these seven host capabilities at version `1`:
 
-The APC frontend later registers its toolbar item and Agent Graph tab through
-those generic roots, rendering the **Single | Sequential | Parallel** radiogroup
-and Agent Graph content with APC-owned labels, disabled reasons, accessibility
-behavior, and catalogs.
+1. `preset-extension-data-v1`
+2. `preset-editor-v1`
+3. `loom-block-editor-v1`
+4. `generation-assembly-v1`
+5. `interceptor-context-v1`
+6. `interceptor-final-response-v1`
+7. `connection-dispatch-resolution-v1`
 
-The surviving controlled native Loom editor and its generic frontend
-bridge/placement surface remain current staging foundations for Gate C. The
-broader historical Gate C hardening is not current capability or release
-authority. Gates D–F still need parent-bound assembly/retrieval/dispatch/prefill
-snapshots, invocation-bound identity and cancellation, non-commit containment,
-tracked revision-bound receipts, terminal guidance placement, thread-final
-finalization, live host locale, and an enforced shared host descriptor.
+An incompatible descriptor fails before APC registration or other domain work.
+The manifest declares `interceptor`, `generation`, `presets`, and
+`final_response`. Loss of required `interceptor` or `generation` permission
+revokes the backend registration and disarms active APC work; loss of
+`final_response` disables only Thread-final routing and leaves safe native Main
+fallback available.
 
-The portable graph has one wire location:
-`metadata.agentic_preset_composer`. The clean cutover has no dual key, dual
-read, or `extensionsMeta` model: the Gate 0 audit found no persisted APC rows at
-either prior path and no installed APC extension. Generic passthrough must
-preserve every unrelated metadata sibling.
+## Runtime contract
 
-## Cross-gate baseline invariant
+### Modes and first use
 
-Across every gate, absent an APC extension registration or use of a new generic
-mount/API, steady-state baseline Lumiverse controls, layout, DOM, and baseline
-strings remain unchanged apart from generic conditional diagnostics. Any new host
-diagnostic string is added to all six Lumiverse core locales.
-Core exposes only generic, inert placement, lifecycle, bridge, compatibility,
-locale, and finalization roots; it never adds APC-specific visuals, literals, or
-catalogs. The APC frontend registers the toolbar item and Agent Graph tab
-through those generic roots, then renders the **Single | Sequential |
-Parallel** radiogroup, Agent Graph content, APC labels, disabled reasons,
-accessibility behavior, and its six locale catalogs. No APC-specific locale
-catalog belongs in core.
+The registered toolbar exposes **Single**, **Sequential**, and **Parallel**:
 
-No APC runtime work begins until one consolidated APC-only host PR carrying
-internal Gates D→E→F lands in `staging`, upstream has merged corrected PR #32,
-and its author has published exact `0.6.6`. Upstream
-`lumiverse-spindle-types@0.6.5` is published, but it is not the corrected
-D–F contract. Corrected draft PR #32 targets `0.6.6`, removes the invented
-global API-version axis, and defines compatibility from the minimum Lumiverse
-application version (`1.0.8`), descriptor schema (`descriptorVersion: 1`), and
-the six named capability versions. Its descriptor fields are exactly
-`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
-`extensionInstallationId`. The corrected `0.6.6` remains unpublished, and
-this extension cannot publish it. Final D–F evidence and the independent
-red-team review must pass before exact pinning or any host draft/publication.
-No host draft PR exists yet. Committed APC dependency metadata remains pinned
-to published `0.5.31`; local checks against the unpublished `0.6.6` candidate
-use an uncommitted local link only. Do not update the package dependency or
-`bun.lock`, run a clean frozen install, or publish the host/APC artifacts until
-upstream merges and publishes `0.6.6`.
-APC compatibility source/manifest alignment targets Lumiverse `1.0.8`; the
-validator rejects any host lacking the required six named capability versions.
+- **Single** activates the host's built-in `blocks` preset editor and leaves
+  native assembly and dispatch unchanged.
+- **Sequential** runs exactly one run per ordered stage, using authoritative
+  Main dispatch for every call. The Sequential UI exposes no connection-slot
+  picker and runtime ignores stored per-thread slot metadata in this mode;
+  switching back to Parallel preserves those bindings.
+- **Parallel** runs one to four distinct runs in a stage, drains with
+  `allSettled`, and preserves configured output order. A thread can inherit
+  Main or use an explicitly bound connection slot.
 
-Both `src/` entrypoints synchronously validate only the immutable public host
-descriptor (`spindle.host` or `ctx.host`) before any registration, UI mount,
-storage, network, or APC API work. The descriptor contains exactly
-`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
-`extensionInstallationId`; compatibility requires `descriptorVersion: 1`,
-Lumiverse `1.0.8` or newer, and version `1` for each of
-`preset-extension-data-v1`, `preset-editor-v1`, `loom-block-editor-v1`,
-`generation-assembly-v1`, `interceptor-context-v1`, and
-`interceptor-final-response-v1`. Valid descriptors leave the backend inert and
-return a frontend cleanup no-op, while invalid descriptors throw. The manifest
-records exactly the four contract permissions; it does not claim or enable APC
-runtime behavior.
+An empty graph offers two explicit creation actions: **Create Sequential
+graph** and **Create Parallel graph**. Either action creates the selected mode's
+first reusable thread, stage, and run, then leaves the draft for the shared
+save coordinator. It does not create a sample graph, bind a connection, or
+grant consent. Single remains available throughout.
 
-The schema-required `github` and `homepage` values are local release metadata
-for a future extension repository. They neither configure a Git remote nor
-install, access, or publish APC; no APC remote exists before user-directed
-publication.
+### Graph and persistence
 
-## Local review bundle
+The portable graph is stored only at
+`metadata.agentic_preset_composer`. Host metadata passthrough preserves that
+bag and unrelated siblings. Connection UUIDs, dispatch revisions, receipts,
+nonces, user IDs, and other private authority data never enter portable
+metadata or user-facing APC copy.
 
-The user has authorized local consolidated D–F implementation/evidence and one
-APC-only host PR. Gate C contributes only its surviving controlled Loom
-foundation; D, then E, then F are internally ordered, separately testable
-slices of the one host PR, with full feature scope preserved. The separately
-claimed consolidated feature worktree composes them sequentially for cross-gate
-verification and becomes the one external host PR source only after all
-evidence and publication blockers clear. The preserved no-remote prototype
-clone remains read-only evidence and never supplies external PR commits. One
-independent cross-gate red-team wave runs after all
-three slices pass verification. There is no requirement for three external
-D/E/F host PRs.
+Threads use either a native-block workspace or a read-only snapshot of Main
+context. Each run has one `final` output. References target earlier stages
+only; invalid closure, limits, or final routing disables the affected mode.
+The schema limits are 16 threads, 32 stages, 64 runs, four parallel runs per
+stage, one sequential run per stage, and a 240-second run timeout.
 
-1. **Generic metadata passthrough and LumiHub integrity (Gate A — complete).**
-   The completed gate reuses upstream passthrough metadata, preserves every
-   sibling key, and records LumiHub create/update preservation. This gate is not
-   an `extensionsMeta` rewrite.
-2. **Generic preset-editor surfaces and persistence (Gate B host capability — complete).**
-   The completed host capability provides generic toolbar placement/registration
-   roots, tab/helper lifecycle, activation of the built-in preset editor through the generic `blocks` API ID,
-   namespace-scoped mutation/serialization, permission teardown, save coordination, and
-   generation-flush gating. It is inert by default and adds no APC-specific UI.
-   The APC frontend later registers its toolbar item through the generic toolbar
-   root and renders the **Single | Sequential | Parallel** radiogroup and
-   **Agent Graph** view through the generic roots.
-3. **Controlled native Loom editor (Gate C — surviving foundation).** One shared
-   controlled editor keeps default output visually identical to Lumiverse's
-   editor; its bridge stays visually inert until an extension explicitly
-   requests a mount. APC later mounts it for extension-owned thread values and
-   owns the surrounding thread UI; the bridge seals host-only fields. This is
-   the surviving generic foundation only, not current APC runtime capability.
-4. **Parent-bound assembly and dispatch substrate (Gate D).** Reuse assembly and quiet
-   internals while adding host-internal parent route/retrieval/dispatch/prefill
-   snapshots, invocation-token enforcement, a non-commit lease and fatal
-   channel, and typed tracked dispatch with immutable revisions and receipts.
-   This gate does not activate APC callbacks.
-5. **Authoritative interceptor lifecycle and terminal placement (Gate E).** Use
-   the Gate D substrate to bind callbacks, aborts, effective context, matching,
-   and disposal authoritatively, then defer terminal guidance and revalidate it
-   before every provider route.
-6. **Finalization, compatibility, and locale (Gate F).** Core exposes privileged
-   thread-final finalization, an enforced shared backend/frontend descriptor
-   with minimum compatibility, and a host locale getter/change subscription.
-   APC ships and renders its own complete catalogs for `en`, `zh`, `zh-TW`,
-   `ja`, `fr`, and `it` through its registered views. Generic conditional
-   permission/compatibility/error diagnostics may appear when applicable; any
-   new host diagnostic string is added to all six Lumiverse core locales. No
-   APC-specific labels, views, literals, or catalogs belong in core.
+Mode and graph edits use the namespace-scoped preset-editor draft helper and
+the host save coordinator's generation-flush barrier. A failed ordinary graph
+save keeps the draft visibly dirty with its failure so it can be corrected and
+resaved. A failed mode transition restores the last persisted active mode;
+native and APC pipelines remain untouched.
 
-These are the post-gate canonical requirements; **none of this APC behavior
-exists or runs while the consolidated host PR and the corrected, exact-pinned
-`0.6.6` types contract remain pending.** After those prerequisites land, the
-APC frontend registers the persistent toolbar item and Agent Graph tab through
-the generic roots, then renders the **Single | Sequential | Parallel** radiogroup
-and Agent Graph content. That extension-owned flow retains native **Blocks**
-activation; native-block threads must reuse the frozen parent retrieval snapshot
-with no new retrieval effects; final routing must remain Main-or-thread; and
-dispatch must remain bound to immutable source revisions and receipts.
-Callback-bound user and cancellation, fail-closed containment, and terminal
-guidance immediately before every provider call remain required.
-Council remains enabled in that future runtime. Sidecar provider/tool effects
-and completed history/cache writes that already occurred before APC interception
-are explicit nonrollbackable effects; later provider routes remain subject to
-APC's terminal guidance, carrier, budget, and provenance validation.
+### Dispatch, consent, and authority
 
-## Where to read
+APC resolves every destination through the authenticated host connection API.
+Each run carries a discriminated `main` or `slot` dispatch source and the exact
+expected `connectionDispatchRevision`. Native-block assembly uses
+`spindle.generate.assemble`; provider dispatch uses
+`spindle.generate.quietTracked` with that same bound source and revision.
+APC validates the returned tracked receipt and rejects stale, mismatched, or
+untrusted results before committing a run.
 
-- `DESIGN.md` — the canonical APC product and security contract, including the
-  upstream primitives, surviving foundations, and three ordered D–F gates.
-- `AUTHOR_BRIEF.md` — the authoritative consolidated host-PR review, evidence,
-  and release protocol.
+Consent is bound to the installation, preset, thread, workspace source,
+connection source, resolved destination, effective dispatch revision, and
+disclosure version. The frontend sends intent only; it never asserts a
+revision, user identity, destination, or whole document. Missing or stale
+consent always makes zero assembly/provider subcalls. A required run then
+drives the required-failure Graph-fallback outcome; an optional run follows
+its configured optional-local policy.
+The backend is the sole local-state writer and serializes binding, consent,
+and execution-replacement mutations.
 
-Together these documents define the canonical local set. No external Gist,
-prior plan, or unlisted local artifact may amend either document.
+### Cancellation, outcomes, and final response
 
-## Development
+Frontend Stop and replacement use the `cancel_execution` intent. Callback-bound
+cancellation is propagated internally through host-owned signals; APC does
+not serialize an `AbortSignal` as a frontend/backend payload. Stop,
+replacement, timeout, required failure, permission loss, disable, update, and
+unload cannot revive an execution. The graph work deadline leaves a host
+reserve for terminal transition and drain.
 
-This independent extension repository remains inert while the consolidated
-APC-only host PR and the corrected, exact-pinned `0.6.6` types contract remain
-pending. Committed dependency metadata remains pinned to published `0.5.31`;
-local candidate checks may use an uncommitted local `0.6.6` link only. Local
-design and no-op scaffold maintenance are permitted; do not commit that local
-link or add runtime behavior, future permissions, package versions, lockfile
-changes, or build output to this extension. Update the package dependency and
-`bun.lock` together to exact `0.6.6` only after upstream publishes it; until
-then, clean frozen-install and publication readiness remain blocked. This
-project cannot publish the types package.
-Gate G—the future APC implementation/release boundary—remains blocked and
-inert: no registration, mount, storage, generation, interceptor callback, or
-other APC runtime work is permitted.
+The monotonic outcome order is **integrity-fatal > parent-cancel >
+selected-final failure > Graph-fallback > optional-local > success**. A
+required failure falls back through Main; optional failures follow their
+configured policy. The final route is either Main or a designated thread run.
+Main guidance is placed immediately before the authenticated prefill carrier;
+thread-final output uses the privileged host finalization path. If
+`final_response` is unavailable or revoked, APC emits a bounded reason/activity
+and preserves the safe native Main response instead. APC never promises rollback
+of provider, tool, Council, history, or cache effects that already occurred.
 
-The authorized D–F candidate is reconstructed in the separately claimed
-consolidated feature worktree. Preserve unrelated work and treat the stopped
-no-remote prototype clone, local prototype tests, and snapshots `45acd748` and
-`e4bbe6c` as historical evidence only, never as current staging capability or
-an implementation base.
+## Build and isolated-host testing
+
+From this extension repository, use Bun and the checked-in lockfile:
+
+```sh
+bun install --frozen-lockfile
+bun run typecheck
+bun run build
+```
+
+`bun run build` invokes the package's `build:backend` and `build:frontend`
+scripts and produces the manifest entrypoints `dist/backend.js` and
+`dist/frontend.js`. Run focused tests with `bun test` when needed.
+HOST TESTING GATE — provision, import, enable, restart, and browser-test APC
+only in a registered isolated host pinned to Lumiverse PR #249 commit
+`90a7fdafec3fdc46d03f0764d30d9282f89ec649` or a verified descendant that
+preserves the same authenticated containment-fatal contract. Do not use an
+ordinary `staging` host or production. Publication remains blocked pending the
+isolated-host evidence and user acceptance.
+
+### Isolated host workflow
+
+For local host testing, first register a dedicated isolated Lumiverse host using
+the shared environment guide. Use that host's registered `STATE.md`
+`paths.data_dir` as `HOST_DATA_DIR`; never use the canonical checkout's data
+directory. Link only the extension repository under the manifest identifier:
+
+```sh
+HOST_DATA_DIR='<registered isolated-host data directory>'
+EXTENSION_ROOT='<absolute APC extension repository>'
+mkdir -p "$HOST_DATA_DIR/extensions/agentic_preset_composer"
+ln -s "$EXTENSION_ROOT" \
+  "$HOST_DATA_DIR/extensions/agentic_preset_composer/repo"
+```
+
+As the host owner, call `POST /api/v1/spindle/import-local` on that registered
+host. Read the import response (or `GET /api/v1/spindle`) to obtain the
+extension's database UUID. The route placeholder is that database UUID, not
+`agentic_preset_composer`: grant permissions with
+`POST /api/v1/spindle/<DB_UUID>/permissions`, enable with
+`POST /api/v1/spindle/<DB_UUID>/enable`, and after each `bun run build` reload
+with `POST /api/v1/spindle/<DB_UUID>/restart`. Restart consumes the already
+built `dist` entrypoints; it does not build them.
+
+## Source map
+
+- `spindle.json` — manifest, permissions, compatibility minimum, and
+  `dist` entrypoints.
+- `src/backend.ts` and `src/backend/` — registration, storage, dispatch,
+  execution, cancellation, traces, endpoints, and final routing.
+- `src/frontend.ts` and `src/frontend/` — host contributions, graph/thread
+  editing, persistence, consent presentation, activity projection, and
+  teardown.
+- `DESIGN.md` — product, authority, privacy, dispatch, cancellation, and
+  final-response contract.
+- `UI.md` — current presentation and interaction guidance.

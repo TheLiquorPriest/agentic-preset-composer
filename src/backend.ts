@@ -1,7 +1,12 @@
 import type { SpindleAPI } from "lumiverse-spindle-types"
-import { validateSpindleHostDescriptor } from "./compat"
+import { setup } from "./backend/runtime"
 
 declare const spindle: SpindleAPI
 
-// Validate the immutable host descriptor before any future APC host API work.
-validateSpindleHostDescriptor(spindle.host)
+// The host awaits the entry module; startup therefore cannot expose a partially
+// initialized interceptor or frontend transport.
+const runtime = setup(spindle)
+await runtime.ready
+
+export { runtime }
+export const teardown = (): Promise<void> => runtime.dispose()

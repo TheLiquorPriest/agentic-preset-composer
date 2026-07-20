@@ -11,12 +11,21 @@ import {
 type DescriptorInput = Record<string, unknown>
 
 const INSTALLATION_ID = "550e8400-e29b-41d4-a716-446655440000"
+const EXPECTED_HOST_CAPABILITIES = {
+  "preset-extension-data-v1": 1,
+  "preset-editor-v1": 1,
+  "loom-block-editor-v1": 1,
+  "generation-assembly-v1": 1,
+  "interceptor-context-v1": 1,
+  "interceptor-final-response-v1": 1,
+  "connection-dispatch-resolution-v1": 1,
+} as const
 
 function descriptor(overrides: DescriptorInput = {}): DescriptorInput {
   return {
     descriptorVersion: 1,
     lumiverseVersion: MIN_LUMIVERSE_VERSION,
-    capabilities: { ...REQUIRED_HOST_CAPABILITIES },
+    capabilities: { ...EXPECTED_HOST_CAPABILITIES },
     extensionInstallationId: INSTALLATION_ID,
     ...overrides,
   }
@@ -33,25 +42,42 @@ function expectCompatibilityError(input: unknown, message: string): void {
   }
 }
 
-describe("APC host compatibility scaffold", () => {
-  test("accepts the exact descriptor and freezes the normalized result", () => {
+describe("APC host compatibility descriptor", () => {
+  test("accepts the exact descriptor shape and freezes the normalized result", () => {
+    expect(REQUIRED_HOST_CAPABILITIES).toEqual(EXPECTED_HOST_CAPABILITIES)
+
     const result = validateSpindleHostDescriptor(descriptor())
 
     expect(result).toEqual({
       descriptorVersion: 1,
       lumiverseVersion: MIN_LUMIVERSE_VERSION,
-      capabilities: REQUIRED_HOST_CAPABILITIES,
+      capabilities: EXPECTED_HOST_CAPABILITIES,
       extensionInstallationId: INSTALLATION_ID,
     })
     expect(Object.isFrozen(result)).toBe(true)
     expect(Object.isFrozen(result.capabilities)).toBe(true)
   })
 
-  test("accepts valid unknown capabilities without using them as requirements", () => {
+  test("requires every canonical capability, including connection dispatch resolution", () => {
+    for (const [name, version] of Object.entries(EXPECTED_HOST_CAPABILITIES)) {
+      const missing: Record<string, number> = { ...EXPECTED_HOST_CAPABILITIES }
+      delete missing[name]
+      expectCompatibilityError(descriptor({ capabilities: missing }), name)
+
+      expectCompatibilityError(
+        descriptor({
+          capabilities: { ...EXPECTED_HOST_CAPABILITIES, [name]: version + 1 },
+        }),
+        name,
+      )
+    }
+  })
+
+  test("accepts valid unknown capabilities without making them requirements", () => {
     const result = validateSpindleHostDescriptor(
       descriptor({
         capabilities: {
-          ...REQUIRED_HOST_CAPABILITIES,
+          ...EXPECTED_HOST_CAPABILITIES,
           "future-host-feature-v2": 3,
         },
       }),
@@ -60,35 +86,17 @@ describe("APC host compatibility scaffold", () => {
     expect(result.capabilities["future-host-feature-v2"]).toBe(3)
   })
 
-  test("rejects missing and wrong required capabilities", () => {
-    const missing: Record<string, number> = { ...REQUIRED_HOST_CAPABILITIES }
-    delete missing["preset-editor-v1"]
-    expectCompatibilityError(
-      descriptor({ capabilities: missing }),
-      "preset-editor-v1",
-    )
-    expectCompatibilityError(
-      descriptor({
-        capabilities: {
-          ...REQUIRED_HOST_CAPABILITIES,
-          "preset-editor-v1": 2,
-        },
-      }),
-      "preset-editor-v1",
-    )
-  })
-
-  test("rejects malformed capability names and values", () => {
+  test("rejects malformed capability names and versions", () => {
     for (const name of ["", "Bad-Key", "bad_key", "bad--key", "bad key"]) {
       expectCompatibilityError(
         descriptor({
-          capabilities: { ...REQUIRED_HOST_CAPABILITIES, [name]: 1 },
+          capabilities: { ...EXPECTED_HOST_CAPABILITIES, [name]: 1 },
         }),
         "Invalid Spindle host capability name",
       )
     }
 
-    for (const value of [
+    for (const version of [
       0,
       -1,
       1.5,
@@ -99,8 +107,8 @@ describe("APC host compatibility scaffold", () => {
       expectCompatibilityError(
         descriptor({
           capabilities: {
-            ...REQUIRED_HOST_CAPABILITIES,
-            "future-host-feature-v2": value,
+            ...EXPECTED_HOST_CAPABILITIES,
+            "future-host-feature-v2": version,
           },
         }),
         "Invalid Spindle host capability version",
@@ -108,14 +116,13 @@ describe("APC host compatibility scaffold", () => {
     }
   })
 
-  test("rejects malformed descriptors and too-old Lumiverse hosts", () => {
+  test("rejects malformed descriptors and hosts below the minimum version", () => {
     for (const input of [null, [], "descriptor", descriptor({ descriptorVersion: 2 })]) {
       expectCompatibilityError(input, "Spindle host descriptor")
     }
-    expectCompatibilityError(
-      descriptor({ lumiverseVersion: "1.0.7" }),
-      "too old",
-    )
+    expectCompatibilityError(descriptor({ capabilities: null }), "capabilities")
+    expectCompatibilityError(descriptor({ extensionInstallationId: undefined }), "canonical lowercase UUID")
+    expectCompatibilityError(descriptor({ lumiverseVersion: "1.0.7" }), "too old")
   })
 
   test("accepts the minimum and newer canonical Lumiverse versions", () => {
@@ -137,7 +144,7 @@ describe("APC host compatibility scaffold", () => {
     )
   })
 
-  test("rejects noncanonical semantic versions and UUIDs", () => {
+  test("rejects noncanonical semantic versions and installation UUIDs", () => {
     for (const value of ["v1.0.8", "1.0", "01.0.8", "1.0.8-alpha.01", "1.0.8+"]) {
       expectCompatibilityError(
         descriptor({ lumiverseVersion: value }),
@@ -160,7 +167,7 @@ describe("APC host compatibility scaffold", () => {
   test("copies input capabilities so later mutation cannot alter frozen requirements", () => {
     const input = descriptor({
       capabilities: {
-        ...REQUIRED_HOST_CAPABILITIES,
+        ...EXPECTED_HOST_CAPABILITIES,
         "future-host-feature-v2": 3,
       },
     })
@@ -171,7 +178,7 @@ describe("APC host compatibility scaffold", () => {
 
     expect(result.capabilities["preset-editor-v1"]).toBe(1)
     expect(result.capabilities["future-host-feature-v2"]).toBe(3)
-    expect(REQUIRED_HOST_CAPABILITIES["preset-editor-v1"]).toBe(1)
+    expect(REQUIRED_HOST_CAPABILITIES["connection-dispatch-resolution-v1"]).toBe(1)
     expect(Object.isFrozen(REQUIRED_HOST_CAPABILITIES)).toBe(true)
   })
 })

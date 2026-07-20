@@ -1,0 +1,1080 @@
+// @ts-ignore Bun provides the test module at runtime; the extension bundle excludes this file.
+import { describe, expect, test } from "bun:test"
+import { createDefaultApcConfig, type ApcPresetConfigV1 } from "../config/schema"
+import type {
+  BackendConnectionListResponse,
+  BackendHydrationResponse,
+  ConnectionSummary,
+} from "../protocol/messages"
+import type {
+  ApcDomainIntent,
+  ApcDomainResponse,
+  ApcDomainTransport,
+  ApcPresetEditorDraftAdapter,
+  ApcPresetEditorDraftState,
+} from "./persistence"
+import { createApcPersistence } from "./persistence"
+import { PROTOCOL_VERSION } from "../protocol/messages"
+import type { ApcFrontendStore } from "./state"
+import { createApcFrontendState } from "./state"
+ 
+const PRESET_A = "550e8400-e29b-41d4-a716-446655440000"
+const PRESET_B = "550e8400-e29b-41d4-a716-446655440001"
+const THREAD_ID = "550e8400-e29b-41d4-a716-446655440002"
+const SEQUENTIAL_PIPELINE_ID = "550e8400-e29b-41d4-a716-446655440003"
+const PARALLEL_PIPELINE_ID = "550e8400-e29b-41d4-a716-446655440004"
+const SEQUENTIAL_STAGE_ID = "550e8400-e29b-41d4-a716-446655440005"
+const PARALLEL_STAGE_ID = "550e8400-e29b-41d4-a716-446655440006"
+const SEQUENTIAL_RUN_ID = "550e8400-e29b-41d4-a716-446655440007"
+const PARALLEL_RUN_ID = "550e8400-e29b-41d4-a716-446655440008"
+ 
+const CONNECTION_A: ConnectionSummary = {
+  id: "550e8400-e29b-41d4-a716-446655440009",
+  name: "Primary",
+  provider: "openai",
+  model: "gpt-5",
+}
+const CONNECTION_B: ConnectionSummary = {
+  id: "550e8400-e29b-41d4-a716-446655440010",
+  name: "Secondary",
+  provider: "anthropic",
+  model: "claude",
+}
+ 
+function graphConfig(activeMode: "single" | "sequential" | "parallel" = "single"): ApcPresetConfigV1 {
+  const base = createDefaultApcConfig()
+  base.supportedModes = ["single", "sequential", "parallel"]
+  base.activeMode = activeMode
+  base.threads = [{
+    id: THREAD_ID,
+    name: "Writer",
+    description: "Writes a response.",
+    workspaceSource: "main-context",
+    blocks: [],
+    promptVariableValues: {},
+    output: { id: "final", name: "Final Response" },
+  }]
+  const pipeline = (id: string, stageId: string, runId: string) => ({
+    id,
+    stages: [{ id: stageId, name: "Draft", runs: [{ id: runId, threadId: THREAD_ID, required: true, timeoutMs: 60_000, inputs: [] }] }],
+    finalResponse: { source: "thread" as const, runId },
+  })
+  base.pipelines = {
+    sequential: pipeline(SEQUENTIAL_PIPELINE_ID, SEQUENTIAL_STAGE_ID, SEQUENTIAL_RUN_ID),
+    parallel: pipeline(PARALLEL_PIPELINE_ID, PARALLEL_STAGE_ID, PARALLEL_RUN_ID),
+  }
+  return base
+}
+ 
+class FakeEditor implements ApcPresetEditorDraftAdapter {
+  state: ApcPresetEditorDraftState = { presetId: PRESET_A, metadata: graphConfig() }
+  failFlush = false
+  failFlushCount = 0
+  flushCount = 0
+  blockFlushAt: number | null = null
+  metadataUpdates: unknown[] = []
+  #flushRelease: (() => void) | null = null
+  #listeners = new Set<(state: ApcPresetEditorDraftState) => void>()
+ 
+  getState(): ApcPresetEditorDraftState { return this.state }
+  onChange(listener: (state: ApcPresetEditorDraftState) => void): () => void {
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
+  updateMetadata(mutator: (metadata: unknown) => unknown): void {
+    this.state = { ...this.state, metadata: mutator(this.state.metadata) }
+    this.metadataUpdates.push(this.state.metadata)
+    for (const listener of this.#listeners) listener(this.state)
+  }
+  releaseFlush(): void {
+    const release = this.#flushRelease
+    this.#flushRelease = null
+    release?.()
+  }
+  async flush(): Promise<void> {
+    this.flushCount += 1
+    if (this.failFlushCount > 0) {
+      this.failFlushCount -= 1
+      throw new Error("editor flush failed")
+    }
+    if (this.failFlush) throw new Error("editor flush failed")
+    if (this.blockFlushAt === this.flushCount) {
+      await new Promise<void>((resolve) => {
+        this.#flushRelease = resolve
+      })
+    }
+  }
+  switchPreset(presetId: string | null, metadata: unknown): void {
+    this.state = { presetId, metadata }
+    for (const listener of this.#listeners) listener(this.state)
+  }
+}
+ 
+class FakeTransport implements ApcDomainTransport {
+  sent: ApcDomainIntent[] = []
+  #listeners = new Set<(message: ApcDomainResponse) => void>()
+  #sequence = 0
+  #connections: readonly ConnectionSummary[]
+  #autoRespondConnections: boolean
+  #autoRespondHydration: boolean
+
+  constructor(options: Readonly<{
+    connections?: readonly ConnectionSummary[]
+    autoRespondConnections?: boolean
+    autoRespondHydration?: boolean
+  }> = {}) {
+    this.#connections = options.connections ?? [CONNECTION_A, CONNECTION_B]
+    this.#autoRespondConnections = options.autoRespondConnections ?? true
+    this.#autoRespondHydration = options.autoRespondHydration ?? true
+  }
+  send(message: ApcDomainIntent): void {
+    this.sent.push(message)
+    if (message.type === "hydrate_preset") {
+      if (this.#autoRespondHydration) queueMicrotask(() => this.respondHydration(message.correlationId, message.payload.presetId))
+      return
+    }
+    if (message.type !== "list_connections" || !this.#autoRespondConnections) return
+    queueMicrotask(() => this.respondConnections(message.correlationId))
+  }
+
+  onMessage(listener: (message: ApcDomainResponse) => void): () => void {
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
+
+  setConnections(connections: readonly ConnectionSummary[]): void {
+    this.#connections = connections
+  }
+
+  respondConnections(correlationId: string, connections = this.#connections): void {
+    const response: BackendConnectionListResponse = {
+      version: PROTOCOL_VERSION,
+      type: "connections",
+      correlationId,
+      sequence: ++this.#sequence,
+      payload: { connections },
+    }
+    this.respond(response)
+  }
+  respondHydration(
+    correlationId: string,
+    presetId: string,
+    bindings: BackendHydrationResponse["payload"]["bindings"] = [],
+    consents: BackendHydrationResponse["payload"]["consents"] = [],
+    execution?: BackendHydrationResponse["payload"]["execution"],
+  ): void {
+    const response: BackendHydrationResponse = {
+      version: PROTOCOL_VERSION,
+      type: "hydration",
+      correlationId,
+      sequence: ++this.#sequence,
+      payload: { presetId, bindings, consents, ...(execution === undefined ? {} : { execution }) },
+    }
+    this.respond(response)
+  }
+  nextSequence(): number {
+    return ++this.#sequence
+  }
+
+
+  respond(message: ApcDomainResponse): void {
+    for (const listener of this.#listeners) listener(message)
+  }
+}
+ 
+class ErrorTransport implements ApcDomainTransport {
+  #listener: ((message: ApcDomainResponse) => void) | null = null
+  #correlationId: string | null = null
+  #sequence = 0
+
+  send(message: ApcDomainIntent): void {
+    this.#correlationId = message.correlationId
+    if (message.type === "hydrate_preset") {
+      queueMicrotask(() => this.#listener?.({
+        version: PROTOCOL_VERSION,
+        type: "hydration",
+        correlationId: message.correlationId,
+        sequence: ++this.#sequence,
+        payload: { presetId: message.payload.presetId, bindings: [], consents: [] },
+      }))
+    }
+    if (message.type === "list_connections") {
+      queueMicrotask(() => this.#listener?.({
+        version: PROTOCOL_VERSION,
+        type: "connections",
+        correlationId: message.correlationId,
+        sequence: ++this.#sequence,
+        payload: { connections: [{ id: "opaque-connection", name: "Primary", provider: "openai", model: "gpt-5" }] },
+      }))
+    }
+  }
+
+  onMessage(listener: (message: ApcDomainResponse) => void): () => void {
+    this.#listener = listener
+    return () => { this.#listener = null }
+  }
+
+  respondWithHostileMessage(): void {
+    if (this.#correlationId === null) return
+    this.#listener?.({
+      version: PROTOCOL_VERSION,
+      type: "error",
+      correlationId: this.#correlationId,
+      payload: { code: "BACKEND_ERROR", messageKey: "error.backend", retryable: false },
+    })
+  }
+}
+ 
+function storeFor(editor: FakeEditor, transport: ApcDomainTransport = new FakeTransport()): ApcFrontendStore {
+  const persistence = createApcPersistence({ editor, transport })
+  return createApcFrontendState({ persistence })
+}
+ 
+async function settleMicrotasks(): Promise<void> {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+describe("APC frontend application state", () => {
+  test("hydrates typed config and exposes mode issues and availability", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+
+    const snapshot = await store.hydrate(PRESET_A)
+
+    expect(snapshot.presetId).toBe(PRESET_A)
+    expect(snapshot.config?.activeMode).toBe("single")
+    expect(snapshot.decoded?.status).toBe("valid")
+    expect(snapshot.modeIssues.sequential).toEqual([])
+    expect(snapshot.modeAvailability.parallel.valid).toBe(true)
+    store.dispose()
+  })
+  test("hydrates an active execution into an opaque safe activity snapshot", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const pending = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const request = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(request?.type).toBe("hydrate_preset")
+    transport.respondHydration(request?.correlationId ?? "missing", PRESET_A, [], [], {
+      executionId: "execution-hydrated",
+      presetId: PRESET_A,
+      kind: "graph",
+      phase: "progress",
+      terminal: false,
+      runStatus: "running",
+      usage: { input: 4, output: 2, total: 6 },
+      stageIndex: 0,
+      stageCount: 1,
+      runIndex: 0,
+      runCount: 1,
+    })
+    const snapshot = await pending
+    expect(snapshot.execution.executionKey).toMatch(/^execution-/)
+    expect(snapshot.execution.executionKey).not.toBe("execution-hydrated")
+    expect(snapshot.execution.activity).toHaveLength(1)
+    expect(snapshot.execution.usage).toEqual({ input: 4, output: 2, total: 6 })
+    expect(snapshot.execution.activity[0]?.status).toBe("running")
+    expect(snapshot.execution.activity[0]?.phase).toBe("progress")
+    expect(snapshot.busyReason).toBe("execution")
+    expect(JSON.stringify(snapshot)).not.toContain("execution-hydrated")
+    store.dispose()
+  })
+  test("retains bounded cumulative usage across missing updates and resets for a new execution", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-usage-start",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-usage-a",
+        presetId: PRESET_A,
+        kind: "execution",
+        phase: "started",
+        terminal: false,
+        runStatus: "running",
+        usage: { input: 100, output: 40, total: 140 },
+      },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-usage-run",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-usage-a",
+        presetId: PRESET_A,
+        kind: "run-settled",
+        phase: "progress",
+        terminal: false,
+        runStatus: "completed",
+        usage: { input: 130, output: 50, total: 180 },
+      },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-usage-failed",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-usage-a",
+        presetId: PRESET_A,
+        kind: "run-settled",
+        phase: "progress",
+        terminal: false,
+        runStatus: "failed",
+      },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-usage-terminal",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-usage-a",
+        presetId: PRESET_A,
+        kind: "execution-terminal",
+        phase: "completed",
+        terminal: true,
+        outcome: "success",
+      },
+    })
+    const completed = store.getSnapshot()
+    expect(completed.execution.status).toBe("completed")
+    expect(completed.execution.usage).toEqual({ input: 130, output: 50, total: 180 })
+    expect(completed.execution.activity.map((entry) => entry.status)).toEqual(["running", "completed", "failed", "completed"])
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-usage-new",
+      sequence: transport.nextSequence(),
+      payload: {
+        executionId: "execution-usage-b",
+        presetId: PRESET_A,
+        kind: "execution",
+        phase: "started",
+        terminal: false,
+        runStatus: "running",
+      },
+    })
+    const next = store.getSnapshot()
+    expect(next.execution.executionKey).not.toBe(completed.execution.executionKey)
+    expect(next.execution.usage).toBeUndefined()
+    expect(next.execution.activity).toHaveLength(1)
+    store.dispose()
+  })
+  test("hydrates safe binding and consent views without raw metadata or revisions", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const pending = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const request = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(request?.type).toBe("hydrate_preset")
+    transport.respondHydration(request?.correlationId ?? "missing", PRESET_A, [{
+      slotId: "slot",
+      bound: true,
+      status: "bound",
+      descriptor: { label: "Primary", provider: "openai", model: "gpt-5" },
+    }, {
+      slotId: "stale-slot",
+      bound: true,
+      status: "stale",
+    }], [{
+      threadId: THREAD_ID,
+      workspaceSource: "main-context",
+      connectionSourceKey: "main",
+      status: "approved",
+      destination: { label: "Primary", provider: "openai", model: "gpt-5" },
+      disclosure: { version: 1, summary: "Thread input", categories: ["thread", "workspace", "source", "destination", "provider", "model", "main-context", "input-bindings", "prior-stage-outputs"] },
+    }])
+    const snapshot = await pending
+    expect(snapshot.connectionBindings.slot).toEqual({ slotId: "slot", bound: true, status: "bound", descriptor: { label: "Primary", provider: "openai", model: "gpt-5" } })
+    expect(snapshot.connectionBindings["stale-slot"]).toEqual({ slotId: "stale-slot", bound: true, status: "stale" })
+    expect(Object.values(snapshot.consent)[0]).toMatchObject({ threadId: THREAD_ID, status: "approved", destination: { label: "Primary" } })
+    expect(Object.prototype.hasOwnProperty.call(snapshot, "raw")).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(snapshot.decoded ?? {}, "raw")).toBe(false)
+    expect(JSON.stringify(snapshot)).not.toContain("dispatchRevision")
+    store.dispose()
+  })
+  test("restarts same-preset hydration after an external draft update", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondConnections: false, autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const firstHydration = store.hydrate(PRESET_A)
+    void firstHydration.catch(() => {})
+    await settleMicrotasks()
+    const firstRequest = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(firstRequest?.type).toBe("hydrate_preset")
+    editor.switchPreset(PRESET_A, graphConfig("parallel"))
+    await settleMicrotasks()
+    const hydrationRequests = transport.sent.filter((message) => message.type === "hydrate_preset")
+    const secondRequest = hydrationRequests.at(-1)
+    expect(hydrationRequests.length).toBe(2)
+    expect(secondRequest?.type).toBe("hydrate_preset")
+    transport.respondHydration(firstRequest?.correlationId ?? "missing", PRESET_A)
+    await expect(firstHydration).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    transport.respondHydration(secondRequest?.correlationId ?? "missing", PRESET_A)
+    await settleMicrotasks()
+    expect(store.getSnapshot().config?.activeMode).toBe("parallel")
+    expect(store.getSnapshot().hydrated).toBe(true)
+    store.dispose()
+  })
+  test("notifies subscribers when the active preset is cleared", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-clear-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-clear", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    expect(store.getSnapshot().busyReason).toBe("execution")
+    let notifications = 0
+    const unsubscribe = store.subscribe(() => { notifications += 1 })
+    editor.switchPreset(null, null)
+    expect(notifications).toBe(1)
+    expect(store.getSnapshot().presetId).toBe(null)
+    expect(store.getSnapshot().config).toBe(null)
+    expect(store.getSnapshot().busy).toBe(false)
+    expect(store.getSnapshot().busyReason).toBe(null)
+    unsubscribe()
+    store.dispose()
+  })
+  test("restarts hydration when a subscriber changes the same draft during hydration notification", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondConnections: false, autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    let changed = false
+    store.subscribe((snapshot) => {
+      if (!changed && snapshot.hydrating) {
+        changed = true
+        editor.switchPreset(PRESET_A, graphConfig("parallel"))
+      }
+    })
+    const firstHydration = store.hydrate(PRESET_A)
+    void firstHydration.catch(() => {})
+    await settleMicrotasks()
+    const hydrationRequests = transport.sent.filter((message) => message.type === "hydrate_preset")
+    expect(hydrationRequests.length).toBe(1)
+    const replacementRequest = hydrationRequests[0]
+    expect(replacementRequest?.type).toBe("hydrate_preset")
+    await expect(firstHydration).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    transport.respondHydration(replacementRequest?.correlationId ?? "missing", PRESET_A)
+    await settleMicrotasks()
+    expect(store.getSnapshot().config?.activeMode).toBe("parallel")
+    store.dispose()
+  })
+  test("rejects delayed hydration from an old preset without replacing current safe state", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondConnections: false, autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const oldHydration = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const oldRequest = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(oldRequest?.type).toBe("hydrate_preset")
+
+    editor.state = { presetId: PRESET_B, metadata: graphConfig("parallel") }
+    const currentHydration = store.hydrate(PRESET_B)
+    await settleMicrotasks()
+    const hydrationRequests = transport.sent.filter((message) => message.type === "hydrate_preset")
+    const currentRequest = hydrationRequests.at(-1)
+    expect(currentRequest?.type).toBe("hydrate_preset")
+    transport.respondHydration(currentRequest?.correlationId ?? "missing", PRESET_B)
+    await currentHydration
+    transport.respondHydration(oldRequest?.correlationId ?? "missing", PRESET_A, [{
+      slotId: "old-slot",
+      bound: true,
+      descriptor: { label: "Old", provider: "old-provider", model: "old-model" },
+    }])
+    await expect(oldHydration).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(store.getSnapshot().presetId).toBe(PRESET_B)
+    expect(store.getSnapshot().connectionBindings).toEqual({})
+    store.dispose()
+  })
+  test("rejects stale binding, consent, trace, cancellation, and activity continuations", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    await store.refreshConnections()
+    const bindingSelector = "slot"
+    const firstBind = store.bindConnection(bindingSelector, "connection-1")
+    const firstBindRequest = transport.sent.filter((message) => message.type === "bind_slot").at(-1)
+    const secondBind = store.bindConnection(bindingSelector, "connection-2")
+    const secondBindRequest = transport.sent.filter((message) => message.type === "bind_slot").at(-1)
+    expect(firstBindRequest?.type).toBe("bind_slot")
+    expect(secondBindRequest?.type).toBe("bind_slot")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "binding",
+      correlationId: secondBindRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, slotId: bindingSelector, bound: true, status: "stale" },
+    })
+    await secondBind
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "binding",
+      correlationId: firstBindRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, slotId: bindingSelector, bound: true, status: "bound", descriptor: { label: "Old", provider: "old-provider", model: "old-model" } },
+    })
+    await expect(firstBind).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(store.getSnapshot().connectionBindings.slot).toEqual({ slotId: bindingSelector, bound: true, status: "stale" })
+    const firstUnbind = store.unbindConnection(bindingSelector)
+    const firstUnbindRequest = transport.sent.filter((message) => message.type === "unbind_slot").at(-1)
+    const secondUnbind = store.unbindConnection(bindingSelector)
+    const secondUnbindRequest = transport.sent.filter((message) => message.type === "unbind_slot").at(-1)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "binding",
+      correlationId: secondUnbindRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, slotId: bindingSelector, bound: false, status: "missing" },
+    })
+    await secondUnbind
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "binding",
+      correlationId: firstUnbindRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, slotId: bindingSelector, bound: true, status: "stale" },
+    })
+    await expect(firstUnbind).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(store.getSnapshot().connectionBindings.slot).toEqual({ slotId: bindingSelector, bound: false, status: "missing" })
+
+    const selector = { presetId: PRESET_A, threadId: THREAD_ID, workspaceSource: "main-context" as const, connectionSourceKey: "main" as const }
+    const approve = store.approveConsent(selector)
+    const revoke = store.revokeConsent(selector)
+    const consentRequests = transport.sent.filter((message) => message.type === "approve_consent" || message.type === "revoke_consent")
+    const approveRequest = consentRequests.find((message) => message.type === "approve_consent")
+    const revokeRequest = consentRequests.find((message) => message.type === "revoke_consent")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "consent",
+      correlationId: revokeRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { ...selector, status: "revoked", destination: { label: "New", provider: "new-provider", model: "new-model" }, disclosure: { version: 1, summary: "Thread input", categories: ["thread", "workspace", "source", "destination", "provider", "model", "main-context", "input-bindings", "prior-stage-outputs"] } },
+    })
+    await revoke
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "consent",
+      correlationId: approveRequest?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { ...selector, status: "approved", destination: { label: "Old", provider: "old-provider", model: "old-model" }, disclosure: { version: 1, summary: "Thread input", categories: ["thread", "workspace", "source", "destination", "provider", "model", "input-bindings", "prior-stage-outputs", "main-context"] } },
+    })
+    await expect(approve).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(Object.values(store.getSnapshot().consent)[0]?.status).toBe("revoked")
+
+    const executionA = "execution-a"
+    const executionB = "execution-b"
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-a-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionA, presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    const traces = store.loadTraces({ executionKey: "execution-1" })
+    void traces.catch(() => {})
+    const traceRequest = transport.sent.filter((message) => message.type === "list_traces").at(-1)
+    if (traceRequest?.type !== "list_traces") throw new Error("list_traces request was not sent")
+    const tracePayload = traceRequest.payload
+    expect(tracePayload.presetId).toBe(PRESET_A)
+    expect(tracePayload.executionId).toBe(executionA)
+    const traceExecutionId = tracePayload.executionId
+    if (traceExecutionId === undefined) throw new Error("list_traces request omitted executionId")
+    const detail = store.loadTrace("trace-a")
+    void detail.catch(() => {})
+    const cancellation = store.cancelExecution("execution-1", "user")
+    void cancellation.catch(() => {})
+    const cancellationRequest = transport.sent.filter((message) => message.type === "cancel_execution").at(-1)
+    if (cancellationRequest?.type !== "cancel_execution") throw new Error("cancel_execution request was not sent")
+    const cancellationPayload = cancellationRequest.payload
+    expect(cancellationPayload.presetId).toBe(PRESET_A)
+    expect(cancellationPayload.executionId).toBe(executionA)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-a-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionA, presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-b-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionB, presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-a-late",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionA, presetId: PRESET_A, kind: "graph", phase: "progress", terminal: false },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: traceRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: { traces: [{ traceId: "trace-a", executionId: traceExecutionId, presetId: tracePayload.presetId, status: "completed", startedAt: 1, eventCount: 0 }] },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "cancellation",
+      correlationId: cancellationRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: { executionId: cancellationPayload.executionId, presetId: cancellationPayload.presetId, accepted: true, status: "accepted", cancellationSource: "user" },
+    })
+    await expect(traces).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    await expect(detail).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    await expect(cancellation).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect(store.getSnapshot().execution.executionKey).toBe("execution-2")
+    expect(store.getSnapshot().execution.terminal).toBe(false)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-b-terminal",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionB, presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-a-retired-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: executionA, presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    expect(store.getSnapshot().execution.executionKey).toBe("execution-2")
+    expect(store.getSnapshot().execution.terminal).toBe(true)
+    store.dispose()
+  })
+  test("preserves a descriptor when unbind returns a bound status", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    const pending = store.unbindConnection("slot")
+    const request = transport.sent.filter((message) => message.type === "unbind_slot").at(-1)
+    expect(request?.type).toBe("unbind_slot")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "binding",
+      correlationId: request?.correlationId ?? "missing",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, slotId: "slot", bound: true, status: "bound", descriptor: { label: "Retained", provider: "openai", model: "gpt-5" } },
+    })
+    await expect(pending).resolves.toEqual({ slotId: "slot", bound: true, status: "bound", descriptor: { label: "Retained", provider: "openai", model: "gpt-5" } })
+    expect(store.getSnapshot().connectionBindings.slot).toEqual({ slotId: "slot", bound: true, status: "bound", descriptor: { label: "Retained", provider: "openai", model: "gpt-5" } })
+    store.dispose()
+  })
+  test("retains execution busy state when selection changes", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-selection-start",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-selection", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    expect(store.getSnapshot().busyReason).toBe("execution")
+    const refresh = store.refreshConnections()
+    await refresh
+    expect(store.getSnapshot().busyReason).toBe("execution")
+    store.setSelection({ kind: "main" })
+    expect(store.getSnapshot().busyReason).toBe("execution")
+    expect(store.getSnapshot().busy).toBe(true)
+    store.dispose()
+  })
+ 
+  test("retains the last connection list when an explicit refresh fails", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondConnections: false })
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const discovery = transport.sent.find((message) => message.type === "list_connections")
+    expect(discovery?.type).toBe("list_connections")
+    transport.respondConnections(discovery?.correlationId ?? "missing", [CONNECTION_A])
+    await settleMicrotasks()
+    expect(store.getSnapshot().availableConnections).toEqual([{ key: "connection-1", name: CONNECTION_A.name, provider: CONNECTION_A.provider, model: CONNECTION_A.model }])
+
+    const refresh = store.refreshConnections()
+    const refreshRequest = transport.sent.filter((message) => message.type === "list_connections").at(-1)
+    expect(refreshRequest?.type).toBe("list_connections")
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "error",
+      correlationId: refreshRequest?.correlationId ?? "missing",
+      payload: { code: "CONNECTIONS_UNAVAILABLE", messageKey: "error.connectionUnavailable", retryable: true },
+    })
+
+    await expect(refresh).rejects.toMatchObject({ code: "BACKEND_ERROR" })
+    expect(store.getSnapshot().availableConnections).toEqual([{ key: "connection-1", name: CONNECTION_A.name, provider: CONNECTION_A.provider, model: CONNECTION_A.model }])
+    store.dispose()
+  })
+
+  test("isolates stale background connection responses after navigation", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondConnections: false })
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    const firstRequest = transport.sent.filter((message) => message.type === "list_connections")[0]
+    expect(firstRequest?.type).toBe("list_connections")
+
+    editor.state = { presetId: PRESET_B, metadata: graphConfig("single") }
+    await store.hydrate(PRESET_B)
+    const connectionRequests = transport.sent.filter((message) => message.type === "list_connections")
+    const secondRequest = connectionRequests.at(-1)
+    expect(secondRequest?.type).toBe("list_connections")
+
+    transport.respondConnections(secondRequest?.correlationId ?? "missing", [CONNECTION_B])
+    await settleMicrotasks()
+    expect(store.getSnapshot().availableConnections).toEqual([{ key: "connection-1", name: CONNECTION_B.name, provider: CONNECTION_B.provider, model: CONNECTION_B.model }])
+
+    transport.respondConnections(firstRequest?.correlationId ?? "missing", [CONNECTION_A])
+    await settleMicrotasks()
+    expect(store.getSnapshot().presetId).toBe(PRESET_B)
+    expect(store.getSnapshot().availableConnections).toEqual([{ key: "connection-1", name: CONNECTION_B.name, provider: CONNECTION_B.provider, model: CONNECTION_B.model }])
+    store.dispose()
+  })
+
+  test("switches Single, Sequential, and Parallel through persisted draft state", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+
+    expect(await store.setActiveMode("sequential")).toBe(true)
+    expect(store.getSnapshot().activeMode).toBe("sequential")
+    expect(await store.setActiveMode("parallel")).toBe(true)
+    expect(store.getSnapshot().activeMode).toBe("parallel")
+    expect(await store.setActiveMode("single")).toBe(true)
+    expect(store.getSnapshot().activeMode).toBe("single")
+    store.dispose()
+  })
+
+  test("coalesces dirty updates behind one flush and keeps a navigation barrier", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    store.updateConfig((config) => ({ ...config, activeMode: "sequential" }))
+    store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))
+    expect(store.getSnapshot().dirty).toBe(true)
+    await store.flush()
+    editor.state = { presetId: PRESET_B, metadata: graphConfig("single") }
+
+    await store.hydrate(PRESET_B)
+
+    expect(store.getSnapshot().presetId).toBe(PRESET_B)
+    expect(store.getSnapshot().dirty).toBe(false)
+    expect(store.getSnapshot().connectionBindings).toEqual({})
+    expect(store.getSnapshot().consent).toEqual({})
+    expect(store.getSnapshot().traces.summaries).toEqual([])
+    store.dispose()
+  })
+  test("does not mutate local config when staging rejects an inactive editor preset", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    const before = store.getSnapshot()
+    editor.state = { presetId: PRESET_B, metadata: graphConfig("single") }
+    expect(() => store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))).toThrow()
+    const after = store.getSnapshot()
+    expect(after.config).toEqual(before.config)
+    expect(after.revision).toBe(before.revision)
+    expect(after.dirty).toBe(before.dirty)
+    store.dispose()
+  })
+
+  test("failed mode flush restores the persisted mode and exposes reload state", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    editor.failFlushCount = 1
+    editor.blockFlushAt = 2
+
+    let settled = false
+    const transition = store.setActiveMode("parallel").then((result) => {
+      settled = true
+      return result
+    })
+    await settleMicrotasks()
+    await settleMicrotasks()
+    expect(settled).toBe(false)
+    expect(editor.flushCount).toBe(2)
+    editor.releaseFlush()
+    expect(await transition).toBe(false)
+    expect(store.getSnapshot().activeMode).toBe("single")
+    expect(editor.state.metadata).toEqual(graphConfig("single"))
+    expect(editor.metadataUpdates.some((metadata) => JSON.stringify(metadata) === JSON.stringify(graphConfig("single")))).toBe(true)
+    expect(editor.flushCount).toBeGreaterThan(1)
+    expect(store.getSnapshot().saveError).not.toBeNull()
+    expect(store.getSnapshot().dirty).toBe(false)
+    store.dispose()
+  })
+
+  test("restages the persisted draft when flushing an already-selected mode fails", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    store.updateConfig((config) => ({ ...config, activeMode: "parallel" }))
+    editor.failFlushCount = 1
+
+    expect(await store.setActiveMode("parallel")).toBe(false)
+    expect(editor.state.metadata).toEqual(graphConfig("single"))
+    expect(editor.metadataUpdates.some((metadata) => JSON.stringify(metadata) === JSON.stringify(graphConfig("single")))).toBe(true)
+    expect(editor.flushCount).toBeGreaterThan(1)
+    expect(store.getSnapshot().activeMode).toBe("single")
+    expect(store.getSnapshot().dirty).toBe(false)
+    store.dispose()
+  })
+
+  test("keeps validation and save surfaces locale-neutral", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    editor.failFlush = true
+
+    expect(await store.setActiveMode("parallel")).toBe(false)
+    const failed = store.getSnapshot()
+    expect(failed.saveError?.message).toEqual({ key: "error.persistConfigFallback" })
+    expect(failed.dirty).toBe(true)
+    expect(JSON.stringify(failed.saveError)).not.toContain("editor flush failed")
+    expect(Object.isFrozen(failed.saveError?.message)).toBe(true)
+    store.dispose()
+
+    const invalidEditor = new FakeEditor()
+    invalidEditor.state = { presetId: PRESET_A, metadata: { schemaVersion: 1, supportedModes: ["single"], activeMode: "single" } }
+    const invalidStore = storeFor(invalidEditor)
+    const invalid = await invalidStore.hydrate(PRESET_A)
+    expect(invalid.decoded?.issues.some((issue) => Object.prototype.hasOwnProperty.call(issue, "message"))).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(invalid.modeIssues.single[0] ?? {}, "message")).toBe(false)
+    expect(invalid.blockedReasons.every((reason) => typeof reason.key === "string")).toBe(true)
+    expect(JSON.stringify(invalid)).not.toContain("Expected a plain")
+    invalidStore.dispose()
+  })
+
+  test("keeps invalid hydrated config repairable while mode activation stays fail-closed", async () => {
+    const editor = new FakeEditor()
+    editor.state = { presetId: PRESET_A, metadata: { schemaVersion: 1, supportedModes: ["single"], activeMode: "single" } }
+    const store = storeFor(editor)
+    const invalid = await store.hydrate(PRESET_A)
+
+    expect(invalid.decoded?.status).toBe("invalid")
+    expect(invalid.decoded?.config).toBe(null)
+    expect(invalid.config).toEqual(createDefaultApcConfig())
+    expect(invalid.blockedReasons).toEqual([])
+    expect(invalid.modeAvailability.single.valid).toBe(false)
+    expect(await store.setActiveMode("parallel")).toBe(false)
+
+    const repaired = store.updateConfig(() => graphConfig("single"))
+    expect(repaired.decoded?.status).toBe("valid")
+    expect(repaired.dirty).toBe(true)
+    expect(repaired.blockedReasons).toEqual([])
+    await store.flush()
+    expect(store.getSnapshot().dirty).toBe(false)
+    expect(store.getSnapshot().decoded?.status).toBe("valid")
+    store.dispose()
+  })
+
+  test("switches away from an invalid active mode without locking local run repair", async () => {
+    const editor = new FakeEditor()
+    const invalidActive = graphConfig("parallel")
+    invalidActive.pipelines.parallel!.stages[0]!.runs[0]!.required = false
+    editor.state = { presetId: PRESET_A, metadata: invalidActive }
+    const store = storeFor(editor)
+    const snapshot = await store.hydrate(PRESET_A)
+
+    expect(snapshot.decoded?.status).toBe("valid")
+    expect(snapshot.activeMode).toBe("parallel")
+    expect(snapshot.modeAvailability.parallel.valid).toBe(false)
+    expect(snapshot.modeIssues.parallel.length).toBeGreaterThan(0)
+    expect(snapshot.blockedReasons).toEqual([])
+    expect(await store.setActiveMode("parallel")).toBe(false)
+    expect(await store.setActiveMode("single")).toBe(true)
+    expect(store.getSnapshot().activeMode).toBe("single")
+    store.dispose()
+  })
+
+  test("hard-locks a dirty view after an external same-preset draft change until hydration", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    store.updateConfig((config) => ({ ...config, activeMode: "sequential" }))
+    expect(store.getSnapshot().dirty).toBe(true)
+
+    editor.switchPreset(PRESET_A, graphConfig("parallel"))
+
+    expect(store.getSnapshot().stale).toBe(true)
+    expect(store.getSnapshot().config?.activeMode).toBe("sequential")
+    expect(store.getSnapshot().blockedReasons).toEqual([{ key: "error.staleConfigReload" }])
+    expect(() => store.updateConfig((config) => ({ ...config, activeMode: "single" }))).toThrow()
+    expect(await store.setActiveMode("single")).toBe(false)
+    await expect(store.flush()).rejects.toMatchObject({ code: "STALE_OPERATION" })
+    expect((editor.state.metadata as ApcPresetConfigV1).activeMode).toBe("parallel")
+
+    const reloaded = await store.hydrate(PRESET_A)
+    expect(reloaded.stale).toBe(false)
+    expect(reloaded.activeMode).toBe("parallel")
+    store.dispose()
+  })
+
+  test("keeps duplicate trace IDs distinct by opaque composite trace key", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const pending = store.loadTraces()
+    const listRequest = transport.sent.filter((message) => message.type === "list_traces").at(-1)
+    if (listRequest?.type !== "list_traces") throw new Error("list_traces request was not sent")
+    expect(Object.prototype.hasOwnProperty.call(listRequest.payload, "executionId")).toBe(false)
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "trace",
+      correlationId: listRequest.correlationId,
+      sequence: transport.nextSequence(),
+      payload: {
+        traces: [
+          { traceId: "trace-shared", executionId: "execution-a", presetId: PRESET_A, status: "completed", startedAt: 1, eventCount: 0 },
+          { traceId: "trace-shared", executionId: "execution-b", presetId: PRESET_A, status: "completed", startedAt: 2, eventCount: 0 },
+        ],
+      },
+    })
+    const traces = await pending
+    const [first, second] = traces.summaries
+    if (first === undefined || second === undefined) throw new Error("trace summaries were not returned")
+    expect(first.key).not.toBe(second.key)
+    expect(JSON.stringify(traces)).not.toContain("trace-shared")
+
+    for (const [key, executionId, startedAt] of [[first.key, "execution-a", 1], [second.key, "execution-b", 2]] as const) {
+      const detail = store.loadTrace(key)
+      const request = transport.sent.filter((message) => message.type === "get_trace").at(-1)
+      if (request?.type !== "get_trace") throw new Error("get_trace request was not sent")
+      expect(request.payload.executionId).toBe(executionId)
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "trace",
+        correlationId: request.correlationId,
+        sequence: transport.nextSequence(),
+        payload: {
+          trace: {
+            traceId: "trace-shared",
+            executionId,
+            presetId: PRESET_A,
+            status: "completed",
+            startedAt,
+            eventCount: 0,
+            events: [],
+          },
+        },
+      })
+      await detail
+    }
+    expect(Object.keys(store.getSnapshot().traces.details).sort()).toEqual([first.key, second.key].sort())
+    expect(JSON.stringify(store.getSnapshot().traces)).not.toContain("trace-shared")
+    store.dispose()
+  })
+
+  test("retains bounded immutable safe execution activity history per execution", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-history-start-a",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-history-a", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-history-progress-a",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-history-a", presetId: PRESET_A, kind: "graph", phase: "progress", terminal: false, stageIndex: 0, stageCount: 1, runIndex: 0, runCount: 1 },
+    })
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-history-terminal-a",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-history-a", presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    expect(store.getSnapshot().execution.activity.map((entry) => entry.phase)).toEqual(["started", "progress", "completed"])
+    expect(store.getSnapshot().execution.activity.map((entry) => entry.status)).toEqual(["running", "running", "completed"])
+
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-history-start-b",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-history-b", presetId: PRESET_A, kind: "graph", phase: "started", terminal: false },
+    })
+    for (let index = 0; index < 40; index += 1) {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId: `activity-history-progress-b-${index}`,
+        sequence: transport.nextSequence(),
+        payload: { executionId: "execution-history-b", presetId: PRESET_A, kind: "graph", phase: "progress", terminal: false, runIndex: 0, runCount: 1 },
+      })
+    }
+    transport.respond({
+      version: PROTOCOL_VERSION,
+      type: "activity",
+      correlationId: "activity-history-terminal-b",
+      sequence: transport.nextSequence(),
+      payload: { executionId: "execution-history-b", presetId: PRESET_A, kind: "graph", phase: "completed", terminal: true, outcome: "success" },
+    })
+    const activity = store.getSnapshot().execution.activity
+    expect(activity).toHaveLength(32)
+    expect(activity[0]?.phase).toBe("progress")
+    expect(activity.at(-1)?.phase).toBe("completed")
+    expect(activity.some((entry) => entry.phase === "started")).toBe(false)
+    expect(Object.isFrozen(activity)).toBe(true)
+    expect(Object.isFrozen(activity[0])).toBe(true)
+    expect(JSON.stringify(activity)).not.toContain("execution-history-b")
+    store.dispose()
+  })
+
+  test("does not copy hostile backend diagnostics into the state snapshot", async () => {
+    const editor = new FakeEditor()
+    const transport = new ErrorTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    await store.refreshConnections()
+    const pending = store.bindConnection("slot", "connection-1")
+    transport.respondWithHostileMessage()
+    await expect(pending).rejects.toMatchObject({ code: "BACKEND_ERROR", message: "APC backend request failed (BACKEND_ERROR)" })
+    expect(JSON.stringify(store.getSnapshot())).not.toContain("HOSTILE BACKEND MESSAGE")
+    store.dispose()
+  })
+
+  test("dispose removes subscriptions and rejects later mutations", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    await store.hydrate(PRESET_A)
+    store.dispose()
+
+    expect(() => store.setSelection({ kind: "main" })).toThrow("disposed")
+    await expect(store.flush()).rejects.toThrow("disposed")
+  })
+})

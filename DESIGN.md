@@ -1,567 +1,364 @@
 # Agentic Preset Composer (APC) — Canonical Design
 
-> **Gate 0 decision recorded; local consolidated D–F implementation/evidence and one host PR are authorized.** This is
-> the canonical APC contract, not permission to make APC runtime behavior, publish
-> a type package, or make a remote/release externally available. PR 0 and host
-> Gates A/B are historical records; current staging retains only the surviving
-> controlled Loom foundation relevant to Gate C. The broader historical Gate C
-> hardening is not current staging capability.
-> Gates D–F are internal, separately testable slices of one APC-only host PR;
-> they must remain strictly ordered D→E→F and retain their full scope. Existing
-> aggregate types PR #32 is the corrected cumulative D–F contract targeted at
-> exactly `0.6.6`; upstream `lumiverse-spindle-types@0.6.5` is published, but it
-> is not this corrected contract. The `0.6.6` draft removes the invented global
-> API-version axis. Compatibility instead uses the minimum Lumiverse application
-> version (`1.0.8`), descriptor schema (`descriptorVersion: 1`), and named
-> capability versions; the descriptor fields are exactly `descriptorVersion`,
-> `lumiverseVersion`, `capabilities`, and `extensionInstallationId`. The
-> corrected `0.6.6` remains unpublished. Its upstream author owns merge and
-> package publication, not this extension. The host candidate may exact-pin it
-> only after upstream merges PR #32 and the author publishes `0.6.6`; no host
-> draft PR exists or may open before that dependency and final evidence/red-team
-> review.
->
-> The earlier blanket publication hold is superseded for this authorized local
-> path; it is not an active hold on local implementation/evidence. The upstream
-> publication dependency remains, and host/APC package pins, clean frozen
-> installation, and external publication remain blocked until `0.6.6` is merged
-> and published.
-> APC compatibility source/manifest alignment targets Lumiverse `1.0.8`; the
-> capability validator rejects any host lacking the six required named capability
-> versions. Both inert entrypoints validate this descriptor synchronously before
-> any extension work.
->
-> **Current basis.** Public `origin/staging` authority is
-> `cef256f340220a41b948553120f1833f009752a9`. It includes upstream
-> `lumiverse-spindle-types@0.6.5`, the generic Spindle foundations, and the
-> controlled Loom editor/frontend surface, but not the local D–F contracts.
-> The rebased consolidated candidate `c53ee50db5366ffc5a0d65be7b92fe89b38b9e5d`
-> remains local evidence, not current staging behavior or an open host PR.
->
-> This document is the canonical APC product and security contract.
-> `AUTHOR_BRIEF.md` is the authoritative consolidated host-PR review and release
-> protocol; `README.md` records the scaffold status. Neither may weaken this
-> contract, and this contract may not weaken the release protocol.
+> APC is the implemented Gate G Spindle extension for Lumiverse. This document
+> is the product, authority, privacy, failure, and security contract for the
+> checked-in source. `package.json` and `bun.lock` pin
+> `lumiverse-spindle-types` to exact `0.6.6`.
+
+APC is an opt-in extension. It activates only for a valid non-Single graph and
+an explicitly selected non-Single mode. A legacy preset or a preset without an
+APC bag normalizes to `supportedModes: ['single']` and
+`activeMode: 'single'`; its native generation path is unchanged.
 
 ## Product model
 
-APC is an opt-in Spindle extension that lets a user run a preset as a
-**distributed agent graph** rather than one monolithic prompt. A preset declares
-one of three execution modes. For non-Single modes, APC's registered
-post-assembly interceptor orchestrates role-specialized sub-generations,
-composes their outputs, and routes a final result before the user-facing turn
-settles. It generalizes Council: Council is one fixed multi-member pattern;
-APC is a user-configurable, bounded agent graph.
+APC lets a user run a preset as a bounded distributed agent graph rather than
+one monolithic prompt. A graph uses reusable thread workspaces, ordered stages,
+typed `final` outputs, explicit input bindings, and one final route. APC
+generalizes Council: Council is a fixed multi-member pattern, while APC is a
+user-configurable graph with explicit limits and failure policies.
 
-APC is opt-in and non-breaking. A preset is APC-enabled only when it contains a
-valid non-Single graph and the user selects a supported non-Single mode. Legacy
-presets and presets without an APC bag normalize to
-`supportedModes: ['single']` and `activeMode: 'single'`; their generation path
-is unchanged.
+APC executes from the post-assembly interception point. It does not duplicate
+native prompt assembly, put additional-thread blocks in Main's flat
+`prompt_order`, or bypass the native generation lifecycle. Sidecar provider and
+tool work that occurs before APC interception remains outside APC's rollback
+boundary.
 
-APC executes only from the post-assembly interception point. It does not
-duplicate native prompt assembly, put additional-thread blocks in the flat Main
-Thread `prompt_order`, or bypass the native generation lifecycle.
+## Host contract and registration
 
-## Current upstream foundations
+The immutable host descriptor contains exactly:
+`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
+`extensionInstallationId`. APC requires descriptor schema version `1`, Lumiverse
+`1.0.8` or newer, and these seven host capabilities at version `1`:
 
-Current staging provides valuable generic Spindle foundations. APC must reuse
-them rather than recreate parallel generic surfaces:
+- `preset-extension-data-v1`
+- `preset-editor-v1`
+- `loom-block-editor-v1`
+- `generation-assembly-v1`
+- `interceptor-context-v1`
+- `interceptor-final-response-v1`
+- `connection-dispatch-resolution-v1`
 
-1. **Top-level metadata passthrough.**
-   `LoomPreset.passthroughMetadata` preserves metadata entries that are neither
-   Loom-owned nor `_lumiverse_*`; the upstream regression includes the top-level
-   APC shape. This is the persistence foundation for APC's portable bag.
-2. **Native preset-editor tab and draft helper.**
-   `ctx.ui.registerPresetEditorTab` and
-   `ctx.ui.presetEditor.{getState,onChange,updatePreset,flush}` provide a
-   generic tab root and draft lifecycle. APC later registers and renders its
-   Agent Graph view through that root.
-3. **Native arbitrary-block assembly.**
-   `spindle.assemble({ blocks, chatId, connectionId?, personaId?,
-   generationType?, promptVariables?, signal? })` creates a transient Loom
-   preset, performs native assembly, returns messages and Breakdown, invokes no
-   LLM, does not recurse through the ordinary context/message-interceptor
-   pipeline, and uses `macroCommit: false`.
-4. **Nonrecursive quiet generation.**
-   `spindle.generate.quiet` accepts prebuilt messages, optional connection,
-   reasoning/parameters/tools, and a caller-owned signal. It is the direct
-   provider foundation for APC subcalls.
-5. **A 300-second interceptor ceiling.** Per-invocation interceptor time is
-   clamped to 1–300 seconds, sufficient for APC's graph wall-clock budget.
-6. **Richer pre-assembly generation context.**
-   `spindle.contracts.preAssemblyGenerationContext = 1` supplies `userId` and
-   `dryRun`; `cancelGeneration: true` stops before prompt assembly and Main
-   dispatch.
-7. **Post-assembly mutation.** Interceptors can replace messages, return
-   permitted parameters, and contribute Breakdown attribution.
+Both entrypoints validate this descriptor synchronously before extension
+registration, UI mounting, storage, network, generation, or interceptor work.
+An incompatible descriptor fails closed.
 
-These are foundations, not reduced substitutes for the canonical contract.
-`spindle.assemble` is not parent-bound APC assembly; quiet generation is not
-revision-bound tracked dispatch; the context contract is not callback-bound
-nested cancellation; and ordinary post-assembly mutation is not authenticated
-terminal placement. The remaining three gates add only the complementary host
-behavior that those foundations do not provide.
+The manifest permissions are `interceptor`, `generation`, `presets`, and
+`final_response`. Backend execution requires the first two. Loss of required
+`interceptor` or `generation` permission revokes the registration and disarms
+active APC work. Thread-final response routing additionally requires
+`final_response`; if it is absent or revoked, APC disables only that route and
+preserves the safe native Main fallback with a bounded reason/activity.
 
-## Core/extension presentation boundary
+### Backend startup
 
-Across every gate, absent an APC extension registration or use of a new generic
-mount/API, steady-state baseline Lumiverse controls, layout, DOM, and baseline
-strings remain unchanged apart from generic conditional diagnostics. Any new host
-diagnostic string is added to all six Lumiverse core locales.
-Core exposes generic, inert placement, lifecycle, bridge, compatibility, locale,
-and finalization roots only; it never adds APC-specific visuals, literals, or
-catalogs. The APC frontend later registers the toolbar item and Agent Graph tab
-through the generic host roots, then renders the **Single | Sequential |
-Parallel** radiogroup, Agent Graph content, labels, disabled reasons, and
-accessibility behavior there. No APC-specific locale catalog belongs in core.
+The backend validates `spindle.host`, initializes user-scoped atomic storage,
+connection bindings, consent, traces, admission, and the endpoint router, then
+subscribes to frontend messages, permission changes, and extension lifecycle
+events. When `interceptor` and `generation` are granted it owns one
+host-registered interceptor for the APC runtime. The registration match is
+limited to non-dry-run `normal` and `continue` generations whose authenticated
+APC mode is `sequential` or `parallel`; the wrapper revalidates the context and
+returns native messages on an ineligible or failed callback.
 
-## Execution modes
+Registration is replaced in place rather than duplicated across users or
+presets. Loss of required permission revokes the registration and aborts active
+graphs; loss of `final_response` only aborts Thread-final executions and
+updates route availability. Disable, update, unload, and explicit teardown
+dispose the router, listeners, registrations, active executions, and trace
+finalization exactly once.
 
-The APC frontend registers a mode-toolbar item through the generic host toolbar
-root and renders **Single | Sequential | Parallel** above LoomBuilder's list/edit
-branch as an accessible radiogroup. A preset declares unique `supportedModes`;
-`single` is mandatory.
+### Frontend startup
 
-- **Single** — today's behavior. APC is bypassed; native assembly and provider
-  dispatch proceed unchanged. Selecting Single asks the generic host API to
-  activate the built-in preset editor (`blocks` API ID; current visible label **Preset**).
-- **Sequential** — runs one thread per ordered stage. Every call uses the
-  authoritative Main connection. Each stage feeds the next in configured order.
-- **Parallel** — runs ordered stages whose distinct threads may overlap within a
-  stage. A thread may resolve a locally bound connection slot or inherit Main.
-  The hard width is four concurrent runs per stage; APC drains with
-  `allSettled`, and output order remains configured order rather than completion
-  order.
+The frontend validates the host descriptor and required UI, permission, locale,
+message, draft, and controlled Loom-editor APIs before mounting. It registers
+one APC mode-toolbar contribution and one **Agent Graph** preset-editor tab
+through host-owned roots, then mounts APC-owned graph, thread, inspector,
+consent, activity, and accessibility surfaces. The host's built-in `blocks` tab
+remains the Single surface.
 
-APC keeps all three choices visible. Unsupported, invalid, unresolved, or
-permission-blocked choices are disabled by the APC frontend with APC-rendered
-reasons. A valid non-Single selection asks the generic host tab root to mount
-APC's registered **Agent Graph** view, whose content and accessibility behavior
-remain APC-owned. Mode activation is a namespace-scoped draft update followed by
-the shared save coordinator's generation flush; a failed flush restores the last
-persisted mode and announces the failure without touching either pipeline.
+APC writes only its namespace through the preset-editor draft helper. The host
+save coordinator supplies the generation-flush barrier. Locale changes update
+APC's own catalogs for `en`, `zh`, `zh-TW`, `ja`, `fr`, and `it`. Loss of
+required permission disarms APC subscriptions, DOM contributions, state,
+pending requests, and view work; loss of `final_response` updates only
+Thread-final availability and active final-route work. Disable, update, unload,
+and teardown dispose the remaining APC lifecycle without touching host-owned
+siblings.
 
-## Portable graph data
+## Execution modes and creation
 
-The portable graph lives at the single top-level key
-`metadata.agentic_preset_composer`. `LoomPreset.passthroughMetadata` carries
-that opaque, versioned bag alongside every unrelated passthrough sibling; APC
-alone decodes and validates its contents under a two-phase rule:
+The toolbar always presents **Single | Sequential | Parallel**. Unsupported,
+invalid, unresolved, or permission-blocked choices remain visible and disabled
+with an APC-owned reason.
 
-1. validate the envelope, global caps, and shared records; then
-2. validate path-local objects and references.
+- **Single** activates the host's built-in preset editor through the `blocks`
+  API ID. APC does not alter native assembly or provider dispatch.
+- **Sequential** contains exactly one run per ordered stage. Every call uses
+  authoritative Main dispatch and each stage feeds the next in configured
+  order. The Sequential UI exposes no connection-slot picker and runtime
+  ignores stored per-thread slot metadata in this mode; switching back to
+  Parallel preserves those bindings.
+- **Parallel** contains one to four distinct runs per stage. Runs may overlap
+  inside a stage, the scheduler drains with `allSettled`, and result order stays
+  in configured order. A thread may inherit Main or resolve an explicit
+  connection slot.
 
-Connection UUIDs never enter portable metadata. There is one APC wire shape and
-one source of truth. The persisted-data audit found no installed APC extension
-and no local preset rows using any earlier APC layout, so the clean cutover needs
-neither speculative dual reads nor a compatibility write path. If real
-previously persisted data is later identified, migration is reassessed before it
-is deployed.
+An empty graph has two explicit creation actions: **Create Sequential graph**
+and **Create Parallel graph**. Each action creates one default reusable thread,
+one stage, and one run for its selected mode, selects that mode, and emits a
+namespace-scoped dirty draft. It does not create sample data, bind a
+connection, or grant consent. A later mode switch preserves both pipeline
+definitions rather than deleting the unselected mode.
 
-Loom-native persistence paths must preserve the bag and every unrelated
-passthrough sibling. Legacy SillyTavern conversion intentionally does not
-preserve arbitrary passthrough metadata.
+The portable graph is bounded by 16 threads, 32 stages, 64 runs, four parallel
+runs per stage, one sequential run per stage, and a 240-second run timeout.
+References target earlier stages only. Cycles, same-stage references,
+unreachable runs, invalid required/failure-policy closure, and an invalid
+final route make the affected non-Single mode unavailable.
 
-## Threads, outputs, and pipelines
+## Portable graph data and persistence
 
-- **Main Thread** — fixed and always present; it owns the live top-level Loom
-  blocks and variables.
-- **Threads** — each added thread is one invocation-local workspace.
-  `native-blocks` uses shared Loom editing and native assembly;
-  `main-context` clones assembled Main messages. A repeated thread reuses one
-  workspace across later stages and cannot run twice in one stage.
-- **Outputs** — every thread exposes one `final` output. Synthesis or voting is
-  an ordinary downstream thread, never an implicit operation.
-- **Pipelines** — Sequential has exactly one run per stage. Parallel has one to
-  four runs per stage with distinct threads. References target earlier stages
-  only. The final route is either **Main** or one designated **thread** run.
+The portable graph has one top-level key:
+`metadata.agentic_preset_composer`. Host passthrough carries this opaque,
+versioned bag with every unrelated passthrough sibling. APC alone decodes and
+validates it in two phases: envelope/global caps/shared records first, then
+path-local objects and references.
 
-For a Main final route, resolved outputs are composed into Main guidance. The
-host places that guidance immediately before the exact authenticated assistant
-prefill carrier at the terminal dispatch boundary, not merely at an earlier
-interceptor pass. For a thread final route, the designated run supplies the
-user-facing assistant response through the privileged host finalization path.
-Both routes are canonical; a missing privileged capability or permission makes
-the thread-final choice unavailable with an explicit reason rather than silently
-redefining the graph.
+Connection UUIDs, dispatch revisions, receipts, nonces, user IDs, credentials,
+and other private authority data never enter portable metadata or user-facing
+copy. There is no second APC metadata key, compatibility write path, or
+speculative dual-read path.
 
-V1 actions are closed: execute a thread run, bind literals or prior-thread
-outputs, and route one final. There are no arbitrary scripts, branches, loops,
-parsers, or implicit votes. Missing-output bindings resolve before
+Native Loom persistence preserves the APC bag and unrelated passthrough
+siblings. Legacy SillyTavern conversion intentionally does not preserve
+arbitrary passthrough metadata.
+
+Mode changes and graph edits update only the APC namespace. The shared save
+coordinator flushes the draft before generation. A failed ordinary graph save
+keeps the draft visibly dirty with its failure so it can be corrected and
+resaved. A failed mode transition restores the last persisted active mode and
+leaves both native and APC pipelines untouched.
+The backend is the sole writer of local binding, consent, execution, and trace
+state.
+
+## Threads, runs, and pipelines
+
+- **Main Thread** is fixed and always present. It owns live top-level Loom
+  blocks, variables, authoritative Main dispatch, and the normal user-facing
+  generation path.
+- **Thread** is a reusable invocation-local workspace. `native-blocks` uses
+  controlled Loom editing and native assembly; `main-context` clones the
+  immutable assembled Main messages. A repeated thread reuses one workspace
+  across later stages and cannot run twice in one stage.
+- **Run** is one scheduled use of a thread in one stage. It has requiredness,
+  timeout, ordered input bindings, and one `final` output.
+- **Output** is a run's single `final` value. Synthesis and voting are ordinary
+  downstream runs, never implicit operations.
+- **Final route** is Main or one designated thread run. Both are first-class
+  routes when the required host capability and permission are available.
+
+V1 actions are closed: execute a run, bind literals or earlier-thread outputs,
+and choose one final route. There are no arbitrary scripts, branches, loops,
+parsers, transforms, or implicit votes. Missing-output bindings resolve before
 workspace/deadline: `fail-graph` wins, then `skip-run`, then omit the binding
-and append survivors. Each survivor becomes its own configured-role message with
-a display-delimiter wrapper. The wrapper is not a security boundary: output is
-untrusted model-authored text and is never parsed or treated as provenance.
+and append survivors. Each survivor becomes its own configured-role message
+with a display-delimiter wrapper. The wrapper is not a security boundary:
+model-authored output is untrusted text and is never parsed as provenance.
 
-## Privacy, dispatch, and connection invariants
+## Dispatch, revisions, and connection privacy
 
-Every generation call carries a required discriminated dispatch source:
+Every auxiliary generation call carries a required discriminated dispatch source:
 
 - `main` contains no connection ID and binds only to the active callback's
-  `MainDispatchSnapshot`;
-- `slot` contains the explicit connection ID.
+  immutable `MainDispatchSnapshot`;
+- `slot` contains the explicit connection ID resolved by the authenticated host.
 
-Both carry the exact expected `connectionDispatchRevision`. Equal IDs or
-revisions never alias sources; resolved assembly, trusted receipts, consent, and
-traces all echo the source.
+Both sources carry the exact expected `connectionDispatchRevision`. Equal IDs
+or revisions never alias sources; resolved assembly, trusted receipts, and
+consent enforce the source provenance. Bounded traces expose only run, status,
+and timestamp metadata; they do not echo connection or revision provenance.
 
-Privacy requires an opaque effective dispatch revision:
-`base64url(SHA-256(...))` over every mutable database input to the call:
-connection base token, dispatch-affecting columns, the distinct
-missing/present encrypted-secret tuple, preset parameters, and reasoning
-settings. The Gate D assembly and tracked-dispatch paths check it atomically.
+The effective dispatch revision is an opaque value supplied by the
+authenticated host. APC binds the value to the resolved connection descriptor
+and validates exact equality at assembly, tracked dispatch, receipt, consent,
+and settlement boundaries. APC does not derive, fingerprint, or reconstruct
+that revision from database inputs.
 List-then-call fingerprints and roulette parents cannot authorize a destination:
-every run requires a concrete, nonnull dispatch revision or fails before assembly
-or provider work.
+every run requires a concrete non-null host-provided dispatch revision or fails
+before assembly or provider work.
 
 Runtime derives a closed source key from portable metadata: reserved `main` for
-inherited Main, or `slot:<canonical UUID>` for an explicit slot. Per-user state
-binds only `(presetId, slotId)` slots. Consent keys are
-`(installId, nonce, presetId, threadId, workspaceSource, connectionSourceKey,
-connectionId, dispatchRevision, DISCLOSURE_VERSION)`. `main` resolves only
-authoritative Main, never a slot binding or hint.
+inherited Main or a canonical slot key for an explicit binding. Per-user state
+binds only `(presetId, slotId)`. Consent is bound to installation, nonce,
+preset, thread, workspace source, connection source key, resolved connection,
+dispatch revision, and disclosure version.
 
-Explicit slots are bound and consented through backend `resolveDispatch`;
-frontend payloads never assert a revision. Inherited Main is runtime-dynamic:
-when its exact descriptor lacks consent, APC makes zero subcalls, emits one
-bounded `consent_required` trace, and Graph-fallbacks to Main.
+Explicit slots are bound and consented through backend resolution. Frontend
+payloads never assert a revision. Inherited Main is runtime-dynamic: when its
+exact descriptor lacks consent, APC makes zero assembly/provider subcalls.
+A required run then drives the required-failure Graph-fallback outcome; an
+optional run follows its configured optional-local policy. APC emits one bounded
+`consent_required` trace event per denied run/approval attempt.
 
-The backend is the sole local-state writer. Binding and consent intents serialize
-under `(authoritativeCallbackUserId, presetId)` queues, read-latest/derive/
-temp-and-move, and a volatile monotonic `mutationEpoch` aborts only matching
-executions. The frontend sends neither a user ID nor whole documents.
-## Invocation, cancellation, and non-commit invariants
+Binding and consent intents serialize under the authoritative callback user and
+preset. The backend reads the latest state, derives the next record, writes via
+temporary-file-and-move, and advances a volatile monotonic `mutationEpoch`.
+Only executions matching the current epoch may commit.
 
-An interceptor request crosses `postMessage`; cancellation is therefore an
-explicit **`intercept_abort` protocol**, never a serialized host
-`AbortSignal`. Gate E binds each authoritative callback to a host-created
-invocation identity and worker-local signal. Each run composes
-`AbortSignal.any([interceptorSignal, graphSignal, runDeadline])` for cloning,
-assembly, and tracked quiet dispatch.
+## Assembly, tracked dispatch, and authority
+
+APC reuses the host's authenticated generation surfaces:
+
+1. `spindle.generate.assemble` receives controlled native-blocks, a dispatch
+   source and revision, a deadline, and a worker-local signal. It returns
+   assembled messages, Breakdown attribution, and resolved source provenance.
+2. APC appends validated input bindings and calls
+   `spindle.generate.quietTracked` with the same source/revision, deadline,
+   cancellation signal, and any authorized parent-prefill continuation.
+3. APC accepts only a structurally valid tracked result whose receipt preserves
+   source, destination, and dispatch revision. A stale, malformed, or
+   mismatched result is rejected before run commit.
+
+Provider routing, credentials, endpoints, and provider parameters are host
+authority. APC supplies only run/workspace data, validated messages, and the
+host-resolved dispatch binding. It never accepts a destination override nested
+in portable graph data.
+
+## Invocation, cancellation, and non-commit containment
+
+Frontend Stop and replacement use the `cancel_execution` intent. Callback-bound
+cancellation is propagated internally through host-owned signals; APC does
+not serialize an `AbortSignal` as a frontend/backend payload. The host binds
+each authoritative callback to an invocation identity and worker-local signal.
+Each run uses APC's custom composed cancellation tree and signal, combining the
+interceptor root, graph/stage/run deadlines, parent signal, and child
+controllers for cloning, assembly, and tracked dispatch.
 
 Stop, replacement, host/graph/run timeout, required failure, permission loss,
-and disable/update abort controllers. The graph drains with `allSettled`, rolls
-back identifiable provisional state, and settles once. The 300-second
-interceptor budget supports the graph deadline but never replaces
-callback-bound cancellation propagation.
+disable, update, unload, and teardown abort controllers. Parallel work drains
+with `allSettled`, rolls back identifiable APC-owned provisional state, and
+settles once. The host's 300-second interceptor ceiling supports the graph
+deadline but does not replace callback-bound cancellation.
 
-At matched callback entry, the host resolves the existing manifest-controlled
-interceptor timeout into an absolute `interceptorDeadlineAt`, then computes
-`boundWorkDeadlineAt = min(entry + 285000 ms, interceptorDeadlineAt - 15000
-ms)`. APC subcalls stop at the work deadline; the reserve is for host terminal
-transition and drain only. The fixed containment grace is teardown-only and
-cannot admit new APC work or extend either deadline.
+At callback entry, the host resolves the configured interceptor timeout into an
+absolute `interceptorDeadlineAt`, then APC computes
+`boundWorkDeadlineAt = min(entry + 285000 ms, interceptorDeadlineAt - 15000 ms)`.
+Subcalls stop at the work deadline; the reserve is only for host terminal
+transition and drain. The fixed containment grace is teardown-only: it cannot
+admit work or extend a deadline.
 
 The host retains one private `ParentPrefillAttestation` and derives only
-purpose/request-scoped child uses from it. First-run branch continuations receive
+purpose/request-scoped child uses. First-run branch continuations receive
 distinct one-use worker children; retries are replay, not a second use. The
-worker-callable `WorkerInvocationBinding` ends when the handler settles. A
-separate host-only `TerminalFinalizationLease` retains accepted directive/final
-provenance until parent terminal settlement and mints a fresh one-use terminal
-child immediately before every initial, retry, continuation, inline-tool, or
-fallback provider dispatch. No worker receives a carrier index, parent
-attestation, terminal child, or post-settlement authority.
+worker-callable binding ends when the handler settles. A separate host-only
+`TerminalFinalizationLease` retains accepted directive/final provenance until
+parent terminal settlement and mints a fresh one-use terminal child immediately
+before every initial, retry, continuation, inline-tool, or fallback provider
+dispatch. No worker receives a carrier index, parent attestation, terminal
+child, or post-settlement authority.
 
-Current transient native assembly is a useful foundation, but APC requires
-host-attested non-commit containment. Before every non-committing
-context/world-info/macro hook, the host acquires a read-only lease. During that
-lease it blocks mutating and reentrant worker operations while still permitting
-authenticated cancellation and manager teardown that only reduce pre-existing
-work.
+Before every non-committing context, world-info, or macro hook, the host
+acquires a read-only lease. During that lease, mutating and reentrant worker
+operations are blocked while authenticated cancellation and manager teardown
+remain able to reduce pre-existing work.
 
-A contradiction among host-owned binding, scope, lease, retrieval, or provenance
-maps latches a branded, non-exported `HostFatalInterceptorError` with a closed
-code set, including `NONCOMMIT_CONTAINMENT_FAILED`. It bypasses ordinary
-interceptor fail-open behavior, aborts siblings, and yields no Main provider call
-and no APC/Main persistence. Worker-authored names, payloads, IDs, dispatch
-sources, and revisions cannot forge that channel; they remain ordinary
-Graph-fallback faults.
+Non-commit containment fatal behavior is host-owned. APC does not invent a
+worker-visible fatal channel or claim an extension-local way to authenticate,
+bypass, or upgrade a host containment failure. An eligible Spindle host must
+preserve the exact host-created containment-fatal identity across worker RPC,
+reject the parent interceptor fail-closed, keep teardown grace non-authoritative,
+and expose only a generic abort to the worker. APC must remain blocked on hosts
+without that contract because they cannot support the stronger
+zero-Main/no-persistence guarantee for a host contradiction. Ordinary
+worker-authored names, payloads, IDs, dispatch sources, and revisions remain
+untrusted Graph-fallback data.
 
-## Parent retrieval snapshot
+## Parent retrieval and external effects
 
-Native-block threads always reuse Main's host-owned **parent retrieval
-snapshot**: the exact resolved vector world-info, chat-memory/Cortex, and
-databank inputs, results, and settings from parent assembly. It is deep-frozen
-and bound to `(userId, chatId, generationId)`.
+Native-block threads reuse Main's host-owned **Parent Retrieval Snapshot**:
+the exact resolved world-info, chat-memory/Cortex, databank inputs, results, and
+settings from parent assembly. It is deep-frozen and bound to `(userId, chatId,
+generationId)`.
 
-Cold additional assembly may not issue embeddings, perform fresh retrieval, or
-mutate retrieval caches or database state. APC adds no retrieval embedding
-request or cache write. Connection overrides change only LLM dispatch, never
-retrieval policy. A missing, expired, unavailable, or oversize parent snapshot
-fails closed; it never falls back to fresh retrieval.
+Cold additional assembly does not issue embeddings, perform fresh retrieval, or
+mutate retrieval caches or database state. APC adds no retrieval request or
+cache write. Connection overrides change only LLM dispatch, never retrieval
+policy. A missing, expired, unavailable, or oversize parent snapshot fails
+closed; it never falls back to fresh retrieval.
 
-## Council coexistence and effect boundary
+Council remains enabled. Sidecar Council may already have issued provider/tool
+calls and completed history/cache writes before APC interception. Those
+external and persisted effects are explicit, traceable, and nonrollbackable.
+A later APC containment fatal compensates only identifiable APC/host-owned
+provisional state; it cannot promise universal rollback over Sidecar or any
+provider effect that already occurred. Every later provider route remains
+subject to APC's terminal guidance, carrier, budget, Breakdown, receipt, and
+provenance validation immediately before dispatch.
 
-Council remains enabled. APC never suppresses or silently reorders it.
+## Terminal routing and outcomes
 
-Sidecar Council can execute before APC's prompt-pipeline interception and may
-already have issued provider/tool calls and completed history/cache writes. Those
-external and persisted effects are explicit, traceable, **nonrollbackable**
-effects. A later APC containment fatal prevents Main/APC persistence and
-compensates only identifiable host-owned provisional state; it cannot promise a
-universal transaction rollback over Sidecar.
+For a Main final route, resolved outputs become Main guidance. The host places
+that guidance immediately before the exact authenticated assistant-prefill
+carrier at the terminal dispatch boundary, not merely at an earlier
+interceptor pass. For a thread final route, the designated run supplies the
+user-facing response through the privileged host finalization path.
 
-The ordering is deliberate and testable. Existing Sidecar work completes first;
-authoritative pre-assembly context then settles; the host captures one immutable
-`MainDispatchSnapshot` before ordinary prompt assembly. After Main retrieval and
-before post-assembly interception, it captures the bound
-`ParentRetrievalSnapshot` and parent prefill attestation. Subsequent Main
-assembly/dispatch, APC-bound calls, retries, continuations, and later inline
-rounds use those snapshots. Earlier Sidecar calls receive no retroactive APC
-attestation, receipt, or rollback promise.
+Both routes are canonical. Missing final-response capability or permission
+makes the Thread choice unavailable with an explicit reason rather than
+silently redefining the graph. The safe native Main response remains the
+fallback, with bounded reason/activity emitted at the terminal decision.
+Settlement rechecks host signal, live permissions and revisions, receipt
+containment, guidance carrier, and selected final state before accepting a
+result.
 
-Later provider routes remain subject to APC's terminal validation. Gate E must
-enumerate and protect the initial Main dispatch, retries, continuations, inline
-Council/tool rounds, and any other provider path: each must revalidate the
-host-owned guidance carrier, provenance, budget, Breakdown, dispatch revision,
-and receipt immediately before provider work. The editor cannot know whether a
-generation-resolved prompt includes Council material, so every non-Single graph
-shows a conservative route warning.
-
-## Frontend trust and cooperative authority
-
-Frontend extensions run as trusted same-origin code in the authenticated host
-page. Namespace-scoped APC mutation and cloned read-only Main fields are
-cooperative least-authority APIs: they reduce accidental cross-extension and
-host-state writes, but they are not a hostile-code sandbox or isolation boundary.
-The backend's authoritative callback binding, permissions, dispatch checks, and
-host-owned fatal channel remain the security boundaries.
-
-## Observable failure outcomes
-
-A single monotonic latch chooses one observable outcome per execution:
+A single monotonic latch chooses one visible outcome per execution:
 
 **integrity-fatal > parent-cancel > selected-final failure > Graph-fallback >
 optional-local > success.**
 
-Within Graph-fallback, a fixed cause rank orders host gates,
-retrieval/dispatch/consent, capacity/config/graph/prefill,
-assembly/setup/storage, timeout, and required typed run failure. A required
-typed failure (hook, macro, provider, tool, blank, or oversize) projects to
-Graph-fallback. An optional typed failure follows the run's omit/skip policy and
-continues. Final settlement rechecks host signal, live permissions/revisions,
-receipt containment, and selected-final state.
+Within Graph-fallback, host gates, retrieval/dispatch/consent,
+capacity/config/graph/prefill, assembly/setup/storage, timeout, and required
+typed run failure have a fixed cause rank. A required typed failure projects to
+Graph-fallback. An optional typed failure follows the run's omit/skip policy
+and continues. Cancellation is never described as provider failure.
 
-## Prerequisite host capabilities — surviving foundations and three ordered D–F gates
+## Frontend trust and privacy
 
-The surviving A/B/C foundations remain independently testable and available in
-staging; the three remaining capabilities retain strict internal dependency
-order D→E→F. Current staging retains only the surviving controlled Loom
-editor/frontend/type foundation relevant to Gate C; the broader historical
-hardening is not current capability. APC remains runtime-inert until the single
-APC-only host PR carrying Gates D, E, and F lands in staging with the exact
-author-published `lumiverse-spindle-types@0.6.6` contract. The local D→E→F
-slices preserve full scope and separate evidence; consolidating them into one
-external host PR is administrative, not a collapse or reorder. Upstream
-`lumiverse-spindle-types@0.6.5` is already published, but corrected draft PR
-#32 targets `0.6.6` and removes the invented global API-version axis. Its
-compatibility contract uses the minimum Lumiverse application version `1.0.8`,
-descriptor schema `descriptorVersion: 1`, and the six named capability
-versions. The corrected `0.6.6` remains unpublished; its upstream author owns
-merge and package publication, and this project cannot publish it. The host
-candidate exact-pins only that author-published artifact after final evidence
-and red-team review pass; no host draft PR exists yet.
+Frontend extensions run as trusted same-origin code in the authenticated host
+page. Namespace-scoped mutation and cloned read-only Main fields reduce
+accidental cross-extension and host-state writes, but they are cooperative
+least-authority APIs, not a hostile-code sandbox. Backend callback binding,
+permissions, dispatch resolution/revision checks, consent validation,
+cancellation, and the host-owned fatal channel are the security boundaries.
 
-### PR 1 — passthrough integrity and LumiHub (complete in staging; Gate A)
+The frontend sends neither a user ID nor whole portable/private state
+documents. It renders safe labels and bounded activity summaries, never raw
+invocation IDs, revision hashes, connection UUIDs, internal receipts, nonces,
+carrier details, secrets, or opaque backend identifiers. Model-authored outputs,
+trace payloads, wrappers, and prompt fragments are hostile text and are
+rendered as text rather than parsed as provenance or executable markup.
 
-**Branch:** `feat/preset-extension-metadata`  
-**Depends on:** nothing
+## Verification and local operation
 
-The merged Gate A preserves `LoomPreset.passthroughMetadata` losslessly through
-normal Loom persistence, duplication, and internal import/export, and makes
-LumiHub create/update preserve those fields rather than rebuilding fixed
-metadata. It validates the clean top-level APC shape. This gate is generic
-passthrough integrity and LumiHub only; no second metadata container is added.
+Use Bun with the checked-in lockfile:
 
-### PR 2 — preset-editor integration and safe persistence (complete in staging; Gate B host capability)
+```sh
+bun install --frozen-lockfile
+bun run typecheck
+bun run build
+```
 
-**Branch:** `feat/spindle-preset-editor-surface`  
-**Depends on:** PR 1
-
-Reuse the native preset-editor tab and draft helper. The merged Gate B host
-capability is complete as a generic, inert surface. Core owns only:
-
-- generic toolbar placement and a registration root, with no APC-specific item
-  or default mode UI;
-- generic preset-editor tab/helper lifecycle and mount roots;
-- activation of the host's built-in preset editor through the generic `blocks` API ID;
-- namespace-scoped extension mutation and cloned read-only Main fields;
-- synchronous permission-revocation teardown of mounted tabs and draft
-  subscriptions;
-- one module-global, per-preset save coordinator shared by every preset writer;
-- serialization and a generation-flush barrier that prevents dispatch against an
-  unpersisted graph revision.
-
-APC later registers its toolbar item through the generic toolbar root and renders
-the **Single | Sequential | Parallel** radiogroup and **Agent Graph** view
-through the generic roots. APC owns those controls' labels, disabled reasons,
-accessibility behavior, and all APC-specific view content; core does not ship or
-render them.
-
-### Gate C — surviving controlled native Loom editor foundation
-
-The controlled native Loom block editor and its generic frontend bridge/placement
-surface survive in current staging as an extension-requested, visually inert
-foundation. Default output remains visually identical to Lumiverse's existing
-editor; the bridge operates on cloned controlled values and seals host-only
-fields. APC-specific thread UI and runtime mounting remain future work after the
-implementation halt lifts. Core adds no APC-specific editor markup.
-
-### Gate D — host-internal parent-bound assembly and dispatch substrate
-
-**Internal slice:** `feat/spindle-generate-assemble`  
-**Depends on:** Gate C foundation
-
-Reuse `spindle.assemble` and quiet-generation internals to build an independently
-testable **host-internal** substrate:
-
-- frozen parent route, retrieval, dispatch, and authenticated prefill snapshots;
-- a private parent-prefill attestation plus purpose/request-scoped one-use child
-  attachments for branch continuations and later host terminal dispatches;
-- opaque invocation-token enforcement for nested RPC identity, user/chat/
-  generation scope, cancellation authority, and host-computed work deadlines;
-- separate worker-invocation and host-only terminal/finalization lifetimes;
-- non-committing read-only leases and the host-fatal containment channel;
-- typed tracked dispatch outcomes, immutable source revisions, and trustworthy
-  receipts.
-
-Gate D defines and tests the substrate, including the no-fresh-retrieval
-invariant. It does **not** bind ordinary interceptor callbacks, issue APC
-callback tokens, register APC runtime behavior, or claim that callback lifecycle
-is solved. It is the prerequisite internal substrate for Gate E within the
-consolidated host PR, not an extension-only APC engine.
-
-### Gate E — authoritative callback lifecycle and terminal placement
-
-**Internal slice:** `feat/spindle-interceptor-context`  
-**Depends on:** Gate D
-
-For every authoritative callback, the host creates the Gate D
-`WorkerInvocationBinding` and host-only `TerminalFinalizationLease`, installs the
-worker binding, and exposes only the bound effective context, work deadline, and
-worker-local signal. User/chat/generation scope derives exclusively from that
-binding. Host-side preset/mode/route matching avoids irrelevant worker work, and
-an idempotent registration disposer owns teardown.
-
-Handler settlement ends worker RPC authority. Accepted directive/final
-provenance moves to the host-only terminal lease, which survives only until
-parent completion, cancellation, permission loss, unload, disable/update, or a
-confirmed containment fatal. Using Gate D's snapshots, tracked outcome, parent
-attestation, and containment channel, Gate E implements deferred host-owned
-guidance placement.
-Immediately before every provider dispatch it mints and consumes a fresh purpose/request-
-bound terminal child, authenticates or restores the prefill carrier,
-rebuilds/reclips budget and Breakdown, and revalidates terminal provenance.
-Existing post-assembly message, parameter, and Breakdown mutation remains the
-foundation; Gate E adds terminal enforcement rather than recreating that surface.
-
-### Gate F — thread-final finalization, compatibility, and locale
-
-**Internal slice:** `feat/spindle-interceptor-final-response`  
-**Depends on:** Gate E
-
-Add privileged, provenance-validated thread-final finalization so a graph may
-route its final response through Main or a designated thread. Define one
-immutable shared backend/frontend host descriptor with exactly the fields
-`descriptorVersion`, `lumiverseVersion`, `capabilities`, and
-`extensionInstallationId`. Both inert entrypoints synchronously validate it
-before incompatible extension source loads or any registration, mount, storage,
-generation, interceptor callback, or other domain call. Compatibility requires
-descriptor schema `descriptorVersion: 1`, minimum Lumiverse application version
-`1.0.8`, and version `1` for each named capability:
-`preset-extension-data-v1`, `preset-editor-v1`, `loom-block-editor-v1`,
-`generation-assembly-v1`, `interceptor-context-v1`, and
-`interceptor-final-response-v1`.
-After the host's generic pre-bundle nonce/digest handshake, the only
-pre-readiness extension operation is an immutable synchronous descriptor read.
-The extension installs no transport hello, listener, or digest exchange.
-Expose a host locale getter/change subscription so extensions can live-switch
-their own catalogs. APC ships and renders its own complete catalogs for `en`,
-`zh`, `zh-TW`, `ja`, `fr`, and `it` through its registered views. Core may show
-only generic conditional permission/compatibility/error diagnostics when
-applicable; any new host diagnostic string is added to all six Lumiverse core
-locales. No APC-specific labels, views, literals, or catalogs belong in core.
-The three internal D–F capabilities may be administratively grouped into the
-one APC-only host PR only if their ordering, full scope, and independently
-testable evidence remain equivalent. The consolidated host PR must retain strict
-D→E→F dependency order; replacing the gates with reduced workstreams is a Gate
-0 product-contract change.
-
-## Local bundle and later release discipline
-
-Current staging retains the surviving controlled Loom editor/frontend/type
-foundation relevant to Gate C; no ready-PR or current-hardening claim is made.
-The authorized local bundle records D, E, and F as separately testable
-capability slices and composes them sequentially in the separately claimed
-consolidated feature worktree. That worktree follows the normal fork PR controls
-and becomes the one external host PR source only after every evidence and
-publication blocker clears. The preserved no-remote prototype clone remains a
-read-only evidence input, not an implementation base or PR source.
-Each gate includes focused tests, generic host documentation, six Lumiverse
-core locale updates only when generic host strings are added, and cumulative
-types source for PR #32. Local prototype commits and tests are evidence inputs,
-not current staging capabilities or release authority. One independent
-cross-gate red-team review runs after all D–F verification passes. APC's six
-locale catalogs remain post-host extension work.
-
-After D→E→F evidence and the final independent cross-gate red-team review pass,
-the one consolidated APC-only host PR may carry all three internal gates in that
-order. This is one future external host PR, not three D/E/F host PRs and not a
-scope reduction. Upstream has published `lumiverse-spindle-types@0.6.5`, but
-corrected draft PR #32 targets `0.6.6` and must be merged upstream before its
-author publishes that exact version. This project cannot publish the package;
-host/APC exact pins, a clean frozen install, and external publication remain
-blocked until then. No host draft PR exists yet.
-
-For local D–F implementation/evidence, preserve unrelated work and use only the
-separately claimed consolidated feature worktree. Do not treat preserved
-prototype commits, tests, or historical Gate C hardening as current staging
-capability. Snapshots `45acd748` and `e4bbe6c` remain historical reference, not
-implementation bases.
-
-The published `lumiverse-spindle-types@0.6.5` remains the current staging type
-foundation. Corrected draft PR #32 is the cumulative D–F contract targeted at
-exactly `0.6.6`; it remains unpublished and has no release authority until its
-upstream author merges and publishes it. No package publication occurs in this
-extension.
-
-## Gate 0 decision and halt condition
-
-The user has authorized local consolidated D–F implementation/evidence and one
-APC-only host PR. The upstream author will review that single host PR normally
-after its prerequisites; no separate D/E/F host PR sequence is required. A
-review request, rejection, or material reshape reopens the affected contract
-boundary before that host PR proceeds.
-
-**No APC runtime implementation begins until the consolidated APC-only host PR
-lands in `staging` and the upstream author has merged corrected PR #32 and
-published exactly `0.6.6`.** Upstream `lumiverse-spindle-types@0.6.5` is
-published, but it is not the corrected contract. Final D–F evidence and the
-independent red-team review must pass before the host/APC exact pin or any host
-draft/publication. No host draft PR exists yet; clean frozen installation and
-external publication remain blocked until `0.6.6` is published. Before those
-conditions the extension performs no registration, mount, storage, generation,
-interceptor callback, or subcall work. There are no fallback paths: no DOM
-hacks, duplicated prompt assembly, event-only cancellation, unsafe metadata
-writes, or compatibility shims.
-
-After those prerequisites lift the implementation halt, compatibility bootstrap
-is the only exception to the pre-readiness no-work rule: the host owns any
-generic pre-bundle nonce/digest handshake, while the extension performs only
-immutable `spindle.host` / `ctx.host` descriptor reads. Everything else stays
-inert until future APC runtime work is authorized.
-
-## Gate G boundary — inert APC implementation and release
-
-Gate G remains blocked until the corrected `0.6.6` contract is published,
-the exact host/APC pins and clean frozen installation are verified, the single
-consolidated host PR lands in `staging`, and the user separately authorizes
-APC runtime/release work. Until then, this independent extension remains an
-inert scaffold: no APC registration, mount, storage, generation, interceptor
-callback, subcall, or publication work may begin.
+The build scripts produce the manifest's `dist/backend.js` and
+`dist/frontend.js` entrypoints. For isolated host testing, follow the shared
+registered-environment guide and the import-local/restart workflow in
+`README.md`; use the returned database UUID for Spindle routes, not the
+manifest identifier. Do not place credentials or private host data in this
+document.
 
 ## Companion documents
 
-- `AUTHOR_BRIEF.md` — consolidated host-PR review guide for this Gate 0 contract.
-- `README.md` — design-only scaffold status and implementation halt.
+- `README.md` — implementation status, runtime summary, build commands, and
+  registered isolated-host workflow.
+- `UI.md` — current presentation, interaction, accessibility, and localization
+  guidance.
