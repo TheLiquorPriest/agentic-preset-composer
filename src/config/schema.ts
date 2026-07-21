@@ -4,9 +4,18 @@ import type {
   PromptVariableValueDTO,
   PromptVariableValuesDTO,
 } from "lumiverse-spindle-types"
-import { MAX_CONFIG_BYTES } from "./limits"
 import {
-  serializedUtf8Bytes,
+  MAX_BLOCK_CONTENT_BYTES,
+  MAX_BLOCKS_PER_THREAD,
+  MAX_CONFIG_BYTES,
+  MAX_DESCRIPTION_BYTES,
+  MAX_LITERAL_BYTES,
+  MAX_NAME_CHARS,
+  characterCount,
+  utf8Bytes,
+} from "./limits"
+import {
+  sanitizedPlainJson,
   type PlainJsonErrorCode,
 } from "./plain-json"
 
@@ -163,7 +172,6 @@ const VARIABLE_TYPES: readonly PromptVariableDefDTO["type"][] = [
   "switch",
   "multiselect",
 ]
-const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"])
 
 interface DecodeContext {
   issues: ApcIssue[]
@@ -232,6 +240,9 @@ function plainJsonCode(code: PlainJsonErrorCode): string {
     case "sparse-array": return "SPARSE_ARRAY"
     case "non-enumerable-key": return "NON_ENUMERABLE_PROPERTY"
     case "array-property": return "ARRAY_PROPERTY"
+    case "depth-limit": return "JSON_DEPTH_LIMIT"
+    case "node-limit": return "JSON_NODE_LIMIT"
+    case "path-limit": return "JSON_PATH_LIMIT"
     default: return "UNSAFE_OBJECT"
   }
 }
@@ -285,107 +296,71 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return false
   }
 }
+function isPlainArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) return false
+  try {
+    return Object.getPrototypeOf(value) === Array.prototype || Object.getPrototypeOf(value) === null
+  } catch {
+    return false
+  }
+}
+
+const MISSING = Symbol("missing")
+
+function ownValue(record: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key)
+    if (!descriptor || !("value" in descriptor)) return MISSING
+    return descriptor.value
+  } catch {
+    return MISSING
+  }
+}
 
 function own(record: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(record, key)
+  return ownValue(record, key) !== MISSING
 }
 
-function scanJsonValue(
-  value: unknown,
-  path: readonly (string | number)[],
-  ancestors: WeakSet<object>,
-  context: DecodeContext,
-): boolean {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true
-  if (typeof value === "number") {
-    if (Number.isFinite(value)) return true
-    addIssue(context, path, "NON_FINITE_NUMBER", "Numbers must be finite")
-    return false
-  }
-  if (value === undefined) {
-    addIssue(context, path, "UNSUPPORTED_VALUE", "Undefined is not JSON data")
-    return false
-  }
-  if (typeof value !== "object") {
-    addIssue(context, path, "UNSUPPORTED_VALUE", "Only JSON-safe values are accepted")
-    return false
-  }
-
-  let prototype: object | null
-  let keys: (string | symbol)[]
+function arrayValue(values: readonly unknown[], index: number): unknown {
   try {
-    prototype = Object.getPrototypeOf(value)
-    keys = Reflect.ownKeys(value)
+    const descriptor = Object.getOwnPropertyDescriptor(values, String(index))
+    if (!descriptor || !("value" in descriptor)) return MISSING
+    return descriptor.value
+  } catch {
+    return MISSING
+  }
+}
+
+function plainDataKeys(record: object, path: readonly (string | number)[], context: DecodeContext): string[] | null {
+  let keys: readonly (string | symbol)[]
+  try {
+    keys = Reflect.ownKeys(record)
   } catch {
     addIssue(context, path, "UNSAFE_OBJECT", "Object inspection failed")
-    return false
+    return null
   }
-
-  const isArray = Array.isArray(value)
-  if (isArray) {
-    if (prototype !== Array.prototype) {
-      addIssue(context, path, "PLAIN_ARRAY_REQUIRED", "Arrays must use the ordinary Array prototype")
-      return false
+  const result: string[] = []
+  for (const key of keys) {
+    if (typeof key !== "string") {
+      addIssue(context, path, "UNSAFE_KEY", "Symbol keys are not JSON data")
+      return null
     }
-  } else if (prototype !== Object.prototype && prototype !== null) {
-    addIssue(context, path, "PLAIN_OBJECT_REQUIRED", "Objects must be plain records")
-    return false
-  }
-
-  if (ancestors.has(value)) {
-    addIssue(context, path, "CYCLE", "Cyclic values are not executable configuration")
-    return false
-  }
-  ancestors.add(value)
-  let valid = true
-  try {
-    for (const key of keys) {
-      if (typeof key !== "string") {
-        addIssue(context, path, "UNSAFE_KEY", "Symbol keys are not JSON data")
-        valid = false
-        continue
-      }
-      if (isArray && key === "length") continue
-      if (DANGEROUS_KEYS.has(key)) {
-        addIssue(context, [...path, key], "DANGEROUS_KEY", `Key ${key} is not allowed`)
-        valid = false
-        continue
-      }
-      if (key === "toJSON") {
-        addIssue(context, [...path, key], "CUSTOM_TO_JSON", "Custom toJSON properties are not allowed")
-        valid = false
-        continue
-      }
-      let descriptor: PropertyDescriptor | undefined
-      try {
-        descriptor = Object.getOwnPropertyDescriptor(value, key)
-      } catch {
-        addIssue(context, [...path, key], "UNSAFE_PROPERTY", "Property inspection failed")
-        valid = false
-        continue
-      }
-      if (descriptor === undefined) {
-        addIssue(context, [...path, key], "UNSAFE_PROPERTY", "Property inspection failed")
-        valid = false
-        continue
-      }
-      if (descriptor.get !== undefined || descriptor.set !== undefined) {
-        addIssue(context, [...path, key], "ACCESSOR_PROPERTY", "Accessor properties are not allowed")
-        valid = false
-        continue
-      }
-      if (!descriptor.enumerable) {
-        addIssue(context, [...path, key], "NON_ENUMERABLE_PROPERTY", "Only enumerable own properties are accepted")
-        valid = false
-        continue
-      }
-      if (!scanJsonValue(descriptor.value, [...path, key], ancestors, context)) valid = false
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(record, key)
+    } catch {
+      addIssue(context, [...path, key], "UNSAFE_PROPERTY", "Property inspection failed")
+      return null
     }
-  } finally {
-    ancestors.delete(value)
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      addIssue(context, [...path, key], "UNSAFE_PROPERTY", "Only enumerable own data properties are accepted")
+      return null
+    }
+    result.push(key)
   }
-  return valid
+  return result
 }
+
 
 function requiredRecord(
   value: unknown,
@@ -406,8 +381,8 @@ function requiredArray(
   context: DecodeContext,
   mode?: ApcMode,
 ): unknown[] | null {
-  if (!Array.isArray(value)) {
-    addIssue(context, path, "ARRAY_REQUIRED", "Expected an array", mode)
+  if (!isPlainArray(value)) {
+    addIssue(context, path, "ARRAY_REQUIRED", "Expected an ordinary array", mode)
     return null
   }
   return value
@@ -424,7 +399,7 @@ function requiredString(
     addIssue(context, [...path, key], "MISSING_FIELD", `Missing ${key}`, mode)
     return null
   }
-  const value = record[key]
+  const value = ownValue(record, key)
   if (typeof value !== "string") {
     addIssue(context, [...path, key], "STRING_REQUIRED", `${key} must be a string`, mode)
     return null
@@ -443,7 +418,7 @@ function requiredNumber(
     addIssue(context, [...path, key], "MISSING_FIELD", `Missing ${key}`, mode)
     return null
   }
-  const value = record[key]
+  const value = ownValue(record, key)
   if (typeof value !== "number" || !Number.isFinite(value)) {
     addIssue(context, [...path, key], "FINITE_NUMBER_REQUIRED", `${key} must be a finite number`, mode)
     return null
@@ -462,7 +437,7 @@ function requiredBoolean(
     addIssue(context, [...path, key], "MISSING_FIELD", `Missing ${key}`, mode)
     return null
   }
-  const value = record[key]
+  const value = ownValue(record, key)
   if (typeof value !== "boolean") {
     addIssue(context, [...path, key], "BOOLEAN_REQUIRED", `${key} must be a boolean`, mode)
     return null
@@ -478,7 +453,7 @@ function optionalString(
   mode?: ApcMode,
 ): string | undefined | null {
   if (!own(record, key)) return undefined
-  const value = record[key]
+  const value = ownValue(record, key)
   if (typeof value !== "string") {
     addIssue(context, [...path, key], "STRING_REQUIRED", `${key} must be a string`, mode)
     return null
@@ -497,9 +472,65 @@ function requiredStringOrNull(
     addIssue(context, [...path, key], "MISSING_FIELD", `Missing ${key}`, mode)
     return undefined
   }
-  const value = record[key]
+  const value = ownValue(record, key)
   if (value !== null && typeof value !== "string") {
     addIssue(context, [...path, key], "STRING_OR_NULL_REQUIRED", `${key} must be a string or null`, mode)
+    return undefined
+  }
+  return value
+}
+function boundedRequiredString(
+  record: Record<string, unknown>,
+  key: string,
+  path: readonly (string | number)[],
+  context: DecodeContext,
+  max: number,
+  measure: (value: string) => number,
+  code: string,
+  message: string,
+): string | null {
+  const value = requiredString(record, key, path, context)
+  if (value === null) return null
+  if (measure(value) > max) {
+    addIssue(context, [...path, key], code, message)
+    return null
+  }
+  return value
+}
+
+function boundedOptionalString(
+  record: Record<string, unknown>,
+  key: string,
+  path: readonly (string | number)[],
+  context: DecodeContext,
+  max: number,
+  measure: (value: string) => number,
+  code: string,
+  message: string,
+): string | undefined | null {
+  const value = optionalString(record, key, path, context)
+  if (value === undefined || value === null) return value
+  if (measure(value) > max) {
+    addIssue(context, [...path, key], code, message)
+    return null
+  }
+  return value
+}
+
+function boundedStringOrNull(
+  record: Record<string, unknown>,
+  key: string,
+  path: readonly (string | number)[],
+  context: DecodeContext,
+  max: number,
+  measure: (value: string) => number,
+  code: string,
+  message: string,
+): string | null | undefined {
+  const value = requiredStringOrNull(record, key, path, context)
+  if (value === undefined || value === null) return value
+  if (measure(value) > max) {
+    addIssue(context, [...path, key], code, message)
     return undefined
   }
   return value
@@ -529,7 +560,7 @@ function requiredEnum<T extends string>(
     addIssue(context, [...path, key], "MISSING_FIELD", `Missing ${key}`, mode)
     return null
   }
-  return enumValue(record[key], values, [...path, key], context, mode)
+  return enumValue(ownValue(record, key), values, [...path, key], context, mode)
 }
 
 function generatedId(
@@ -575,15 +606,24 @@ function stringArray(
   path: readonly (string | number)[],
   context: DecodeContext,
   mode?: ApcMode,
+  maxItems = MAX_BLOCKS_PER_THREAD,
+  maxBytes = MAX_LITERAL_BYTES,
 ): string[] | null {
   const values = requiredArray(value, path, context, mode)
   if (values === null) return null
+  if (values.length > maxItems) {
+    addIssue(context, path, "COLLECTION_LIMIT", `Collection exceeds its limit of ${maxItems}.`, mode)
+    return null
+  }
   const result: string[] = []
   let valid = true
   for (let index = 0; index < values.length; index += 1) {
-    const item = values[index]
+    const item = arrayValue(values, index)
     if (typeof item !== "string") {
       addIssue(context, [...path, index], "STRING_REQUIRED", "Array entries must be strings", mode)
+      valid = false
+    } else if (utf8Bytes(item) > maxBytes) {
+      addIssue(context, [...path, index], "LITERAL_LIMIT", `Array entry exceeds ${maxBytes} UTF-8 bytes.`, mode)
       valid = false
     } else {
       result.push(item)
@@ -599,9 +639,36 @@ function promptVariableOption(
 ): { id: string; label: string; value: string } | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const id = requiredString(record, "id", path, context)
-  const label = requiredString(record, "label", path, context)
-  const optionValue = requiredString(record, "value", path, context)
+  const id = boundedRequiredString(
+    record,
+    "id",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Name exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const label = boundedRequiredString(
+    record,
+    "label",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Label exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const optionValue = boundedRequiredString(
+    record,
+    "value",
+    path,
+    context,
+    MAX_LITERAL_BYTES,
+    utf8Bytes,
+    "LITERAL_LIMIT",
+    `Option value exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`,
+  )
   if (id === null || label === null || optionValue === null) return null
   return { id, label, value: optionValue }
 }
@@ -613,7 +680,7 @@ function finiteOptionalNumber(
   context: DecodeContext,
 ): number | undefined | null {
   if (!own(record, key)) return undefined
-  const value = record[key]
+  const value = ownValue(record, key)
   if (typeof value !== "number" || !Number.isFinite(value)) {
     addIssue(context, [...path, key], "FINITE_NUMBER_REQUIRED", `${key} must be a finite number`)
     return null
@@ -628,23 +695,77 @@ function promptVariableDefinition(
 ): PromptVariableDefDTO | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const id = requiredString(record, "id", path, context)
-  const name = requiredString(record, "name", path, context)
-  const label = requiredString(record, "label", path, context)
+  const id = boundedRequiredString(
+    record,
+    "id",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Variable ID exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const name = boundedRequiredString(
+    record,
+    "name",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Variable name exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const label = boundedRequiredString(
+    record,
+    "label",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Variable label exceeds ${MAX_NAME_CHARS} characters.`,
+  )
   const type = requiredEnum(record, "type", VARIABLE_TYPES, path, context)
   if (id === null || name === null || label === null || type === null) return null
-  const description = optionalString(record, "description", path, context)
+  const description = boundedOptionalString(
+    record,
+    "description",
+    path,
+    context,
+    MAX_DESCRIPTION_BYTES,
+    utf8Bytes,
+    "DESCRIPTION_LIMIT",
+    `Description exceeds ${MAX_DESCRIPTION_BYTES} UTF-8 bytes.`,
+  )
   if (description === null) return null
 
   if (type === "text") {
-    const defaultValue = requiredString(record, "defaultValue", path, context)
+    const defaultValue = boundedRequiredString(
+      record,
+      "defaultValue",
+      path,
+      context,
+      MAX_LITERAL_BYTES,
+      utf8Bytes,
+      "LITERAL_LIMIT",
+      `Default value exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`,
+    )
     if (defaultValue === null) return null
     return description === undefined
       ? { id, name, label, type, defaultValue }
       : { id, name, label, type, defaultValue, description }
   }
   if (type === "textarea") {
-    const defaultValue = requiredString(record, "defaultValue", path, context)
+    const defaultValue = boundedRequiredString(
+      record,
+      "defaultValue",
+      path,
+      context,
+      MAX_LITERAL_BYTES,
+      utf8Bytes,
+      "LITERAL_LIMIT",
+      `Default value exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`,
+    )
     const rows = finiteOptionalNumber(record, "rows", path, context)
     if (defaultValue === null || rows === null) return null
     const result: Extract<PromptVariableDefDTO, { type: "textarea" }> = {
@@ -697,27 +818,48 @@ function promptVariableDefinition(
     return result
   }
   if (type === "select" || type === "multiselect") {
-    const optionsValue = requiredArray(record["options"], [...path, "options"], context)
+    const optionsValue = requiredArray(ownValue(record, "options"), [...path, "options"], context)
     const options: { id: string; label: string; value: string }[] = []
     let valid = optionsValue !== null
     if (optionsValue !== null) {
+      if (optionsValue.length > MAX_BLOCKS_PER_THREAD) {
+        addIssue(context, [...path, "options"], "COLLECTION_LIMIT", `Options exceed ${MAX_BLOCKS_PER_THREAD} entries.`)
+        return null
+      }
       for (let index = 0; index < optionsValue.length; index += 1) {
-        const option = promptVariableOption(optionsValue[index], [...path, "options", index], context)
+        const option = promptVariableOption(arrayValue(optionsValue, index), [...path, "options", index], context)
         if (option === null) valid = false
         else options.push(option)
       }
     }
     if (!valid) return null
     if (type === "select") {
-      const defaultValue = requiredString(record, "defaultValue", path, context)
+      const defaultValue = boundedRequiredString(
+        record,
+        "defaultValue",
+        path,
+        context,
+        MAX_LITERAL_BYTES,
+        utf8Bytes,
+        "LITERAL_LIMIT",
+        `Default value exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`,
+      )
       if (defaultValue === null) return null
       return description === undefined
         ? { id, name, label, type, defaultValue, options }
         : { id, name, label, type, defaultValue, options, description }
     }
-    const defaultValueValue = record["defaultValue"]
-    const defaultValue = stringArray(defaultValueValue, [...path, "defaultValue"], context)
-    const separator = optionalString(record, "separator", path, context)
+    const defaultValue = stringArray(ownValue(record, "defaultValue"), [...path, "defaultValue"], context)
+    const separator = boundedOptionalString(
+      record,
+      "separator",
+      path,
+      context,
+      MAX_LITERAL_BYTES,
+      utf8Bytes,
+      "LITERAL_LIMIT",
+      `Separator exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`,
+    )
     if (defaultValue === null || separator === null) return null
     const result: Extract<PromptVariableDefDTO, { type: "multiselect" }> = {
       id,
@@ -732,7 +874,7 @@ function promptVariableDefinition(
     return result
   }
 
-  const defaultValue = record["defaultValue"]
+  const defaultValue = ownValue(record, "defaultValue")
   if (defaultValue !== 0 && defaultValue !== 1) {
     addIssue(context, [...path, "defaultValue"], "SWITCH_VALUE_REQUIRED", "switch defaultValue must be 0 or 1")
     return null
@@ -742,6 +884,7 @@ function promptVariableDefinition(
     : { id, name, label, type, defaultValue, description }
 }
 
+
 function promptBlock(
   value: unknown,
   path: readonly (string | number)[],
@@ -749,18 +892,72 @@ function promptBlock(
 ): PromptBlockDTO | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const id = requiredString(record, "id", path, context)
-  const name = requiredString(record, "name", path, context)
-  const content = requiredString(record, "content", path, context)
+  const id = boundedRequiredString(
+    record,
+    "id",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Block ID exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const name = boundedRequiredString(
+    record,
+    "name",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Block name exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const content = boundedRequiredString(
+    record,
+    "content",
+    path,
+    context,
+    MAX_BLOCK_CONTENT_BYTES,
+    utf8Bytes,
+    "BLOCK_CONTENT_LIMIT",
+    `Block content exceeds ${MAX_BLOCK_CONTENT_BYTES} UTF-8 bytes.`,
+  )
   const role = requiredEnum(record, "role", BLOCK_ROLES, path, context)
   const enabled = requiredBoolean(record, "enabled", path, context)
   const position = requiredEnum(record, "position", BLOCK_POSITIONS, path, context)
   const depth = requiredNumber(record, "depth", path, context)
-  const marker = requiredStringOrNull(record, "marker", path, context)
+  const marker = boundedStringOrNull(
+    record,
+    "marker",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Block marker exceeds ${MAX_NAME_CHARS} characters.`,
+  )
   const isLocked = requiredBoolean(record, "isLocked", path, context)
-  const color = requiredStringOrNull(record, "color", path, context)
-  const injectionTrigger = stringArray(record["injectionTrigger"], [...path, "injectionTrigger"], context)
-  const group = requiredStringOrNull(record, "group", path, context)
+  const color = boundedStringOrNull(
+    record,
+    "color",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Block color exceeds ${MAX_NAME_CHARS} characters.`,
+  )
+  const injectionTrigger = stringArray(ownValue(record, "injectionTrigger"), [...path, "injectionTrigger"], context)
+  const group = boundedStringOrNull(
+    record,
+    "group",
+    path,
+    context,
+    MAX_NAME_CHARS,
+    characterCount,
+    "NAME_LIMIT",
+    `Block group exceeds ${MAX_NAME_CHARS} characters.`,
+  )
   if (
     id === null ||
     name === null ||
@@ -791,12 +988,12 @@ function promptBlock(
     group,
   }
   if (own(record, "characterTagTrigger")) {
-    const characterTagTrigger = stringArray(record["characterTagTrigger"], [...path, "characterTagTrigger"], context)
+    const characterTagTrigger = stringArray(ownValue(record, "characterTagTrigger"), [...path, "characterTagTrigger"], context)
     if (characterTagTrigger === null) return null
     result.characterTagTrigger = characterTagTrigger
   }
   if (own(record, "categoryMode")) {
-    const categoryMode = record["categoryMode"]
+    const categoryMode = ownValue(record, "categoryMode")
     if (categoryMode !== null && categoryMode !== "radio" && categoryMode !== "checkbox") {
       addIssue(context, [...path, "categoryMode"], "INVALID_ENUM", "categoryMode must be radio, checkbox, or null")
       return null
@@ -804,12 +1001,16 @@ function promptBlock(
     result.categoryMode = categoryMode
   }
   if (own(record, "variables")) {
-    const values = requiredArray(record["variables"], [...path, "variables"], context)
+    const values = requiredArray(ownValue(record, "variables"), [...path, "variables"], context)
     if (values === null) return null
+    if (values.length > MAX_BLOCKS_PER_THREAD) {
+      addIssue(context, [...path, "variables"], "COLLECTION_LIMIT", `Variables exceed ${MAX_BLOCKS_PER_THREAD} entries.`)
+      return null
+    }
     const variables: PromptVariableDefDTO[] = []
     let valid = true
     for (let index = 0; index < values.length; index += 1) {
-      const variable = promptVariableDefinition(values[index], [...path, "variables", index], context)
+      const variable = promptVariableDefinition(arrayValue(values, index), [...path, "variables", index], context)
       if (variable === null) valid = false
       else variables.push(variable)
     }
@@ -826,22 +1027,48 @@ function promptVariableValues(
 ): PromptVariableValuesDTO | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const result: PromptVariableValuesDTO = {}
-  for (const [blockId, blockValue] of Object.entries(record)) {
-    const blockRecord = requiredRecord(blockValue, [...path, blockId], context)
+  const blockKeys = plainDataKeys(record, path, context)
+  if (blockKeys === null) return null
+  if (blockKeys.length > MAX_BLOCKS_PER_THREAD) {
+    addIssue(context, path, "COLLECTION_LIMIT", `Prompt-variable blocks exceed ${MAX_BLOCKS_PER_THREAD} entries.`)
+    return null
+  }
+  const result = Object.create(null) as PromptVariableValuesDTO
+  for (const blockId of blockKeys) {
+    if (characterCount(blockId) > MAX_NAME_CHARS) {
+      addIssue(context, [...path, blockId], "NAME_LIMIT", `Block ID exceeds ${MAX_NAME_CHARS} characters.`)
+      return null
+    }
+    const blockRecord = requiredRecord(ownValue(record, blockId), [...path, blockId], context)
     if (blockRecord === null) return null
-    const values: Record<string, PromptVariableValueDTO> = {}
-    for (const [name, item] of Object.entries(blockRecord)) {
+    const variableKeys = plainDataKeys(blockRecord, [...path, blockId], context)
+    if (variableKeys === null) return null
+    if (variableKeys.length > MAX_BLOCKS_PER_THREAD) {
+      addIssue(context, [...path, blockId], "COLLECTION_LIMIT", `Prompt-variable values exceed ${MAX_BLOCKS_PER_THREAD} entries.`)
+      return null
+    }
+    const values: Record<string, PromptVariableValueDTO> = Object.create(null) as Record<string, PromptVariableValueDTO>
+    for (const name of variableKeys) {
+      const item = ownValue(blockRecord, name)
+      const valuePath = [...path, blockId, name]
+      if (characterCount(name) > MAX_NAME_CHARS) {
+        addIssue(context, valuePath, "NAME_LIMIT", `Variable name exceeds ${MAX_NAME_CHARS} characters.`)
+        return null
+      }
       if (typeof item === "string") {
+        if (utf8Bytes(item) > MAX_LITERAL_BYTES) {
+          addIssue(context, valuePath, "LITERAL_LIMIT", `Prompt variable value exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`)
+          return null
+        }
         values[name] = item
       } else if (typeof item === "number" && Number.isFinite(item)) {
         values[name] = item
       } else if (Array.isArray(item)) {
-        const strings = stringArray(item, [...path, blockId, name], context)
+        const strings = stringArray(item, valuePath, context)
         if (strings === null) return null
         values[name] = strings
       } else {
-        addIssue(context, [...path, blockId, name], "PROMPT_VALUE_REQUIRED", "Prompt variable values must be strings, finite numbers, or string arrays")
+        addIssue(context, valuePath, "PROMPT_VALUE_REQUIRED", "Prompt variable values must be strings, finite numbers, or string arrays")
         return null
       }
     }
@@ -863,7 +1090,7 @@ function mainThread(value: unknown, path: readonly (string | number)[], context:
   if (record === null) return null
   const id = fixedString(record, "id", "main", path, context)
   const name = fixedString(record, "name", "Main Thread", path, context)
-  const threadOutput = output(record["output"], [...path, "output"], context)
+  const threadOutput = output(ownValue(record, "output"), [...path, "output"], context)
   return id && name && threadOutput !== null
     ? { id: "main", name: "Main Thread", output: threadOutput }
     : null
@@ -872,12 +1099,12 @@ function mainThread(value: unknown, path: readonly (string | number)[], context:
 function connectionSlot(value: unknown, path: readonly (string | number)[], context: DecodeContext): ApcConnectionSlotV1 | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const id = generatedId(record["id"], [...path, "id"], context)
+  const id = generatedId(ownValue(record, "id"), [...path, "id"], context)
   const label = requiredString(record, "label", path, context)
   if (id === null || label === null) return null
   const result: ApcConnectionSlotV1 = { id, label }
   if (own(record, "hint")) {
-    const hintRecord = requiredRecord(record["hint"], [...path, "hint"], context)
+    const hintRecord = requiredRecord(ownValue(record, "hint"), [...path, "hint"], context)
     if (hintRecord === null) return null
     const profileName = optionalString(hintRecord, "profileName", [...path, "hint"], context)
     const provider = optionalString(hintRecord, "provider", [...path, "hint"], context)
@@ -895,19 +1122,19 @@ function connectionSlot(value: unknown, path: readonly (string | number)[], cont
 function thread(value: unknown, path: readonly (string | number)[], context: DecodeContext): ApcThreadV1 | null {
   const record = requiredRecord(value, path, context)
   if (record === null) return null
-  const id = generatedId(record["id"], [...path, "id"], context)
+  const id = generatedId(ownValue(record, "id"), [...path, "id"], context)
   const name = requiredString(record, "name", path, context)
   const description = requiredString(record, "description", path, context)
   const workspaceSource = requiredEnum(record, "workspaceSource", WORKSPACE_SOURCES, path, context)
-  const blocksValue = requiredArray(record["blocks"], [...path, "blocks"], context)
-  const promptValues = promptVariableValues(record["promptVariableValues"], [...path, "promptVariableValues"], context)
-  const threadOutput = output(record["output"], [...path, "output"], context)
+  const blocksValue = requiredArray(ownValue(record, "blocks"), [...path, "blocks"], context)
+  const promptValues = promptVariableValues(ownValue(record, "promptVariableValues"), [...path, "promptVariableValues"], context)
+  const threadOutput = output(ownValue(record, "output"), [...path, "output"], context)
   if (id === null || name === null || description === null || workspaceSource === null || blocksValue === null || promptValues === null || threadOutput === null) return null
 
   const blocks: PromptBlockDTO[] = []
   let valid = true
   for (let index = 0; index < blocksValue.length; index += 1) {
-    const block = promptBlock(blocksValue[index], [...path, "blocks", index], context)
+    const block = promptBlock(arrayValue(blocksValue, index), [...path, "blocks", index], context)
     if (block === null) valid = false
     else blocks.push(block)
   }
@@ -923,7 +1150,7 @@ function thread(value: unknown, path: readonly (string | number)[], context: Dec
     output: threadOutput,
   }
   if (own(record, "connectionSlotId")) {
-    const connectionSlotId = generatedId(record["connectionSlotId"], [...path, "connectionSlotId"], context)
+    const connectionSlotId = generatedId(ownValue(record, "connectionSlotId"), [...path, "connectionSlotId"], context)
     if (connectionSlotId === null) return null
     result.connectionSlotId = connectionSlotId
   }
@@ -944,14 +1171,14 @@ function inputBinding(value: unknown, path: readonly (string | number)[], contex
   const source = requiredString(record, "source", path, context, mode)
   if (source === null) return null
   if (source === "literal") {
-    const inputRole = role(record["role"], [...path, "role"], context, mode)
+    const inputRole = role(ownValue(record, "role"), [...path, "role"], context, mode)
     const content = requiredString(record, "content", path, context, mode)
     return inputRole === null || content === null ? null : { source: "literal", role: inputRole, content }
   }
   if (source === "output") {
-    const runId = generatedId(record["runId"], [...path, "runId"], context, mode)
-    const inputRole = role(record["role"], [...path, "role"], context, mode)
-    const onMissing = missingPolicy(record["onMissing"], [...path, "onMissing"], context, mode)
+    const runId = generatedId(ownValue(record, "runId"), [...path, "runId"], context, mode)
+    const inputRole = role(ownValue(record, "role"), [...path, "role"], context, mode)
+    const onMissing = missingPolicy(ownValue(record, "onMissing"), [...path, "onMissing"], context, mode)
     return runId === null || inputRole === null || onMissing === null
       ? null
       : { source: "output", runId, role: inputRole, onMissing }
@@ -963,16 +1190,16 @@ function inputBinding(value: unknown, path: readonly (string | number)[], contex
 function run(value: unknown, path: readonly (string | number)[], context: DecodeContext, mode: ApcMode): ApcRunV1 | null {
   const record = requiredRecord(value, path, context, mode)
   if (record === null) return null
-  const id = generatedId(record["id"], [...path, "id"], context, mode)
-  const threadId = generatedId(record["threadId"], [...path, "threadId"], context, mode)
+  const id = generatedId(ownValue(record, "id"), [...path, "id"], context, mode)
+  const threadId = generatedId(ownValue(record, "threadId"), [...path, "threadId"], context, mode)
   const required = requiredBoolean(record, "required", path, context, mode)
   const timeoutMs = requiredNumber(record, "timeoutMs", path, context, mode)
-  const inputsValue = requiredArray(record["inputs"], [...path, "inputs"], context, mode)
+  const inputsValue = requiredArray(ownValue(record, "inputs"), [...path, "inputs"], context, mode)
   if (id === null || threadId === null || required === null || timeoutMs === null || inputsValue === null) return null
   const inputs: ApcInputBindingV1[] = []
   let valid = true
   for (let index = 0; index < inputsValue.length; index += 1) {
-    const input = inputBinding(inputsValue[index], [...path, "inputs", index], context, mode)
+    const input = inputBinding(arrayValue(inputsValue, index), [...path, "inputs", index], context, mode)
     if (input === null) valid = false
     else inputs.push(input)
   }
@@ -982,14 +1209,14 @@ function run(value: unknown, path: readonly (string | number)[], context: Decode
 function stage(value: unknown, path: readonly (string | number)[], context: DecodeContext, mode: ApcMode): ApcStageV1 | null {
   const record = requiredRecord(value, path, context, mode)
   if (record === null) return null
-  const id = generatedId(record["id"], [...path, "id"], context, mode)
+  const id = generatedId(ownValue(record, "id"), [...path, "id"], context, mode)
   const name = requiredString(record, "name", path, context, mode)
-  const runsValue = requiredArray(record["runs"], [...path, "runs"], context, mode)
+  const runsValue = requiredArray(ownValue(record, "runs"), [...path, "runs"], context, mode)
   if (id === null || name === null || runsValue === null) return null
   const runs: ApcRunV1[] = []
   let valid = true
   for (let index = 0; index < runsValue.length; index += 1) {
-    const parsed = run(runsValue[index], [...path, "runs", index], context, mode)
+    const parsed = run(arrayValue(runsValue, index), [...path, "runs", index], context, mode)
     if (parsed === null) valid = false
     else runs.push(parsed)
   }
@@ -1000,7 +1227,7 @@ function finalMainInput(value: unknown, path: readonly (string | number)[], cont
   const record = requiredRecord(value, path, context, mode)
   if (record === null) return null
   const source = requiredString(record, "source", path, context, mode)
-  const runId = generatedId(record["runId"], [...path, "runId"], context, mode)
+  const runId = generatedId(ownValue(record, "runId"), [...path, "runId"], context, mode)
   const onMissingValue = requiredString(record, "onMissing", path, context, mode)
   if (source === null || runId === null || onMissingValue === null) return null
   if (source !== "output") {
@@ -1020,19 +1247,19 @@ function finalResponse(value: unknown, path: readonly (string | number)[], conte
   const source = requiredString(record, "source", path, context, mode)
   if (source === null) return null
   if (source === "main") {
-    const values = requiredArray(record["inputs"], [...path, "inputs"], context, mode)
+    const values = requiredArray(ownValue(record, "inputs"), [...path, "inputs"], context, mode)
     if (values === null) return null
     const inputs: ApcFinalMainInputV1[] = []
     let valid = true
     for (let index = 0; index < values.length; index += 1) {
-      const input = finalMainInput(values[index], [...path, "inputs", index], context, mode)
+      const input = finalMainInput(arrayValue(values, index), [...path, "inputs", index], context, mode)
       if (input === null) valid = false
       else inputs.push(input)
     }
     return valid ? { source: "main", inputs } : null
   }
   if (source === "thread") {
-    const runId = generatedId(record["runId"], [...path, "runId"], context, mode)
+    const runId = generatedId(ownValue(record, "runId"), [...path, "runId"], context, mode)
     return runId === null ? null : { source: "thread", runId }
   }
   addIssue(context, [...path, "source"], "INVALID_ENUM", "source must be main or thread", mode)
@@ -1042,14 +1269,14 @@ function finalResponse(value: unknown, path: readonly (string | number)[], conte
 function pipeline(value: unknown, path: readonly (string | number)[], context: DecodeContext, mode: ApcMode): ApcPipelineV1 | null {
   const record = requiredRecord(value, path, context, mode)
   if (record === null) return null
-  const id = generatedId(record["id"], [...path, "id"], context, mode)
-  const stagesValue = requiredArray(record["stages"], [...path, "stages"], context, mode)
-  const final = finalResponse(record["finalResponse"], [...path, "finalResponse"], context, mode)
+  const id = generatedId(ownValue(record, "id"), [...path, "id"], context, mode)
+  const stagesValue = requiredArray(ownValue(record, "stages"), [...path, "stages"], context, mode)
+  const final = finalResponse(ownValue(record, "finalResponse"), [...path, "finalResponse"], context, mode)
   if (id === null || stagesValue === null || final === null) return null
   const stages: ApcStageV1[] = []
   let valid = true
   for (let index = 0; index < stagesValue.length; index += 1) {
-    const parsed = stage(stagesValue[index], [...path, "stages", index], context, mode)
+    const parsed = stage(arrayValue(stagesValue, index), [...path, "stages", index], context, mode)
     if (parsed === null) valid = false
     else stages.push(parsed)
   }
@@ -1058,57 +1285,57 @@ function pipeline(value: unknown, path: readonly (string | number)[], context: D
 
 function parseConfig(raw: Record<string, unknown>, context: DecodeContext): { config: ApcPresetConfigV1 | null; activeValid: boolean; sharedValid: boolean } {
   let sharedValid = true
-  const supportedModesValue = requiredArray(raw["supportedModes"], ["supportedModes"], context)
+  const supportedModesValue = requiredArray(ownValue(raw, "supportedModes"), ["supportedModes"], context)
   const supportedModes: ApcMode[] = []
   if (supportedModesValue === null) {
     sharedValid = false
   } else {
     for (let index = 0; index < supportedModesValue.length; index += 1) {
-      const mode = enumValue(supportedModesValue[index], MODES, ["supportedModes", index], context)
+      const mode = enumValue(arrayValue(supportedModesValue, index), MODES, ["supportedModes", index], context)
       if (mode === null) sharedValid = false
       else supportedModes.push(mode)
     }
   }
   const activeMode = own(raw, "activeMode")
-    ? enumValue(raw["activeMode"], MODES, ["activeMode"], context)
+    ? enumValue(ownValue(raw, "activeMode"), MODES, ["activeMode"], context)
     : (addIssue(context, ["activeMode"], "MISSING_FIELD", "Missing activeMode"), null)
   if (activeMode === null) sharedValid = false
 
-  const parsedMainThread = mainThread(raw["mainThread"], ["mainThread"], context)
+  const parsedMainThread = mainThread(ownValue(raw, "mainThread"), ["mainThread"], context)
   if (parsedMainThread === null) sharedValid = false
 
-  const slotsValue = requiredArray(raw["connectionSlots"], ["connectionSlots"], context)
+  const slotsValue = requiredArray(ownValue(raw, "connectionSlots"), ["connectionSlots"], context)
   const connectionSlots: ApcConnectionSlotV1[] = []
   if (slotsValue === null) {
     sharedValid = false
   } else {
     for (let index = 0; index < slotsValue.length; index += 1) {
-      const slot = connectionSlot(slotsValue[index], ["connectionSlots", index], context)
+      const slot = connectionSlot(arrayValue(slotsValue, index), ["connectionSlots", index], context)
       if (slot === null) sharedValid = false
       else connectionSlots.push(slot)
     }
   }
 
-  const threadsValue = requiredArray(raw["threads"], ["threads"], context)
+  const threadsValue = requiredArray(ownValue(raw, "threads"), ["threads"], context)
   const threads: ApcThreadV1[] = []
   if (threadsValue === null) {
     sharedValid = false
   } else {
     for (let index = 0; index < threadsValue.length; index += 1) {
-      const parsed = thread(threadsValue[index], ["threads", index], context)
+      const parsed = thread(arrayValue(threadsValue, index), ["threads", index], context)
       if (parsed === null) sharedValid = false
       else threads.push(parsed)
     }
   }
 
-  const pipelinesRecord = requiredRecord(raw["pipelines"], ["pipelines"], context)
+  const pipelinesRecord = requiredRecord(ownValue(raw, "pipelines"), ["pipelines"], context)
   if (pipelinesRecord === null) sharedValid = false
   const pipelines: ApcPipelinesV1 = {}
   let activeValid = activeMode !== null
   if (pipelinesRecord !== null) {
     for (const mode of ["sequential", "parallel"] as const) {
       if (!own(pipelinesRecord, mode)) continue
-      const parsed = pipeline(pipelinesRecord[mode], ["pipelines", mode], context, mode)
+      const parsed = pipeline(ownValue(pipelinesRecord, mode), ["pipelines", mode], context, mode)
       if (parsed === null) {
         if (activeMode === mode) activeValid = false
       } else {
@@ -1168,29 +1395,29 @@ export function decodeApcPresetConfig(raw: unknown): ApcDecodedConfig {
     return decoded(raw, "legacy", createDefaultApcConfig(), context, false)
   }
 
-  const serialized = serializedUtf8Bytes(raw)
-  if (!serialized.ok) {
+  const sanitized = sanitizedPlainJson(raw)
+  if (!sanitized.ok) {
     addIssue(
       context,
-      decodePath(serialized.error.path),
-      plainJsonCode(serialized.error.code),
-      serialized.error.message,
+      decodePath(sanitized.error.path),
+      plainJsonCode(sanitized.error.code),
+      sanitized.error.message,
     )
     return decoded(raw, "invalid", null, context, false)
   }
-  if (serialized.bytes > MAX_CONFIG_BYTES) {
+  if (sanitized.bytes > MAX_CONFIG_BYTES) {
     addIssue(context, [], "CONFIG_LIMIT", `Configuration exceeds ${MAX_CONFIG_BYTES} UTF-8 bytes.`)
     return decoded(raw, "invalid", null, context, false)
   }
 
-  const envelope = requiredRecord(raw, [], context)
+  const envelope = requiredRecord(sanitized.value, [], context)
   if (envelope === null) return decoded(raw, "invalid", null, context, false)
 
   if (!own(envelope, "schemaVersion")) {
     addIssue(context, ["schemaVersion"], "SCHEMA_VERSION_REQUIRED", "schemaVersion 1 is required")
     return decoded(raw, "invalid", null, context, false)
   }
-  const schemaVersion = envelope["schemaVersion"]
+  const schemaVersion = ownValue(envelope, "schemaVersion")
   if (typeof schemaVersion !== "number" || !Number.isFinite(schemaVersion)) {
     addIssue(context, ["schemaVersion"], "SCHEMA_VERSION_TYPE", "schemaVersion must be a finite number")
     return decoded(raw, "invalid", null, context, false)

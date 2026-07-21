@@ -255,9 +255,9 @@ describe("user-scoped immutable trace retention", () => {
     const hugePreview = "y".repeat(MAX_TRACE_BYTES * 64)
     const originalEncode = TextEncoder.prototype.encode
     let rawScanCount = 0
-    TextEncoder.prototype.encode = function (input = ""): Uint8Array {
+    TextEncoder.prototype.encode = function (input = ""): Uint8Array<ArrayBuffer> {
       if (input === hugePreview) rawScanCount += 1
-      return originalEncode.call(this, input)
+      return new Uint8Array(originalEncode.call(this, input))
     }
     let appended: TraceMutationResult
     try {

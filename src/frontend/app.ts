@@ -84,13 +84,28 @@ import {
 } from "./styles"
 
 const APC_TOOLBAR_STYLE = `
-:scope .apc-mode-toolbar {
+:scope {
+  container-name: apc-toolbar;
+  container-type: inline-size;
+  min-inline-size: 0;
+}
+:scope .apc-mode-toolbar-shell {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
-  align-items: flex-start;
+  align-items: center;
+  min-inline-size: 0;
+}
+:scope .apc-mode-toolbar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  align-items: center;
+  min-inline-size: 0;
 }
 :scope .apc-mode-toolbar button {
+  min-inline-size: 0;
+  max-inline-size: 100%;
   color: inherit;
   background: var(--lumiverse-fill-subtle, transparent);
   border: 0.0625rem solid var(--lumiverse-border, currentColor);
@@ -101,13 +116,63 @@ const APC_TOOLBAR_STYLE = `
   color: var(--lumiverse-accent-fg, var(--lumiverse-text, CanvasText));
   background: var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
 }
-:scope .apc-mode-toolbar button:disabled {
+:scope .apc-mode-toolbar button:disabled,
+:scope .apc-mode-toolbar button[aria-disabled="true"] {
   cursor: not-allowed;
   opacity: 0.65;
 }
-:scope .apc-mode-toolbar button:focus-visible {
-  outline: 0.125rem solid var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
+:scope .apc-mode-toolbar .apc-disabled-reason {
+  flex: 1 0 100%;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
+  padding-inline: 0.25rem;
+}
+:scope .apc-mode-toolbar button:focus-visible,
+:scope .apc-mode-toolbar [tabindex]:focus-visible {
+  outline: 0.1875rem solid var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
   outline-offset: 0.125rem;
+  box-shadow: 0 0 0 0.125rem var(--lumiverse-fill, Canvas);
+}
+@container apc-toolbar (max-width: 48rem) {
+  :scope .apc-mode-toolbar-shell {
+    align-items: stretch;
+    inline-size: 100%;
+  }
+  :scope .apc-mode-toolbar {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    inline-size: 100%;
+  }
+  :scope .apc-mode-toolbar button {
+    inline-size: 100%;
+    text-align: center;
+  }
+  :scope .apc-mode-toolbar .apc-disabled-reason {
+    grid-column: 1 / -1;
+  }
+}
+@media (forced-colors: active) {
+  :scope,
+  :scope .apc-mode-toolbar,
+  :scope .apc-mode-toolbar button,
+  :scope .apc-mode-toolbar .apc-disabled-reason {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+    forced-color-adjust: auto;
+  }
+  :scope .apc-mode-toolbar button[aria-checked="true"] {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+  }
+  :scope .apc-mode-toolbar button:focus-visible,
+  :scope .apc-mode-toolbar [tabindex]:focus-visible {
+    outline-color: Highlight;
+    box-shadow: none;
+  }
 }
 `
 
@@ -116,7 +181,6 @@ export type ApcFrontendSetupErrorCode =
   | "HOST_API_UNAVAILABLE"
   | "PERMISSION_DENIED"
   | "CONNECTION_SELECTION_UNAVAILABLE"
-
 export class ApcFrontendSetupError extends Error {
   readonly code: ApcFrontendSetupErrorCode
   readonly missingPermissions: readonly string[]
@@ -142,6 +206,10 @@ type ThreadContinuationToken = Readonly<{
   thread: ThreadEditorController
   presetId: string
   threadId: string
+  revision: number
+  activeMode: ApcMode
+  executionKey: string | null
+  executionLockEpoch: number
   contextAuthorityGeneration: number
   consentAuthorityGeneration: number
 }>
@@ -164,6 +232,10 @@ type ModeTransitionOperation = Readonly<{
   generation: number
   mode: ApcMode
   presetId: string | null
+  revision: number
+  executionLockEpoch: number
+  contextAuthorityGeneration: number
+  consentAuthorityGeneration: number
 }>
 type ModeSurfaceProjection = Readonly<{
   presetId: string
@@ -833,7 +905,6 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
             timestamp: event.timestamp,
             kind: event.kind,
             ...(status === undefined ? {} : { status }),
-            ...(event.preview === undefined ? {} : { preview: event.preview }),
           }
         }),
       },
@@ -1256,9 +1327,7 @@ function moveRun(
       [config.activeMode]: candidatePipeline,
     },
   }
-  return validateConfigForMode(candidateConfig, config.activeMode).valid
-    ? candidateConfig
-    : config as ApcPresetConfigV1
+  return candidateConfig
 }
 
 function changeRun(
@@ -1324,6 +1393,7 @@ class ApcAppImpl implements ApcAppHandle {
   #boundConnectionKeysPresetId: string | null = null
   #threadContextAuthorityGeneration = 0
   #threadConsentAuthorityGeneration = 0
+  #authoritySnapshotKey: string | null = null
   #modeTransitionGeneration = 0
   #modeTransitionOperation: ModeTransitionOperation | null = null
   #modeSurfaceGeneration = 0
@@ -1627,10 +1697,31 @@ class ApcAppImpl implements ApcAppHandle {
     const generation = this.#modeTransitionGeneration >= Number.MAX_SAFE_INTEGER
       ? 0
       : this.#modeTransitionGeneration + 1
-    const operation = { generation, mode, presetId: this.#state.getSnapshot().presetId }
+    const snapshot = this.#state.getSnapshot()
+    const operation = {
+      generation,
+      mode,
+      presetId: snapshot.presetId,
+      revision: snapshot.revision,
+      executionLockEpoch: snapshot.executionLockEpoch,
+      contextAuthorityGeneration: this.#threadContextAuthorityGeneration,
+      consentAuthorityGeneration: this.#threadConsentAuthorityGeneration,
+    }
     this.#modeTransitionGeneration = generation
     this.#modeTransitionOperation = operation
     return operation
+  }
+  private rebaseModeTransition(operation: ModeTransitionOperation): ModeTransitionOperation {
+    const snapshot = this.#state.getSnapshot()
+    const rebased = {
+      ...operation,
+      revision: snapshot.revision,
+      executionLockEpoch: snapshot.executionLockEpoch,
+      contextAuthorityGeneration: this.#threadContextAuthorityGeneration,
+      consentAuthorityGeneration: this.#threadConsentAuthorityGeneration,
+    }
+    if (this.#modeTransitionOperation === operation) this.#modeTransitionOperation = rebased
+    return rebased
   }
 
   private isModeTransitionCurrent(operation: ModeTransitionOperation): boolean {
@@ -1639,6 +1730,10 @@ class ApcAppImpl implements ApcAppHandle {
       this.#activity.active &&
       snapshot.hydrated &&
       snapshot.presetId === operation.presetId &&
+      snapshot.revision === operation.revision &&
+      snapshot.executionLockEpoch === operation.executionLockEpoch &&
+      this.#threadContextAuthorityGeneration === operation.contextAuthorityGeneration &&
+      this.#threadConsentAuthorityGeneration === operation.consentAuthorityGeneration &&
       this.#modeTransitionGeneration === operation.generation &&
       this.#modeTransitionOperation === operation
   }
@@ -1760,6 +1855,10 @@ class ApcAppImpl implements ApcAppHandle {
       thread,
       presetId: this.#presetId,
       threadId,
+      revision: snapshot.revision,
+      activeMode: snapshot.activeMode,
+      executionKey: snapshot.execution.executionKey,
+      executionLockEpoch: snapshot.executionLockEpoch,
       contextAuthorityGeneration: this.#threadContextAuthorityGeneration,
       consentAuthorityGeneration: this.#threadConsentAuthorityGeneration,
     }
@@ -1778,17 +1877,36 @@ class ApcAppImpl implements ApcAppHandle {
     }
   }
 
+  private rebaseThreadContinuation(
+    token: ThreadContinuationToken,
+    expectedRevisionDelta = 1,
+  ): ThreadContinuationToken | null {
+    const current = this.captureThreadContinuation(token.thread)
+    if (
+      current === null ||
+      current.threadId !== token.threadId ||
+      current.executionKey !== token.executionKey ||
+      current.executionLockEpoch !== token.executionLockEpoch ||
+      current.activeMode !== token.activeMode ||
+      current.revision !== token.revision + expectedRevisionDelta
+    ) return null
+    return current
+  }
   private isThreadContinuationActive(token: ThreadContinuationToken): boolean {
+    const snapshot = this.#state.getSnapshot()
     return !this.#disposed &&
       this.#activity.active &&
       (this.#threadConfiguration === token.thread || this.#threadWorkspace === token.thread) &&
       this.#presetId === token.presetId &&
+      snapshot.presetId === token.presetId &&
+      snapshot.revision === token.revision &&
+      snapshot.activeMode === token.activeMode &&
+      snapshot.execution.executionKey === token.executionKey &&
+      snapshot.executionLockEpoch === token.executionLockEpoch &&
       this.#threadContextAuthorityGeneration === token.contextAuthorityGeneration &&
       this.#threadConsentAuthorityGeneration === token.consentAuthorityGeneration &&
-      this.#state.getSnapshot().presetId === token.presetId &&
-      selectionThreadId(this.#state.getSnapshot()) === token.threadId
+      selectionThreadId(snapshot) === token.threadId
   }
-
   private async resolveSelectedConsent(
     force = false,
     token?: ThreadContinuationToken,
@@ -1979,10 +2097,10 @@ class ApcAppImpl implements ApcAppHandle {
       )),
     }
     const graphCallbacks = {
-      onConfigChange: (config: ApcPresetConfigV1, mutation: GraphEditorMutation) => this.configChanged(
-        config,
-        mutation.type === "mode" ? mutation.mode : undefined,
-      ),
+      onConfigChange: (config: ApcPresetConfigV1, mutation: GraphEditorMutation) => {
+        if (mutation.type === "config" && mutation.reason === "connection-slot-removed") return
+        this.configChanged(config, mutation.type === "mode" ? mutation.mode : undefined)
+      },
       onAddConnectionSlot: (slot: ApcPresetConfigV1["connectionSlots"][number]) => {
         if (this.#consentReviewOpen) return
         this.#state.updateConfig((config) => {
@@ -2011,6 +2129,11 @@ class ApcAppImpl implements ApcAppHandle {
         if (this.#disposed || !this.#activity.active || this.#consentReviewOpen) return
         const operationSnapshot = this.#state.getSnapshot()
         const operationPresetId = operationSnapshot.presetId
+        const operationRevision = operationSnapshot.revision
+        const operationExecutionKey = operationSnapshot.execution.executionKey
+        const operationExecutionLockEpoch = operationSnapshot.executionLockEpoch
+        const operationContextAuthorityGeneration = this.#threadContextAuthorityGeneration
+        const operationConsentAuthorityGeneration = this.#threadConsentAuthorityGeneration
         const binding = operationSnapshot.connectionBindings[slotId]
         if (binding?.bound === true) {
           try {
@@ -2021,11 +2144,17 @@ class ApcAppImpl implements ApcAppHandle {
             throw error
           }
         }
+        const currentSnapshot = this.#state.getSnapshot()
         if (
           this.#disposed ||
           !this.#activity.active ||
           this.#consentReviewOpen ||
-          this.#state.getSnapshot().presetId !== operationPresetId
+          currentSnapshot.presetId !== operationPresetId ||
+          currentSnapshot.revision !== operationRevision ||
+          currentSnapshot.execution.executionKey !== operationExecutionKey ||
+          currentSnapshot.executionLockEpoch !== operationExecutionLockEpoch ||
+          this.#threadContextAuthorityGeneration !== operationContextAuthorityGeneration ||
+          this.#threadConsentAuthorityGeneration !== operationConsentAuthorityGeneration
         ) return
         this.#state.updateConfig((config) => {
           if (
@@ -2187,13 +2316,15 @@ class ApcAppImpl implements ApcAppHandle {
           this.activateCurrentModeSurface()
           return
         }
-        void this.#state.setActiveMode(mode).then((saved) => {
-          if (!this.isModeTransitionCurrent(operation)) return
+        const transition = this.#state.setActiveMode(mode)
+        const currentOperation = this.rebaseModeTransition(operation)
+        void transition.then((saved) => {
+          if (!this.isModeTransitionCurrent(currentOperation)) return
           const snapshot = this.#state.getSnapshot()
           if (!saved) {
             this.queueModeSurface(snapshot)
             this.#toolbar.root.querySelector<HTMLElement>(
-              `[data-action="select-mode"][data-mode="${operation.mode}"]`,
+              `[data-action="select-mode"][data-mode="${currentOperation.mode}"]`,
             )?.focus()
             return
           }
@@ -2201,15 +2332,15 @@ class ApcAppImpl implements ApcAppHandle {
             saved &&
             snapshot.hydrated &&
             snapshot.presetId !== null &&
-            snapshot.activeMode === operation.mode
+            snapshot.activeMode === currentOperation.mode
           ) {
             void this.resolveSelectedConsent()
           }
         }).catch(() => {
-          if (!this.isModeTransitionCurrent(operation)) return
+          if (!this.isModeTransitionCurrent(currentOperation)) return
           this.queueModeSurface(this.#state.getSnapshot())
           const control = this.#toolbar.root.querySelector<HTMLElement>(
-            `[data-action="select-mode"][data-mode="${operation.mode}"]`,
+            `[data-action="select-mode"][data-mode="${currentOperation.mode}"]`,
           )
           control?.focus()
         })
@@ -2220,8 +2351,20 @@ class ApcAppImpl implements ApcAppHandle {
       // Graph controls are observational while the host is changing presets.
     }
   }
+  private refreshContinuationAuthority(snapshot: ApcFrontendSnapshot): void {
+    const key = JSON.stringify([snapshot.presetId, snapshot.revision, snapshot.stale])
+    if (key === this.#authoritySnapshotKey) return
+    this.#authoritySnapshotKey = key
+    this.#threadContextAuthorityGeneration = this.#threadContextAuthorityGeneration >= Number.MAX_SAFE_INTEGER
+      ? 0
+      : this.#threadContextAuthorityGeneration + 1
+    this.#threadConsentAuthorityGeneration = this.#threadConsentAuthorityGeneration >= Number.MAX_SAFE_INTEGER
+      ? 0
+      : this.#threadConsentAuthorityGeneration + 1
+  }
   render(snapshot: ApcFrontendSnapshot): void {
     if (this.#disposed || !this.#activity.active) return
+    this.refreshContinuationAuthority(snapshot)
     if (
       snapshot.execution.executionKey === null ||
       !snapshot.execution.terminal
@@ -2360,8 +2503,10 @@ class ApcAppImpl implements ApcAppHandle {
             ? { ...thread, workspaceSource }
             : thread),
         }))
-        await this.resolveSelectedConsent(true, token)
-        this.advanceThreadContextAuthority(token)
+        const rebound = this.rebaseThreadContinuation(token)
+        if (rebound === null) return
+        await this.resolveSelectedConsent(true, rebound)
+        this.advanceThreadContextAuthority(rebound)
       },
       onConnectionSlotChange: async (threadId, slotId) => {
         if (this.#consentReviewOpen) return
@@ -2376,8 +2521,10 @@ class ApcAppImpl implements ApcAppHandle {
             return withoutSlot
           }),
         }))
-        await this.resolveSelectedConsent(true, token)
-        this.advanceThreadContextAuthority(token)
+        const rebound = this.rebaseThreadContinuation(token)
+        if (rebound === null) return
+        await this.resolveSelectedConsent(true, rebound)
+        this.advanceThreadContextAuthority(rebound)
       },
       onRunChange: (runId, change) => {
         if (this.#consentReviewOpen) return change.position === undefined ? undefined : false

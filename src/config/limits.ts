@@ -7,6 +7,9 @@ export const MAX_RUN_TIMEOUT_MS = 240_000
 export const HOST_NONCOMMIT_CANCEL_GRACE_MS = 1_000
 
 export const MAX_CONFIG_BYTES = 1_048_576
+export const MAX_PLAIN_JSON_DEPTH = 128
+export const MAX_PLAIN_JSON_NODES = 65_536
+export const MAX_PLAIN_JSON_PATH_CHARS = 4_096
 export const MAX_CONNECTION_SLOTS = 16
 export const MAX_THREADS = 16
 export const MAX_STAGES_PER_PIPELINE = 32

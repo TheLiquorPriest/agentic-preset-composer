@@ -735,6 +735,22 @@ export function reduceBindingIntent(
       return fail("Binding intent is missing binding fields")
     }
     const key = buildBindingKey(binding.presetId, binding.slotId)
+    const previous = bindings[key]
+    if (
+      previous !== undefined &&
+      (
+        previous.connectionSourceKey !== binding.connectionSourceKey ||
+        previous.connectionId !== binding.connectionId ||
+        previous.dispatchRevision !== binding.dispatchRevision
+      )
+    ) {
+      const sourceKey = `slot:${binding.slotId}`
+      for (const [consentKey, consent] of Object.entries(consents)) {
+        if (consent.presetId === binding.presetId && consent.connectionSourceKey === sourceKey) {
+          delete consents[consentKey]
+        }
+      }
+    }
     bindings[key] = binding
   }
 

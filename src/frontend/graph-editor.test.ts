@@ -783,6 +783,27 @@ describe("APC compact graph editor", () => {
     existing.handle.destroy()
   })
 
+  test("changes only finalResponse when selecting a final route", () => {
+    const config = baseConfig("parallel")
+    const pipeline = config.pipelines.parallel
+    if (!pipeline) throw new Error("parallel pipeline missing")
+    pipeline.finalResponse = { source: "thread", runId: IDS.runA }
+    const beforeStages = structuredClone(pipeline.stages)
+    const mounted = mount({
+      ...configuredSnapshot("parallel", { kind: "run", runId: IDS.runA }),
+      config,
+    })
+
+    click(mounted.root, '[data-action="final-main"]')
+
+    expect(mounted.getSnapshot().config?.pipelines.parallel?.finalResponse).toEqual({
+      source: "main",
+      inputs: [{ source: "output", runId: IDS.runA, onMissing: "fail-graph" }],
+    })
+    expect(mounted.getSnapshot().config?.pipelines.parallel?.stages).toEqual(beforeStages)
+    mounted.handle.destroy()
+  })
+
   test("rejects optional selected runs for both final routes and preserves a repairable graph", () => {
     const config = baseConfig("parallel")
     const announcements: string[] = []
@@ -860,7 +881,7 @@ describe("APC compact graph editor", () => {
       runId: IDS.runA,
     })
     const switched = bound.getSnapshot().config
-    expect(switched ? validateConfigForMode(switched, "parallel").valid : false).toBe(true)
+    expect(switched?.pipelines.parallel?.stages).toEqual(config.pipelines.parallel?.stages)
 
     const unavailable = mount({
       ...configuredSnapshot("parallel", { kind: "run", runId: IDS.runA }),
@@ -1053,6 +1074,275 @@ describe("APC compact graph editor", () => {
     expect(mounted.getSnapshot().config?.connectionSlots).toHaveLength(MAX_CONNECTION_SLOTS)
     expect((mounted.root.querySelector('[data-action="add-connection-slot"]') as HTMLButtonElement).disabled).toBe(true)
     mounted.handle.destroy()
+  })
+
+  test("delivers specialized slot callbacks and generic observers exactly once", () => {
+    let configChanges = 0
+    let mutations = 0
+    let added = 0
+    let renamed = 0
+    let removed = 0
+    const mounted = mount(configuredSnapshot("parallel"), {
+      onConfigChange: () => { configChanges += 1 },
+      onMutation: () => { mutations += 1 },
+      onAddConnectionSlot: () => { added += 1 },
+      onRenameConnectionSlot: () => { renamed += 1 },
+      onRemoveConnectionSlot: () => { removed += 1 },
+    })
+
+    click(mounted.root, '[data-action="add-connection-slot"]')
+    expect({ configChanges, mutations, added, renamed, removed }).toEqual({
+      configChanges: 1,
+      mutations: 1,
+      added: 1,
+      renamed: 0,
+      removed: 0,
+    })
+    const input = mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")
+    if (!input) throw new Error("connection slot input missing")
+    input.value = "Primary"
+    input.dispatchEvent(new browser.window.Event("change", { bubbles: true }))
+    expect({ configChanges, mutations, added, renamed, removed }).toEqual({
+      configChanges: 2,
+      mutations: 2,
+      added: 1,
+      renamed: 1,
+      removed: 0,
+    })
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+    expect({ configChanges, mutations, added, renamed, removed }).toEqual({
+      configChanges: 3,
+      mutations: 3,
+      added: 1,
+      renamed: 1,
+      removed: 1,
+    })
+    mounted.handle.destroy()
+  })
+
+  test("rolls back a rejected specialized slot mutation without generic bookkeeping", async () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(982)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    const before = structuredClone(config)
+    const mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRemoveConnectionSlot: () => Promise.reject(new Error("private removal failure")),
+    })
+
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(mounted.getSnapshot().config).toEqual(before)
+    expect(mounted.mutations).toHaveLength(0)
+    expect(mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")?.value)
+      .toBe("Primary")
+    mounted.handle.destroy()
+  })
+
+  test("rolls back a rejected slot mutation after an optimistic cloned render", async () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(983)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    const before = structuredClone(config)
+    let mounted: Mounted
+    mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRemoveConnectionSlot: () => {
+        const echoed = structuredClone(before)
+        echoed.connectionSlots = []
+        mounted.handle.render({
+          ...mounted.getSnapshot(),
+          config: echoed,
+          activeMode: "parallel",
+        })
+        return Promise.reject(new Error("private removal failure"))
+      },
+    })
+
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(mounted.getSnapshot().config).toEqual(before)
+    expect(mounted.mutations).toHaveLength(0)
+    expect(mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")?.value)
+      .toBe("Primary")
+    expect((mounted.root.querySelector('[data-action="remove-connection-slot"]') as HTMLButtonElement).disabled)
+      .toBe(false)
+    mounted.handle.destroy()
+  })
+
+  test("preserves newer authoritative state when a pending slot mutation rejects", async () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(985)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    let rejectRemoval: ((reason: Error) => void) | undefined
+    const removal = new Promise<void>((_resolve, reject) => {
+      rejectRemoval = reject
+    })
+    const mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRemoveConnectionSlot: () => removal,
+    })
+
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+    expect(mounted.root.querySelector("[data-apc-connection-slot=true]")).toBeNull()
+
+    const authoritativeConfig = structuredClone(config)
+    authoritativeConfig.connectionSlots = []
+    mounted.handle.render({
+      ...configuredSnapshot("parallel"),
+      config: authoritativeConfig,
+      dirty: false,
+    })
+    rejectRemoval?.(new Error("stale removal rejected"))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(mounted.root.querySelector("[data-apc-connection-slot=true]")).toBeNull()
+    expect(mounted.mutations).toHaveLength(0)
+    mounted.handle.destroy()
+  })
+
+  test("preserves newer authoritative state when a slot callback renders then throws", () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(986)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    let mounted: Mounted
+    mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRemoveConnectionSlot: () => {
+        const authoritativeConfig = structuredClone(config)
+        authoritativeConfig.connectionSlots = []
+        mounted.handle.render({
+          ...configuredSnapshot("parallel"),
+          config: authoritativeConfig,
+          dirty: false,
+        })
+        throw new Error("stale removal failed synchronously")
+      },
+    })
+
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+
+    expect(mounted.root.querySelector("[data-apc-connection-slot=true]")).toBeNull()
+    expect(mounted.mutations).toHaveLength(0)
+    mounted.handle.destroy()
+  })
+
+  test("does not publish stale slot config after a newer synchronous render succeeds", () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(987)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    let mounted: Mounted
+    mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRemoveConnectionSlot: () => {
+        const authoritativeConfig = structuredClone(config)
+        authoritativeConfig.connectionSlots = [{ id: generatedId(988), label: "Concurrent" }]
+        mounted.handle.render({
+          ...configuredSnapshot("parallel"),
+          config: authoritativeConfig,
+          dirty: false,
+        })
+      },
+    })
+
+    click(mounted.root, '[data-action="remove-connection-slot"]')
+    click(mounted.root, '[data-action="confirm-removal"]')
+
+    expect(mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")?.value)
+      .toBe("Concurrent")
+    expect(mounted.mutations).toHaveLength(0)
+    mounted.handle.destroy()
+  })
+
+  test("does not reuse imported graph identifiers removed by a later render", () => {
+    const imported = baseConfig("parallel")
+    imported.connectionSlots = [{ id: generatedId(1), label: "Imported" }]
+    const mounted = mount(configuredSnapshot("parallel"), {
+      idFactory: () => generatedId(0),
+    })
+
+    mounted.handle.render({ ...configuredSnapshot("parallel"), config: imported })
+    mounted.handle.render(configuredSnapshot("parallel"))
+    click(mounted.root, '[data-action="add-connection-slot"]')
+
+    expect(mounted.getSnapshot().config?.connectionSlots[0]?.id).toBe(generatedId(2))
+    mounted.handle.destroy()
+  })
+
+  test("unlocks controls after a specialized callback renders before success bookkeeping", () => {
+    const config = baseConfig("parallel")
+    const slotId = generatedId(984)
+    config.connectionSlots = [{ id: slotId, label: "Primary" }]
+    let mounted: Mounted
+    mounted = mount({ ...configuredSnapshot("parallel"), config }, {
+      onRenameConnectionSlot: () => {
+        const echoed = structuredClone(config)
+        echoed.connectionSlots[0]!.label = "Updated"
+        mounted.handle.render({
+          ...mounted.getSnapshot(),
+          config: echoed,
+          activeMode: "parallel",
+        })
+      },
+    }, false)
+    const input = mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")!
+    input.value = "Updated"
+    input.dispatchEvent(new browser.window.Event("change", { bubbles: true }))
+
+    const currentInput = mounted.root.querySelector<HTMLInputElement>("[data-apc-connection-slot-label=true]")
+    expect(currentInput?.disabled).toBe(false)
+    expect(currentInput?.value).toBe("Updated")
+    mounted.handle.destroy()
+  })
+
+  test("gives repeated graph controls contextual labels and parallel stages list semantics", () => {
+    for (const mode of ["sequential", "parallel"] as const) {
+      const config = baseConfig(mode)
+      if (mode === "parallel") {
+        config.connectionSlots = [
+          { id: generatedId(980), label: "Primary" },
+          { id: generatedId(981), label: "Backup" },
+        ]
+      }
+      const mounted = mount({ ...configuredSnapshot(mode), config })
+      const stages = mounted.root.querySelector<HTMLElement>(".apc-topology-stages")
+      expect(stages?.getAttribute("role")).toBe("list")
+      const stageItems = mounted.root.querySelectorAll<HTMLElement>("[data-apc-stage=true]")
+      expect(stageItems).toHaveLength(config.pipelines[mode]!.stages.length)
+      expect([...stageItems].every((item) => item.getAttribute("role") === "listitem")).toBe(true)
+
+      const stageLabels = [...mounted.root.querySelectorAll<HTMLElement>('[data-action="remove-stage"]')]
+        .map((control) => control.getAttribute("aria-label") ?? "")
+      expect(new Set(stageLabels).size).toBe(stageLabels.length)
+      expect(stageLabels.join(" ")).toContain("Research")
+      expect(stageLabels.join(" ")).toContain(mode === "parallel" ? "Synthesis" : "Writing")
+
+      const runLabels = [...mounted.root.querySelectorAll<HTMLElement>('[data-action="remove-run"]')]
+        .map((control) => control.getAttribute("aria-label") ?? "")
+      expect(new Set(runLabels).size).toBe(runLabels.length)
+      expect(runLabels.join(" ")).toContain("Researcher")
+      expect(runLabels.join(" ")).toContain("Writer")
+
+      const threadLabels = [...mounted.root.querySelectorAll<HTMLElement>('[data-action="remove-thread"]')]
+        .map((control) => control.getAttribute("aria-label") ?? "")
+      expect(new Set(threadLabels).size).toBe(threadLabels.length)
+      expect(threadLabels.join(" ")).toContain("Researcher")
+      expect(threadLabels.join(" ")).toContain("Writer")
+
+      if (mode === "parallel") {
+        const slotLabels = [...mounted.root.querySelectorAll<HTMLElement>('[data-action="remove-connection-slot"]')]
+          .map((control) => control.getAttribute("aria-label") ?? "")
+        expect(new Set(slotLabels).size).toBe(slotLabels.length)
+        expect(slotLabels.join(" ")).toContain("Primary")
+        expect(slotLabels.join(" ")).toContain("Backup")
+      }
+      mounted.handle.destroy()
+    }
   })
 
   test("keeps a newly added parallel sibling reachable from the final response", () => {

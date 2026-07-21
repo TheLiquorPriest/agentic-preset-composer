@@ -20,6 +20,35 @@ const INSTALL_NONCE_PATTERN = /^[0-9a-f]{32}$/
 const TEMP_MARKER = ".tmp."
 const QUARANTINE_MARKER = ".quarantine."
 
+export const MAX_CLEANUP_ENUMERATION_ENTRIES = 1_024
+export const MAX_RETAINED_QUARANTINE_ARTIFACTS = 2
+
+type CanonicalPathListing = Readonly<{
+  paths: readonly string[]
+  count: number
+}>
+
+type PendingQuarantinePrune = Readonly<{
+  currentPath: string
+  previousToken: string | undefined
+}>
+
+function quarantineTokenForPath(canonicalPath: string, listedPath: string): string | undefined {
+  const separator = canonicalPath.lastIndexOf("/")
+  const directory = separator < 0 ? "" : canonicalPath.slice(0, separator)
+  const directoryPrefix = directory.length > 0 ? `${directory}/` : ""
+  const basename = separator < 0 ? canonicalPath : canonicalPath.slice(separator + 1)
+  const filename = listedPath.startsWith(directoryPrefix)
+    ? listedPath.slice(directoryPrefix.length)
+    : listedPath
+  const quarantinePrefix = `${basename}${QUARANTINE_MARKER}`
+  if (filename.length !== quarantinePrefix.length + 32 || !filename.startsWith(quarantinePrefix)) {
+    return undefined
+  }
+  const token = filename.slice(quarantinePrefix.length)
+  return INSTALL_NONCE_PATTERN.test(token) ? token : undefined
+}
+
 function normalizeListedPath(directory: string, listedPath: string): string | undefined {
   if (
     listedPath.length === 0 ||
@@ -196,9 +225,13 @@ export class AtomicJsonStore {
   private installRecord: InstallRecord | undefined
   private rotatedInstall = false
   private rotatedInstallToken: string | undefined
+  private rotatedPreviousInstallToken: string | undefined
+
   private readonly rotatedQuarantinesByPath = new Map<string, Promise<void>>()
   private readonly queues = new Map<string, Promise<void>>()
   private readonly tempCleanupByPath = new Map<string, Promise<void>>()
+  private readonly pendingQuarantinePrunes = new Map<string, PendingQuarantinePrune>()
+  private readonly pendingQuarantinePruneAttempts = new Map<string, Promise<void>>()
   private readonly activeTempPaths = new Set<string>()
   private lifecycleGeneration = 0
   private initializationBarrier: Promise<void> = Promise.resolve()
@@ -210,6 +243,34 @@ export class AtomicJsonStore {
     this.nonceGenerator = options.nonceGenerator ?? generateInstallNonce
     this.ownerToken = assertInstallNonce(this.nonceGenerator(), "Generated ownerToken")
   }
+  private async listDirectory(
+    directory: string,
+    canonicalPath: string,
+  ): Promise<CanonicalPathListing | undefined> {
+    let paths: readonly string[]
+    let count: number
+    try {
+      const list = this.storage.list
+      if (typeof list !== "function") return undefined
+      const listed = await list.call(this.storage, directory)
+      if (!Array.isArray(listed)) {
+        return fail("STORAGE_FAILURE", `Storage enumeration for ${canonicalPath} was not an array`)
+      }
+      count = listed.length
+      if (!Number.isSafeInteger(count) || count > MAX_CLEANUP_ENUMERATION_ENTRIES) {
+        return fail(
+          "STORAGE_FAILURE",
+          `Storage enumeration for ${canonicalPath} exceeds ${MAX_CLEANUP_ENUMERATION_ENTRIES} entries`,
+        )
+      }
+      paths = listed
+    } catch (error) {
+      if (error instanceof AtomicJsonStoreError) throw error
+      return fail("STORAGE_FAILURE", `Could not enumerate state files for ${canonicalPath}`, error)
+    }
+    return { paths, count }
+  }
+
 
   /**
    * Removes orphaned install-record temporary files before initialization.
@@ -220,8 +281,6 @@ export class AtomicJsonStore {
   }
 
   private async cleanupPathTemps(canonicalPath: string): Promise<void> {
-    if (typeof this.storage.list !== "function") return
-
     const separator = canonicalPath.lastIndexOf("/")
     const directory = separator < 0 ? "" : canonicalPath.slice(0, separator)
     const basename = separator < 0 ? canonicalPath : canonicalPath.slice(separator + 1)
@@ -231,35 +290,47 @@ export class AtomicJsonStore {
     const current = this.tempCleanupByPath.get(canonicalPath)
     if (current) return current
 
-    const list = this.storage.list.bind(this.storage)
     const cleanup = (async () => {
-      let paths: readonly string[]
+      const listing = await this.listDirectory(directory, canonicalPath)
+      if (listing === undefined) return
+      const { paths, count } = listing
       try {
-        paths = await list(directory)
-      } catch (error) {
-        return fail("STORAGE_FAILURE", `Could not enumerate temporary state files for ${canonicalPath}`, error)
-      }
-      for (const listedPath of paths) {
-        const normalizedPath = normalizeListedPath(directory, listedPath)
-        if (normalizedPath === undefined) continue
-        const filename = normalizedPath.startsWith(directoryPrefix)
-          ? normalizedPath.slice(directoryPrefix.length)
-          : normalizedPath
-        const isCanonicalTemp = filename.startsWith(tempFilenamePrefix)
-        const quarantineSuffix = filename.startsWith(quarantineTempPrefix)
-          ? filename.slice(quarantineTempPrefix.length)
-          : ""
-        const quarantineSeparator = quarantineSuffix.indexOf(TEMP_MARKER)
-        const isQuarantineTemp =
-          quarantineSeparator > 0 &&
-          INSTALL_NONCE_PATTERN.test(quarantineSuffix.slice(0, quarantineSeparator))
-        if (filename.includes("/") || (!isCanonicalTemp && !isQuarantineTemp)) continue
-        if (this.activeTempPaths.has(normalizedPath)) continue
-        try {
-          await this.storage.delete(normalizedPath)
-        } catch (error) {
-          return fail("STORAGE_FAILURE", `Could not remove stale temporary state file ${normalizedPath}`, error)
+        for (let index = 0; index < count; index += 1) {
+          const listedPath = paths[index]
+          if (typeof listedPath !== "string") {
+            return fail(
+              "STORAGE_FAILURE",
+              `Storage enumeration for ${canonicalPath} contains a non-string path`,
+            )
+          }
+          const normalizedPath = normalizeListedPath(directory, listedPath)
+          if (normalizedPath === undefined) continue
+          const filename = normalizedPath.startsWith(directoryPrefix)
+            ? normalizedPath.slice(directoryPrefix.length)
+            : normalizedPath
+          const isCanonicalTemp = filename.startsWith(tempFilenamePrefix)
+          const quarantineSuffix = filename.startsWith(quarantineTempPrefix)
+            ? filename.slice(quarantineTempPrefix.length)
+            : ""
+          const quarantineSeparator = quarantineSuffix.indexOf(TEMP_MARKER)
+          const isQuarantineTemp =
+            quarantineSeparator > 0 &&
+            INSTALL_NONCE_PATTERN.test(quarantineSuffix.slice(0, quarantineSeparator))
+          if (filename.includes("/") || (!isCanonicalTemp && !isQuarantineTemp)) continue
+          if (this.activeTempPaths.has(normalizedPath)) continue
+          try {
+            await this.storage.delete(normalizedPath)
+          } catch (error) {
+            return fail(
+              "STORAGE_FAILURE",
+              `Could not remove stale temporary state file ${normalizedPath}`,
+              error,
+            )
+          }
         }
+      } catch (error) {
+        if (error instanceof AtomicJsonStoreError) throw error
+        return fail("STORAGE_FAILURE", `Could not inspect temporary state files for ${canonicalPath}`, error)
       }
     })()
     this.tempCleanupByPath.set(canonicalPath, cleanup)
@@ -282,6 +353,93 @@ export class AtomicJsonStore {
     const scopeToken = this.rotatedInstallToken ?? this.ownerToken
     return `${canonicalPath}${QUARANTINE_MARKER}${scopeToken}`
   }
+
+  private async retryPendingQuarantinePrune(canonicalPath: string): Promise<void> {
+    const pending = this.pendingQuarantinePrunes.get(canonicalPath)
+    if (pending === undefined) return
+    const current = this.pendingQuarantinePruneAttempts.get(canonicalPath)
+    if (current !== undefined) return current
+
+    const attempt = (async () => {
+      await this.pruneQuarantineArtifacts(
+        canonicalPath,
+        pending.currentPath,
+        pending.previousToken,
+      )
+      if (this.pendingQuarantinePrunes.get(canonicalPath) === pending) {
+        this.pendingQuarantinePrunes.delete(canonicalPath)
+      }
+    })()
+    this.pendingQuarantinePruneAttempts.set(canonicalPath, attempt)
+    try {
+      await attempt
+    } finally {
+      if (this.pendingQuarantinePruneAttempts.get(canonicalPath) === attempt) {
+        this.pendingQuarantinePruneAttempts.delete(canonicalPath)
+      }
+    }
+  }
+
+  private async pruneQuarantineArtifacts(
+    canonicalPath: string,
+    currentPath: string,
+    previousToken: string | undefined,
+  ): Promise<void> {
+    const currentToken = quarantineTokenForPath(canonicalPath, currentPath)
+    if (currentToken === undefined) return
+
+    const separator = canonicalPath.lastIndexOf("/")
+    const directory = separator < 0 ? "" : canonicalPath.slice(0, separator)
+    const listing = await this.listDirectory(directory, canonicalPath)
+    if (listing === undefined) return
+
+    const candidates = new Map<string, string>()
+    try {
+      for (let index = 0; index < listing.count; index += 1) {
+        const listedPath = listing.paths[index]
+        if (typeof listedPath !== "string") {
+          return fail(
+            "STORAGE_FAILURE",
+            `Storage enumeration for ${canonicalPath} contains a non-string path`,
+          )
+        }
+        const normalizedPath = normalizeListedPath(directory, listedPath)
+        if (normalizedPath === undefined) continue
+        const token = quarantineTokenForPath(canonicalPath, normalizedPath)
+        if (token === undefined) continue
+        candidates.set(token, normalizedPath)
+      }
+    } catch (error) {
+      if (error instanceof AtomicJsonStoreError) throw error
+      return fail("STORAGE_FAILURE", `Could not inspect quarantine state for ${canonicalPath}`, error)
+    }
+
+    const keepTokens = new Set<string>([currentToken])
+    if (
+      keepTokens.size < MAX_RETAINED_QUARANTINE_ARTIFACTS &&
+      previousToken !== undefined &&
+      candidates.has(previousToken)
+    ) {
+      keepTokens.add(previousToken)
+    }
+    if (keepTokens.size < MAX_RETAINED_QUARANTINE_ARTIFACTS) {
+      const fallback = [...candidates.keys()]
+        .filter((token) => !keepTokens.has(token))
+        .sort()
+        .at(-1)
+      if (fallback !== undefined) keepTokens.add(fallback)
+    }
+
+    for (const [token, path] of candidates) {
+      if (keepTokens.has(token) || this.activeTempPaths.has(path)) continue
+      try {
+        await this.storage.delete(path)
+      } catch (error) {
+        return fail("STORAGE_FAILURE", `Could not prune quarantine state file ${path}`, error)
+      }
+    }
+  }
+
 
   private async ensureRotatedPathMarker(path: string): Promise<void> {
     const rotationToken = this.rotatedInstallToken
@@ -361,21 +519,29 @@ export class AtomicJsonStore {
     const previousBarrier = this.initializationBarrier
     const previousGeneration = this.lifecycleGeneration
     let release!: () => void
-    const transition = new Promise<void>((resolve) => {
+    let rejectTransition!: (reason?: unknown) => void
+    const transition = new Promise<void>((resolve, reject) => {
       release = resolve
+      rejectTransition = reject
     })
     this.lifecycleGeneration = previousGeneration + 1
-    this.initializationBarrier = previousBarrier.then(() => transition)
+    this.initializationBarrier = previousBarrier.then(
+      () => transition,
+      () => transition,
+    )
+    void transition.catch(() => undefined)
+    void this.initializationBarrier.catch(() => undefined)
     const activeBefore = [...this.activeOperations.entries()]
       .filter(([, generation]) => generation <= previousGeneration)
       .map(([operation]) => operation)
 
     try {
-      await previousBarrier
+      await previousBarrier.then(() => undefined, () => undefined)
       await Promise.all(
         activeBefore.map((operation) => operation.then(() => undefined, () => undefined)),
       )
       await this.cleanupStartupTemps()
+      await this.retryPendingQuarantinePrune(this.installRecordPath)
       const hostId = assertHostInstallationId(hostInstallationId)
       const raw = await this.readExisting(this.installRecordPath)
 
@@ -395,6 +561,8 @@ export class AtomicJsonStore {
         this.installRecord = created
         this.rotatedInstall = false
         this.rotatedInstallToken = undefined
+        this.rotatedPreviousInstallToken = undefined
+        release()
         return created
       }
 
@@ -416,6 +584,8 @@ export class AtomicJsonStore {
         this.installRecord = prior
         this.rotatedInstall = rotated
         this.rotatedInstallToken = rotated ? prior.installNonce : undefined
+        if (!rotated) this.rotatedPreviousInstallToken = undefined
+        release()
         return prior
       }
 
@@ -431,9 +601,29 @@ export class AtomicJsonStore {
       this.installRecord = next
       this.rotatedInstall = true
       this.rotatedInstallToken = rotationToken
-      return next
-    } finally {
+      this.rotatedPreviousInstallToken = prior.installNonce
+      const pending = Object.freeze({
+        currentPath: quarantinePath,
+        previousToken: prior.installNonce,
+      })
+      try {
+        await this.pruneQuarantineArtifacts(
+          this.installRecordPath,
+          quarantinePath,
+          prior.installNonce,
+        )
+      } catch {
+        this.pendingQuarantinePrunes.set(this.installRecordPath, pending)
+      }
       release()
+      return next
+    } catch (error) {
+      this.installRecord = undefined
+      this.rotatedInstall = false
+      this.rotatedInstallToken = undefined
+      this.rotatedPreviousInstallToken = undefined
+      rejectTransition(error)
+      throw error
     }
   }
 
@@ -484,6 +674,22 @@ export class AtomicJsonStore {
       } catch (error) {
         return fail("STORAGE_FAILURE", `Could not quarantine rotated state path ${path}`, error)
       }
+      try {
+        await this.pruneQuarantineArtifacts(
+          path,
+          quarantinePath,
+          this.rotatedPreviousInstallToken,
+        )
+      } catch (error) {
+        this.pendingQuarantinePrunes.set(
+          path,
+          Object.freeze({
+            currentPath: quarantinePath,
+            previousToken: this.rotatedPreviousInstallToken,
+          }),
+        )
+        throw error
+      }
     })()
     this.rotatedQuarantinesByPath.set(path, operation)
 
@@ -511,6 +717,7 @@ export class AtomicJsonStore {
   private async readLatestInternal(userId: string, presetId: string): Promise<ReadResult> {
     this.requireInstallRecord()
     const path = buildBindingDocumentKey(userId, presetId)
+    await this.retryPendingQuarantinePrune(path)
     await this.cleanupPathTemps(path)
     await this.quarantineRotatedDocument(path)
     const raw = await this.readExisting(path)
@@ -595,6 +802,18 @@ export class AtomicJsonStore {
     const path = latest.path
     await this.ensureRotatedPathMarker(path)
     await this.persistJsonAtomically(path, serialize(persisted, path))
+    if (this.rotatedInstall && this.rotatedInstallToken !== undefined) {
+      const currentPath = this.nextQuarantinePath(path)
+      const pending = Object.freeze({
+        currentPath,
+        previousToken: this.rotatedPreviousInstallToken,
+      })
+      try {
+        await this.pruneQuarantineArtifacts(path, currentPath, this.rotatedPreviousInstallToken)
+      } catch {
+        this.pendingQuarantinePrunes.set(path, pending)
+      }
+    }
     // The revision is intentionally created only in the value moved to the canonical path.
     return decodeBindingConsentDocument(persisted, presetId)
   }

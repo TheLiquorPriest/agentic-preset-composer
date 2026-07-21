@@ -27,7 +27,7 @@ const SOURCE_KEY_PATTERN = /^slot:([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89a
 const CONSENT_CACHE_TTL_MS = 5 * 60 * 1_000
 const DEFAULT_CONSENT_CACHE_CAP = MAX_THREADS * (MAX_CONNECTION_SLOTS + 1) * 2
 const DEFAULT_CONSENT_SCOPE_CAP = (MAX_CONNECTION_SLOTS + 1) * 2
-const DOCUMENT_MUTATION_QUEUES = new WeakMap<AtomicJsonStore, Map<string, Promise<void>>>()
+const CONSENT_DISCLOSURE_INSTALL_PAIR = Symbol("consentDisclosureInstallPair")
 
 type BoundedCacheEntry<T> = Readonly<{
   key: string
@@ -391,6 +391,11 @@ function assertInstallPair(pair: InstallPair): InstallPair {
   })
 }
 
+function sameInstallPair(left: InstallPair, right: InstallPair): boolean {
+  return left.extensionInstallationId === right.extensionInstallationId &&
+    left.installNonce === right.installNonce
+}
+
 function sourceKey(value: unknown): ConsentSourceKey {
   if (value === "main") return value
   if (typeof value !== "string" || !SOURCE_KEY_PATTERN.test(value)) {
@@ -569,66 +574,90 @@ function snapshotFromDocument(
 
 type NormalizedConsentDisclosure = ConsentDisclosure & Readonly<{
   disclosureVersion: number
+  [CONSENT_DISCLOSURE_INSTALL_PAIR]?: InstallPair
 }>
 
 type ConsentEphemeralState = Readonly<{
+  pair: InstallPair
   pendingDisclosures: BoundedScopedCache<NormalizedConsentDisclosure>
   revokedSelectors: BoundedScopedCache<true>
+  documentMutationQueues: Map<string, Promise<void>>
+  disclosureProvenance: WeakMap<object, InstallPair>
 }>
 
 const CONSENT_EPHEMERAL_STATES = new WeakMap<AtomicJsonStore, ConsentEphemeralState>()
 
+function createConsentEphemeralState(
+  pair: InstallPair,
+  now: () => number,
+  pendingCap: number,
+  revokedCap: number,
+): ConsentEphemeralState {
+  return {
+    pair,
+    pendingDisclosures: new BoundedScopedCache<NormalizedConsentDisclosure>({
+      now,
+      ttlMs: CONSENT_CACHE_TTL_MS,
+      maxEntries: pendingCap,
+      maxEntriesPerScope: Math.min(pendingCap, DEFAULT_CONSENT_SCOPE_CAP),
+    }),
+    revokedSelectors: new BoundedScopedCache<true>({
+      now,
+      ttlMs: CONSENT_CACHE_TTL_MS,
+      maxEntries: revokedCap,
+      maxEntriesPerScope: Math.min(revokedCap, DEFAULT_CONSENT_SCOPE_CAP),
+    }),
+    documentMutationQueues: new Map<string, Promise<void>>(),
+    disclosureProvenance: new WeakMap<object, InstallPair>(),
+  }
+}
+
 export class ConsentService {
   private readonly store: AtomicJsonStore
   private readonly disclosureVersion: number
-  private readonly pendingDisclosures: BoundedScopedCache<NormalizedConsentDisclosure>
-  private readonly revokedSelectors: BoundedScopedCache<true>
-  private readonly documentMutationQueues: Map<string, Promise<void>>
+  private readonly cacheNow: () => number
+  private readonly pendingDisclosureCap: number
+  private readonly revokedSelectorCap: number
 
   constructor(dependencies: ConsentServiceDependencies) {
     this.store = dependencies.store
     this.disclosureVersion = disclosureVersion(dependencies.disclosureVersion, 1)
-    const queues = DOCUMENT_MUTATION_QUEUES.get(this.store)
-    if (queues === undefined) {
-      this.documentMutationQueues = new Map<string, Promise<void>>()
-      DOCUMENT_MUTATION_QUEUES.set(this.store, this.documentMutationQueues)
-    } else {
-      this.documentMutationQueues = queues
-    }
-    const existingState = CONSENT_EPHEMERAL_STATES.get(this.store)
-    if (existingState !== undefined) {
-      this.pendingDisclosures = existingState.pendingDisclosures
-      this.revokedSelectors = existingState.revokedSelectors
-      return
-    }
-    const now = cacheClock(dependencies.now)
-    const pendingCap = cacheCapacity(
+    this.cacheNow = cacheClock(dependencies.now)
+    this.pendingDisclosureCap = cacheCapacity(
       dependencies.pendingDisclosureCap,
       DEFAULT_CONSENT_CACHE_CAP,
       "pendingDisclosureCap",
     )
-    const revokedCap = cacheCapacity(
+    this.revokedSelectorCap = cacheCapacity(
       dependencies.revokedSelectorCap,
       DEFAULT_CONSENT_CACHE_CAP,
       "revokedSelectorCap",
     )
-    const state: ConsentEphemeralState = {
-      pendingDisclosures: new BoundedScopedCache<NormalizedConsentDisclosure>({
-        now,
-        ttlMs: CONSENT_CACHE_TTL_MS,
-        maxEntries: pendingCap,
-        maxEntriesPerScope: Math.min(pendingCap, DEFAULT_CONSENT_SCOPE_CAP),
-      }),
-      revokedSelectors: new BoundedScopedCache<true>({
-        now,
-        ttlMs: CONSENT_CACHE_TTL_MS,
-        maxEntries: revokedCap,
-        maxEntriesPerScope: Math.min(revokedCap, DEFAULT_CONSENT_SCOPE_CAP),
-      }),
+  }
+
+
+  private ensureCurrentState(): ConsentEphemeralState {
+    const pair = assertInstallPair(this.store.getInstallPair())
+    const existing = CONSENT_EPHEMERAL_STATES.get(this.store)
+    if (existing !== undefined && sameInstallPair(existing.pair, pair)) {
+      return existing
     }
+    const state = createConsentEphemeralState(
+      pair,
+      this.cacheNow,
+      this.pendingDisclosureCap,
+      this.revokedSelectorCap,
+    )
     CONSENT_EPHEMERAL_STATES.set(this.store, state)
-    this.pendingDisclosures = state.pendingDisclosures
-    this.revokedSelectors = state.revokedSelectors
+    return state
+  }
+
+  private assertCurrentInstallPair(expectedPair: InstallPair): ConsentEphemeralState {
+    const state = this.ensureCurrentState()
+    if (!sameInstallPair(state.pair, expectedPair)) {
+      return fail("INSTALL_MISMATCH", "Consent operation belongs to another installation")
+    }
+    return state
   }
 
   private enqueueDocumentMutation<T>(
@@ -636,21 +665,33 @@ export class ConsentService {
     presetId: string,
     operation: () => Promise<T>,
   ): Promise<T> {
+    const state = this.ensureCurrentState()
+    const pair = state.pair
+    const queues = state.documentMutationQueues
     const key = documentScope(userId, presetId)
-    const prior = this.documentMutationQueues.get(key) ?? Promise.resolve()
-    const next = prior.then(operation, operation)
+    const prior = queues.get(key) ?? Promise.resolve()
+    const run = () => {
+      this.assertCurrentInstallPair(pair)
+      return operation()
+    }
+    const next = prior.then(run, run)
     const settledTail = next.then(
       () => undefined,
       () => undefined,
     )
-    this.documentMutationQueues.set(key, settledTail)
+    queues.set(key, settledTail)
     void settledTail.then(() => {
-      if (this.documentMutationQueues.get(key) === settledTail) this.documentMutationQueues.delete(key)
+      if (queues.get(key) === settledTail) queues.delete(key)
     })
     return next
   }
 
   private normalizeDisclosure(input: ConsentDisclosure): NormalizedConsentDisclosure {
+    const state = this.ensureCurrentState()
+    const capturedPair = (input as Partial<NormalizedConsentDisclosure>)[CONSENT_DISCLOSURE_INSTALL_PAIR]
+    if (capturedPair !== undefined && !sameInstallPair(assertInstallPair(capturedPair), state.pair)) {
+      return fail("INSTALL_MISMATCH", "Consent disclosure belongs to another installation")
+    }
     const userId = identity(input.userId, "disclosure.userId")
     const presetId = uuid(input.presetId, "disclosure.presetId")
     const threadId = text(input.threadId, "disclosure.threadId")
@@ -662,7 +703,7 @@ export class ConsentService {
       return fail("WRONG_USER", "Disclosure descriptor does not match the connection source")
     }
     const normalizedDisclosureVersion = disclosureVersion(input.disclosureVersion, this.disclosureVersion)
-    return Object.freeze({
+    const normalized = {
       userId,
       presetId,
       threadId,
@@ -671,12 +712,20 @@ export class ConsentService {
       connectionId: normalizedConnectionId,
       descriptor,
       disclosureVersion: normalizedDisclosureVersion,
+    }
+    Object.defineProperty(normalized, CONSENT_DISCLOSURE_INSTALL_PAIR, {
+      value: state.pair,
+      enumerable: false,
     })
+    return Object.freeze(normalized) as NormalizedConsentDisclosure
   }
 
   rememberDisclosure(input: ConsentDisclosure): NormalizedConsentDisclosure {
+    const state = this.ensureCurrentState()
     const normalized = this.normalizeDisclosure(input)
-    this.pendingDisclosures.set(
+    state.disclosureProvenance.set(input, state.pair)
+    state.disclosureProvenance.set(normalized, state.pair)
+    state.pendingDisclosures.set(
       pendingKey(normalized),
       consentScope(normalized.userId, normalized.presetId, normalized.threadId),
       normalized,
@@ -693,12 +742,13 @@ export class ConsentService {
    * exposing the private installation, user, or dispatch fields to callers.
    */
   resolveDisclosure(userIdInput: string, selector: ConsentSelector): ConsentDisclosure | undefined {
+    const state = this.ensureCurrentState()
     const userId = identity(userIdInput, "userId")
     const presetId = uuid(selector.presetId, "selector.presetId")
     const threadId = text(selector.threadId, "selector.threadId")
     const workspaceSource = selector.workspaceSource === undefined ? undefined : workspace(selector.workspaceSource)
     const connectionSourceKey = selector.connectionSourceKey === undefined ? undefined : sourceKey(selector.connectionSourceKey)
-    const candidates = this.pendingDisclosures.entries()
+    const candidates = state.pendingDisclosures.entries()
       .map((entry) => entry.value)
       .filter((disclosure) => disclosure.userId === userId && disclosure.presetId === presetId && disclosure.threadId === threadId)
       .filter((disclosure) => workspaceSource === undefined || disclosure.workspaceSource === workspaceSource)
@@ -707,8 +757,8 @@ export class ConsentService {
     if (candidates.length !== 1) return undefined
     const candidate = candidates[0]
     if (candidate === undefined) return undefined
-    this.pendingDisclosures.touch(pendingKey(candidate))
-    return Object.freeze({
+    state.pendingDisclosures.touch(pendingKey(candidate))
+    const resolved = {
       userId: candidate.userId,
       presetId: candidate.presetId,
       threadId: candidate.threadId,
@@ -717,7 +767,13 @@ export class ConsentService {
       connectionId: candidate.connectionId,
       descriptor: candidate.descriptor,
       disclosureVersion: candidate.disclosureVersion,
+    }
+    Object.defineProperty(resolved, CONSENT_DISCLOSURE_INSTALL_PAIR, {
+      value: state.pair,
+      enumerable: false,
     })
+    state.disclosureProvenance.set(resolved, state.pair)
+    return Object.freeze(resolved)
   }
 
   private disclosureToRecord(
@@ -729,12 +785,37 @@ export class ConsentService {
     descriptor?: HostDispatchDescriptor
     pendingDisclosure?: NormalizedConsentDisclosure
   } {
+    const state = this.ensureCurrentState()
     const userId = identity(userIdInput, "userId")
     if (input.disclosure !== undefined) {
+      const requestedPresetId = input.presetId === undefined ? undefined : uuid(input.presetId, "presetId")
+      if (requestedPresetId !== undefined) {
+        const disclosedPresetId = uuid(input.disclosure.presetId, "disclosure.presetId")
+        if (requestedPresetId !== disclosedPresetId) {
+          return fail("WRONG_USER", "Consent preset identity mismatch")
+        }
+      }
+      const disclosureUserId = identity(input.disclosure.userId, "disclosure.userId")
+      if (disclosureUserId !== userId) return fail("WRONG_USER", "Disclosure belongs to another user")
+      const markerPair = (input.disclosure as Partial<NormalizedConsentDisclosure>)[CONSENT_DISCLOSURE_INSTALL_PAIR]
+      const capturedPair = markerPair ?? state.disclosureProvenance.get(input.disclosure)
+      if (capturedPair === undefined) {
+        return fail("MISSING_DISCLOSURE", "Grant requires a current host disclosure")
+      }
+      if (!sameInstallPair(assertInstallPair(capturedPair), state.pair)) {
+        return fail("INSTALL_MISMATCH", "Consent disclosure belongs to another installation")
+      }
       const disclosure = this.normalizeDisclosure(input.disclosure)
+      if (requestedPresetId !== undefined && disclosure.presetId !== requestedPresetId) {
+        return fail("WRONG_USER", "Consent preset identity mismatch")
+      }
       if (disclosure.userId !== userId) return fail("WRONG_USER", "Disclosure belongs to another user")
-      const currentDisclosure = this.pendingDisclosures.get(pendingKey(disclosure))
+      const currentDisclosure = state.pendingDisclosures.get(pendingKey(disclosure))
       if (currentDisclosure === undefined) return fail("MISSING_DISCLOSURE", "Grant requires a current host disclosure")
+      const currentPair = currentDisclosure[CONSENT_DISCLOSURE_INSTALL_PAIR]
+      if (currentPair === undefined || !sameInstallPair(currentPair, state.pair)) {
+        return fail("INSTALL_MISMATCH", "Consent disclosure belongs to another installation")
+      }
       const currentDescriptor = currentDisclosure.descriptor
       const candidateDescriptor = disclosure.descriptor
       if (
@@ -749,7 +830,6 @@ export class ConsentService {
       ) {
         return fail("STALE_CONSENT", "Consent disclosure is no longer current")
       }
-      const pair = assertInstallPair(this.store.getInstallPair())
       const descriptor = cloneDescriptor(currentDescriptor)
       const dispatchRevision = descriptorRevision(descriptor, undefined)
       return {
@@ -757,8 +837,8 @@ export class ConsentService {
         descriptor,
         pendingDisclosure: currentDisclosure,
         record: cloneRecord({
-          installId: pair.extensionInstallationId,
-          nonce: pair.installNonce,
+          installId: state.pair.extensionInstallationId,
+          nonce: state.pair.installNonce,
           presetId: currentDisclosure.presetId,
           threadId: currentDisclosure.threadId,
           workspaceSource: currentDisclosure.workspaceSource,
@@ -771,8 +851,7 @@ export class ConsentService {
     }
     if (input.consent === undefined) return fail("MISSING_DISCLOSURE", "Grant requires a host disclosure")
     const record = cloneRecord(input.consent)
-    const pair = assertInstallPair(this.store.getInstallPair())
-    if (record.installId !== pair.extensionInstallationId || record.nonce !== pair.installNonce) {
+    if (record.installId !== state.pair.extensionInstallationId || record.nonce !== state.pair.installNonce) {
       return fail("INSTALL_MISMATCH", "Consent record belongs to another installation")
     }
     if (record.presetId !== input.presetId && input.presetId !== undefined) {
@@ -797,13 +876,32 @@ export class ConsentService {
       workspaceSource: record.workspaceSource,
       connectionSourceKey: record.connectionSourceKey,
     })
-    this.pendingDisclosures.deleteIf(key, (candidate) => candidate === pendingDisclosure)
+    this.ensureCurrentState().pendingDisclosures.deleteIf(key, (candidate) => candidate === pendingDisclosure)
   }
 
 
   async grant(input: ConsentGrantInput): Promise<ConsentSnapshot> {
     const userId = identity(input.userId, "userId")
     const requestedPresetId = input.presetId === undefined ? undefined : uuid(input.presetId, "presetId")
+    const state = this.ensureCurrentState()
+    if (input.disclosure !== undefined) {
+      const disclosureUserId = identity(input.disclosure.userId, "disclosure.userId")
+      if (disclosureUserId !== userId) return fail("WRONG_USER", "Disclosure belongs to another user")
+      const markerPair = (input.disclosure as Partial<NormalizedConsentDisclosure>)[CONSENT_DISCLOSURE_INSTALL_PAIR]
+      const capturedPair = markerPair ?? state.disclosureProvenance.get(input.disclosure)
+      if (capturedPair === undefined) {
+        return fail("MISSING_DISCLOSURE", "Grant requires a current host disclosure")
+      }
+      if (!sameInstallPair(assertInstallPair(capturedPair), state.pair)) {
+        return fail("INSTALL_MISMATCH", "Consent disclosure belongs to another installation")
+      }
+    }
+    if (input.disclosure !== undefined && requestedPresetId !== undefined) {
+      const disclosedPresetId = uuid(input.disclosure.presetId, "disclosure.presetId")
+      if (requestedPresetId !== disclosedPresetId) {
+        return fail("WRONG_USER", "Consent preset identity mismatch")
+      }
+    }
     const normalizedDisclosure = input.disclosure === undefined
       ? undefined
       : this.normalizeDisclosure(input.disclosure)
@@ -811,8 +909,16 @@ export class ConsentService {
       normalizedDisclosure === undefined && input.consent !== undefined
         ? cloneRecord(input.consent)
         : undefined
-    const presetId = normalizedDisclosure?.presetId ?? normalizedConsent?.presetId
-    if (presetId === undefined) return fail("MISSING_DISCLOSURE", "Grant requires a host disclosure")
+    const disclosurePresetId = normalizedDisclosure?.presetId ?? normalizedConsent?.presetId
+    if (
+      requestedPresetId !== undefined &&
+      disclosurePresetId !== undefined &&
+      requestedPresetId !== disclosurePresetId
+    ) {
+      return fail("WRONG_USER", "Consent preset identity mismatch")
+    }
+    if (disclosurePresetId === undefined) return fail("MISSING_DISCLOSURE", "Grant requires a host disclosure")
+    const operationPair = state.pair
     const queuedInput: ConsentGrantInput = {
       ...input,
       ...(requestedPresetId === undefined ? {} : { presetId: requestedPresetId }),
@@ -820,25 +926,26 @@ export class ConsentService {
       ...(normalizedConsent === undefined ? {} : { consent: normalizedConsent }),
     }
 
-    return this.enqueueDocumentMutation(userId, presetId, async () => {
+    return this.enqueueDocumentMutation(userId, disclosurePresetId, async () => {
+      this.assertCurrentInstallPair(operationPair)
       const { record, pendingDisclosure } = this.disclosureToRecord(userId, queuedInput)
       const initial = await this.store.readLatest(userId, record.presetId).catch(mapStoreError)
+      this.assertCurrentInstallPair(operationPair)
       if (!slotBindingMatches(initial, record)) {
         this.invalidatePendingDisclosure(userId, record, pendingDisclosure)
         return fail("STALE_CONSENT", "Consent disclosure does not match the current slot binding")
       }
-      if (input.expectedDocumentRevision !== undefined) {
-        if (!Number.isSafeInteger(input.expectedDocumentRevision) || input.expectedDocumentRevision < 0) {
+      if (queuedInput.expectedDocumentRevision !== undefined) {
+        if (!Number.isSafeInteger(queuedInput.expectedDocumentRevision) || queuedInput.expectedDocumentRevision < 0) {
           return fail("STALE_DOCUMENT", "expectedDocumentRevision is invalid")
         }
-        if (input.expectedDocumentRevision !== initial.documentRevision) {
+        if (queuedInput.expectedDocumentRevision !== initial.documentRevision) {
           return fail("STALE_DOCUMENT", "Consent was derived from a stale document revision")
         }
       }
-      const expectedRevision = input.expectedDocumentRevision ?? initial.documentRevision
+      const expectedRevision = queuedInput.expectedDocumentRevision ?? initial.documentRevision
       const key = buildConsentKey(record)
       if (initial.consents[key] !== undefined) return fail("DUPLICATE_CONSENT", "Consent is already granted")
-      const pair = assertInstallPair(this.store.getInstallPair())
       let replacement: BindingConsentDocument = initial
       try {
         const superseded = Object.values(initial.consents)
@@ -850,6 +957,7 @@ export class ConsentService {
       } catch (error) {
         return mapStoreError(error)
       }
+      this.assertCurrentInstallPair(operationPair)
       let current: BindingConsentDocument
       try {
         current = await this.store.writeDocument(
@@ -862,6 +970,7 @@ export class ConsentService {
         if (pendingDisclosure !== undefined && error instanceof AtomicJsonStoreError && error.code === "REVISION_MISMATCH") {
           try {
             const latestAfterFailure = await this.store.readLatest(userId, record.presetId)
+            this.assertCurrentInstallPair(operationPair)
             if (!slotBindingMatches(latestAfterFailure, record)) {
               this.invalidatePendingDisclosure(userId, record, pendingDisclosure)
             }
@@ -869,8 +978,10 @@ export class ConsentService {
             // Preserve the original write failure if the diagnostic read also fails.
           }
         }
+        this.assertCurrentInstallPair(operationPair)
         return mapStoreError(error)
       }
+      const currentState = this.assertCurrentInstallPair(operationPair)
       const pendingKeyValue = pendingKey({
         userId,
         presetId: record.presetId,
@@ -879,11 +990,11 @@ export class ConsentService {
         connectionSourceKey: record.connectionSourceKey,
       })
       if (pendingDisclosure === undefined) {
-        this.pendingDisclosures.delete(pendingKeyValue)
+        currentState.pendingDisclosures.delete(pendingKeyValue)
       } else {
-        this.pendingDisclosures.deleteIf(pendingKeyValue, (candidate) => candidate === pendingDisclosure)
+        currentState.pendingDisclosures.deleteIf(pendingKeyValue, (candidate) => candidate === pendingDisclosure)
       }
-      this.revokedSelectors.delete(selectorFingerprint(userId, {
+      currentState.revokedSelectors.delete(selectorFingerprint(userId, {
         presetId: record.presetId,
         threadId: record.threadId,
         workspaceSource: record.workspaceSource,
@@ -892,14 +1003,14 @@ export class ConsentService {
         dispatchRevision: record.dispatchRevision,
         disclosureVersion: record.disclosureVersion,
       }))
-      this.revokedSelectors.delete(selectorFingerprint(userId, {
+      currentState.revokedSelectors.delete(selectorFingerprint(userId, {
         presetId: record.presetId,
         threadId: record.threadId,
         workspaceSource: record.workspaceSource,
         connectionSourceKey: record.connectionSourceKey,
         connectionId: record.connectionId,
       }))
-      return snapshotFromDocument(userId, record.presetId, pair, current)
+      return snapshotFromDocument(userId, record.presetId, currentState.pair, current)
     })
   }
 
@@ -912,6 +1023,7 @@ export class ConsentService {
     selector: ConsentSelector,
     expectedDocumentRevision?: number,
   ): Promise<ConsentSnapshot> {
+    const state = this.ensureCurrentState()
     const userId = identity(userIdInput, "userId")
     const presetId = uuid(selector.presetId, "selector.presetId")
     const threadId = text(selector.threadId, "selector.threadId")
@@ -935,13 +1047,15 @@ export class ConsentService {
         ? {}
         : { disclosureVersion: disclosureVersion(selector.disclosureVersion, this.disclosureVersion) }),
     }
-    const candidates = this.pendingDisclosures.entries()
+    const candidates = state.pendingDisclosures.entries()
       .map((entry) => entry.value)
       .filter((candidate) => candidate.userId === userId && disclosureMatchesSelector(candidate, normalizedSelector))
       .sort((left, right) => pendingKey(left).localeCompare(pendingKey(right)))
     if (candidates.length !== 1) return fail("MISSING_DISCLOSURE", "Consent disclosure is missing or ambiguous")
-    this.pendingDisclosures.touch(pendingKey(candidates[0]))
-    return this.grant({ userId, disclosure: candidates[0], expectedDocumentRevision })
+    const candidate = candidates[0]
+    if (candidate === undefined) return fail("MISSING_DISCLOSURE", "Consent disclosure is missing or ambiguous")
+    state.pendingDisclosures.touch(pendingKey(candidate))
+    return this.grant({ userId, disclosure: candidate, expectedDocumentRevision })
   }
 
   async revoke(input: ConsentRevokeInput): Promise<ConsentSnapshot> {
@@ -971,7 +1085,9 @@ export class ConsentService {
     }
 
     return this.enqueueDocumentMutation(userId, presetId, async () => {
+      const state = this.assertCurrentInstallPair(this.ensureCurrentState().pair)
       const initial = await this.store.readLatest(userId, presetId).catch(mapStoreError)
+      this.assertCurrentInstallPair(state.pair)
       if (input.expectedDocumentRevision !== undefined) {
         if (!Number.isSafeInteger(input.expectedDocumentRevision) || input.expectedDocumentRevision < 0) {
           return fail("STALE_DOCUMENT", "expectedDocumentRevision is invalid")
@@ -982,7 +1098,7 @@ export class ConsentService {
       }
       const matches = Object.entries(initial.consents)
         .filter(([, record]) => selectorMatches(record, normalizedSelector))
-      const pendingToDelete = this.pendingDisclosures.entries()
+      const pendingToDelete = state.pendingDisclosures.entries()
         .filter((entry) => {
           const disclosure = entry.value
           return disclosure.userId === userId && disclosureMatchesSelector(disclosure, normalizedSelector)
@@ -999,16 +1115,17 @@ export class ConsentService {
             initial.documentRevision,
             replacement,
           ).catch(mapStoreError)
+      const currentState = this.assertCurrentInstallPair(state.pair)
       for (const entry of pendingToDelete) {
-        this.pendingDisclosures.deleteIf(entry.key, (candidate) => candidate === entry.value)
+        currentState.pendingDisclosures.deleteIf(entry.key, (candidate) => candidate === entry.value)
       }
-      this.revokedSelectors.set(
+      currentState.revokedSelectors.set(
         selectorFingerprint(userId, normalizedSelector),
         consentScope(userId, presetId, threadId),
         true,
       )
       for (const [, record] of matches) {
-        this.revokedSelectors.set(
+        currentState.revokedSelectors.set(
           selectorFingerprint(userId, {
             presetId: record.presetId,
             threadId: record.threadId,
@@ -1020,21 +1137,20 @@ export class ConsentService {
           true,
         )
       }
-      const pair = assertInstallPair(this.store.getInstallPair())
-      return snapshotFromDocument(userId, presetId, pair, current)
+      return snapshotFromDocument(userId, presetId, currentState.pair, current)
     })
   }
 
   async revokeConsent(input: ConsentRevokeInput): Promise<ConsentSnapshot> {
     return this.revoke(input)
   }
-
   async listConsents(userIdInput: string, presetIdInput: string): Promise<ConsentSnapshot> {
     const userId = identity(userIdInput, "userId")
     const presetId = uuid(presetIdInput, "presetId")
-    const pair = assertInstallPair(this.store.getInstallPair())
+    const state = this.ensureCurrentState()
     const document = await this.store.readLatest(userId, presetId).catch(mapStoreError)
-    return snapshotFromDocument(userId, presetId, pair, document)
+    const currentState = this.assertCurrentInstallPair(state.pair)
+    return snapshotFromDocument(userId, presetId, currentState.pair, document)
   }
 
   async list(userId: string, presetId: string): Promise<ConsentSnapshot> {
@@ -1060,11 +1176,12 @@ export class ConsentService {
     if (descriptor !== undefined && connectionSourceKey !== "main" && descriptor.connectionId !== normalizedConnectionId) {
       return fail("STALE_CONSENT", "Authorization descriptor does not match the source")
     }
-    const pair = assertInstallPair(this.store.getInstallPair())
+    const state = this.ensureCurrentState()
     const document = await this.store.readLatest(userId, presetId).catch(mapStoreError)
+    const currentState = this.assertCurrentInstallPair(state.pair)
     const record = document.consents[buildConsentKey(
-      pair.extensionInstallationId,
-      pair.installNonce,
+      currentState.pair.extensionInstallationId,
+      currentState.pair.installNonce,
       presetId,
       threadId,
       workspaceSource,
@@ -1074,7 +1191,7 @@ export class ConsentService {
       disclosureVersion(input.disclosureVersion, this.disclosureVersion),
     )]
     if (!record) return fail("REVOKED_CONSENT", "Consent is missing, stale, or revoked")
-    if (record.installId !== pair.extensionInstallationId || record.nonce !== pair.installNonce) {
+    if (record.installId !== currentState.pair.extensionInstallationId || record.nonce !== currentState.pair.installNonce) {
       return fail("INSTALL_MISMATCH", "Consent belongs to another installation")
     }
     return Object.freeze({
@@ -1117,11 +1234,21 @@ export class ConsentService {
   async status(input: ConsentAuthorizationInput): Promise<ConsentStatus> {
     const userId = identity(input.userId, "userId")
     const presetId = uuid(input.presetId, "presetId")
-    return this.enqueueDocumentMutation(userId, presetId, () => this.statusInternal(input))
+    return this.enqueueDocumentMutation(userId, presetId, async () => {
+      const state = this.ensureCurrentState()
+      return this.statusInternal(input, state.pair)
+    })
   }
 
-  private async statusInternal(input: ConsentAuthorizationInput): Promise<ConsentStatus> {
-    if (await this.hasConsent(input)) return "approved"
+  private async statusInternal(
+    input: ConsentAuthorizationInput,
+    operationPair: InstallPair,
+  ): Promise<ConsentStatus> {
+    this.assertCurrentInstallPair(operationPair)
+    if (await this.hasConsent(input)) {
+      this.assertCurrentInstallPair(operationPair)
+      return "approved"
+    }
     const dispatchRevision = input.descriptor === undefined
       ? input.dispatchRevision
       : cloneDescriptor(input.descriptor).connectionDispatchRevision
@@ -1142,10 +1269,12 @@ export class ConsentService {
       connectionId: input.connectionId,
     }
     const current = await this.listConsents(input.userId, input.presetId)
+    this.assertCurrentInstallPair(operationPair)
     const identityPresent = current.consents.some((record) => selectorMatches(record, identitySelector))
     if (identityPresent) {
       try {
         await this.authorize(input)
+        this.assertCurrentInstallPair(operationPair)
         return "approved"
       } catch (error) {
         if (error instanceof ConsentError && (error.code === "REVOKED_CONSENT" || error.code === "STALE_CONSENT")) {
@@ -1154,9 +1283,10 @@ export class ConsentService {
         throw error
       }
     }
+    const state = this.assertCurrentInstallPair(operationPair)
     return (
-      this.revokedSelectors.has(selectorFingerprint(input.userId, selector)) ||
-      this.revokedSelectors.has(selectorFingerprint(input.userId, identitySelector))
+      state.revokedSelectors.has(selectorFingerprint(input.userId, selector)) ||
+      state.revokedSelectors.has(selectorFingerprint(input.userId, identitySelector))
     )
       ? "revoked"
       : "required"

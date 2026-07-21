@@ -468,8 +468,41 @@ describe("safe execution inspector", () => {
     expect(delivered?.textContent).not.toContain("Configured Synthesizer")
     expect(delivered?.querySelector("[data-inspector-field=final-delivery] [data-status-kind=completed]")?.textContent).toContain("en:terminal.ready")
     expect(delivered?.querySelector("[data-inspector-field=main-fallback-result] [data-status-kind=completed]")?.textContent).toContain("en:terminal.ready")
-    expect(inspector.element.querySelector("[data-inspector-section=output]")).toBeNull()
+    expect(inspector.element.querySelector("[data-inspector-section=output] [data-inspector-field=output-label]")?.textContent).toContain("Final response")
+    expect(inspector.element.querySelector("[data-inspector-section=output] [data-inspector-field=output-availability]")?.textContent).toContain("en:terminal.unavailable")
     expect(inspector.element.textContent).not.toContain("en:action.retry")
+    inspector.destroy()
+  })
+
+  test("renders current and terminal run output label and availability metadata", () => {
+    const inspector = mountInspector()
+    inspector.render(snapshot("running", {
+      inspectedRun: {
+        label: "Current run",
+        status: "running",
+        output: { label: "Live response" },
+      },
+    }))
+    const currentOutput = inspector.element.querySelector<HTMLElement>(
+      "[data-current-run-status=running] [data-inspector-section=output]",
+    )
+    expect(currentOutput?.querySelector("[data-inspector-field=output-label]")?.textContent).toContain("Live response")
+    expect(currentOutput?.querySelector("[data-inspector-field=output-availability]")?.textContent).toContain("en:terminal.unavailable")
+
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      inspectedRun: {
+        label: "Terminal run",
+        status: "completed",
+        output: { label: "Final response" },
+      },
+    }))
+    const terminalOutput = inspector.element.querySelector<HTMLElement>(
+      "[data-current-run-status=completed] [data-inspector-section=output]",
+    )
+    expect(terminalOutput?.querySelector("[data-inspector-field=output-label]")?.textContent).toContain("Final response")
+    expect(terminalOutput?.querySelector("[data-inspector-field=output-availability]")?.textContent).toContain("en:terminal.ready")
     inspector.destroy()
   })
 
@@ -550,6 +583,57 @@ describe("safe execution inspector", () => {
     inspector.destroy()
   })
 
+  test("falls back to the inspector panel when a pending trace action has no enabled replacement", async () => {
+    let resolveTrace = () => {}
+    const pending = new Promise<void>(resolve => {
+      resolveTrace = () => resolve()
+    })
+    const inspector = mountInspector({ onLoadTrace: () => pending })
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [{ key: "trace-pending", status: "completed", eventCount: 1 }],
+    }))
+
+    const load = actionButton(inspector, "load-trace")
+    load?.focus()
+    expect(testDocument.activeElement).toBe(load)
+    load?.click()
+
+    expect(actionButton(inspector, "load-trace")?.disabled).toBe(true)
+    expect(testDocument.activeElement).toBe(inspector.element)
+
+    resolveTrace()
+    await pending
+    await Promise.resolve()
+    inspector.destroy()
+  })
+
+  test("falls back to the inspector panel when an enabled replacement cannot receive focus", () => {
+    const inspector = mountInspector({ onLoadTrace: () => undefined })
+    const traceSnapshot = snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [{ key: "trace-noop-focus", status: "completed", eventCount: 1 }],
+    })
+    inspector.render(traceSnapshot)
+    const load = actionButton(inspector, "load-trace")
+    load?.focus()
+    expect(testDocument.activeElement).toBe(load)
+
+    const buttonPrototype = browser.window.HTMLButtonElement.prototype
+    const originalFocus = buttonPrototype.focus
+    buttonPrototype.focus = () => {}
+    try {
+      inspector.render(traceSnapshot)
+    } finally {
+      buttonPrototype.focus = originalFocus
+    }
+
+    expect(testDocument.activeElement).toBe(inspector.element)
+    inspector.destroy()
+  })
+
   test("preserves trace-detail focus by opaque identity when summaries reorder", () => {
     const inspector = mountInspector({ onLoadTrace: () => undefined })
     inspector.render(snapshot("completed", {
@@ -577,6 +661,146 @@ describe("safe execution inspector", () => {
 
     expect(testDocument.activeElement?.getAttribute("data-inspector-action")).toBe("load-trace")
     expect(testDocument.activeElement?.getAttribute("data-inspector-trace-position")).toBe("1")
+    inspector.destroy()
+  })
+
+  test("gives repeated trace-detail actions distinct localized accessible names and status descriptions", () => {
+    const privateTraceKeys = ["trace-private-alpha", "trace-private-beta"]
+    const inspector = mountInspector({ onLoadTrace: () => undefined })
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [
+        { key: privateTraceKeys[0]!, status: "completed", eventCount: 1 },
+        { key: privateTraceKeys[1]!, status: "failed", eventCount: 2 },
+      ],
+    }))
+
+    const buttons = [...inspector.element.querySelectorAll<HTMLButtonElement>(
+      "button[data-inspector-action=load-trace]",
+    )]
+    expect(buttons).toHaveLength(2)
+    const labelIds = buttons.map(button => button.getAttribute("aria-labelledby"))
+    const descriptionIds = buttons.map(button => button.getAttribute("aria-describedby"))
+    expect(new Set(labelIds).size).toBe(2)
+    expect(new Set(descriptionIds).size).toBe(2)
+
+    const expectedStatuses = ["en:inspector.statusCompleted", "en:inspector.statusFailed"]
+    for (const [index, button] of buttons.entries()) {
+      const labelId = labelIds[index]
+      const descriptionId = descriptionIds[index]
+      if (labelId === null || descriptionId === null) throw new Error("trace action a11y references are missing")
+      const labelParts = labelId.split(/\s+/u)
+      if (labelParts.length !== 2) throw new Error("trace action must reference action and ordinal labels")
+      expect(labelParts[0]).toMatch(/^apc-inspector-\d+-trace-\d+-action$/u)
+      expect(labelParts[1]).toMatch(/^apc-inspector-\d+-trace-\d+-label$/u)
+      expect(descriptionId).toMatch(/^apc-inspector-\d+-trace-\d+-status$/u)
+      const actionLabel = testDocument.getElementById(labelParts[0]!)
+      const ordinalLabel = testDocument.getElementById(labelParts[1]!)
+      const description = testDocument.getElementById(descriptionId)
+      expect(actionLabel?.textContent).toContain("en:inspector.traceDetails")
+      expect(ordinalLabel?.textContent).toContain(`en:inspector.runTitle:index=${index + 1}`)
+      expect(button.textContent).toContain("en:inspector.traceDetails")
+      expect(description?.getAttribute("aria-label")).toBe(expectedStatuses[index])
+      expect(button.getAttribute("aria-labelledby")).not.toContain(privateTraceKeys[index]!)
+      expect(button.getAttribute("aria-describedby")).not.toContain(privateTraceKeys[index]!)
+    }
+    const html = inspector.element.outerHTML
+    for (const key of privateTraceKeys) expect(html).not.toContain(key)
+    inspector.destroy()
+  })
+
+  test("discloses each bounded trace truncation signal without preview or raw text", () => {
+    const rawPreview = "<raw trace preview> token=private-trace-secret"
+    const singleEvent = {
+      sequence: 1,
+      kind: "safe-event",
+      status: "completed" as const,
+      preview: rawPreview,
+    }
+    const oversizedEvents = Array.from({ length: 65 }, (_, index) => ({
+      sequence: index + 1,
+      kind: "safe-event",
+      status: "completed" as const,
+      preview: rawPreview,
+    }))
+    const inspector = mountInspector()
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "success" },
+      traces: [
+        {
+          key: "summary-truncated",
+          status: "completed",
+          eventCount: 1,
+          preview: rawPreview,
+          truncated: true,
+        },
+        {
+          key: "detail-truncated",
+          status: "completed",
+          eventCount: 1,
+          preview: rawPreview,
+        },
+        {
+          key: "locally-truncated",
+          status: "completed",
+          eventCount: 64,
+          preview: rawPreview,
+        },
+        {
+          key: "detail-count-truncated",
+          status: "completed",
+          eventCount: 1,
+          preview: rawPreview,
+        },
+      ],
+      traceDetails: {
+        "detail-truncated": {
+          key: "detail-truncated",
+          status: "completed",
+          eventCount: 1,
+          preview: rawPreview,
+          truncated: true,
+          events: [singleEvent],
+        },
+        "locally-truncated": {
+          key: "locally-truncated",
+          status: "completed",
+          eventCount: 64,
+          preview: rawPreview,
+          events: oversizedEvents,
+        },
+        "detail-count-truncated": {
+          key: "detail-count-truncated",
+          status: "completed",
+          eventCount: 2,
+          preview: rawPreview,
+          events: [singleEvent],
+        },
+      },
+    }))
+
+    expect(inspector.element.querySelectorAll(".apc-inspector-trace-truncated")).toHaveLength(4)
+    expect(inspector.element.textContent).toContain("en:inspector.previewTruncated")
+    expect(inspector.element.textContent).toContain("en:inspector.additionalEventsOmitted")
+    for (const position of [1, 2, 3, 4]) {
+      expect(inspector.element.querySelector(
+        `[data-inspector-trace-position="${position}"] .apc-inspector-trace-truncated`,
+      )).not.toBeNull()
+    }
+    expect(inspector.element.querySelectorAll(
+      "[data-inspector-trace-position='3'] .apc-inspector-trace-events > li",
+    )).toHaveLength(64)
+    expect(inspector.element.querySelectorAll(
+      "[data-inspector-trace-position='4'] .apc-inspector-trace-events > li",
+    )).toHaveLength(1)
+    const html = inspector.element.outerHTML
+    expect(html).not.toContain(rawPreview)
+    expect(html).not.toContain("private-trace-secret")
+    for (const key of ["summary-truncated", "detail-truncated", "locally-truncated", "detail-count-truncated"]) {
+      expect(html).not.toContain(key)
+    }
     inspector.destroy()
   })
 

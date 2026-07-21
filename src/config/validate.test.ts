@@ -118,6 +118,8 @@ describe("APC graph validation", () => {
     const result = validateConfigForMode(config, "single")
     expect(result.valid).toBe(true)
     expect(result.reachableRunIds.size).toBe(0)
+    const cloned = structuredClone(config)
+    expect(validateConfigForMode(cloned, "single").valid).toBe(true)
   })
 
   test("accepts valid Sequential and Parallel graphs", () => {
@@ -362,6 +364,68 @@ describe("APC graph validation", () => {
     runsPipeline.finalResponse = { source: "thread", runId: runsPipeline.stages[0].runs[0].id }
     expect(hasCode(runsConfig, "parallel", "RUNS_LIMIT")).toBe(true)
     expect(MAX_RUNS_PER_PIPELINE).toBe(64)
+  })
+
+  test("bounds prompt DTO fields and collections before execution", () => {
+    const config = createDefaultApcConfig()
+    const currentThread = thread(1)
+    const currentBlock = {
+      id: "block",
+      name: "Block",
+      content: "content",
+      role: "system" as const,
+      enabled: true,
+      position: "pre_history" as const,
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: Array.from({ length: MAX_BLOCKS_PER_THREAD }, () => "trigger"),
+      group: null,
+      variables: Array.from({ length: MAX_BLOCKS_PER_THREAD }, (_, index) => ({
+        id: `variable-${index}`,
+        name: `variable-${index}`,
+        label: `Variable ${index}`,
+        type: "text" as const,
+        defaultValue: "value",
+        description: "description",
+      })),
+    }
+    currentThread.blocks = [currentBlock]
+    currentThread.promptVariableValues = {
+      block: Object.fromEntries(Array.from({ length: MAX_BLOCKS_PER_THREAD }, (_, index) => [`variable-${index}`, "value"])),
+    }
+    config.threads = [currentThread]
+    expect(validateConfigForMode(config, "single").valid).toBe(true)
+
+    currentBlock.injectionTrigger.push("overflow")
+    expect(hasCode(config, "single", "PROMPT_ARRAY_LIMIT")).toBe(true)
+    currentBlock.injectionTrigger.pop()
+    currentBlock.variables?.push({
+      id: "overflow",
+      name: "overflow",
+      label: "Overflow",
+      type: "text",
+      defaultValue: "value",
+      description: "description",
+    })
+    expect(hasCode(config, "single", "PROMPT_VARIABLES_LIMIT")).toBe(true)
+    currentBlock.variables?.pop()
+    currentThread.promptVariableValues.block["overflow"] = "value"
+    expect(hasCode(config, "single", "PROMPT_VALUES_LIMIT")).toBe(true)
+    delete currentThread.promptVariableValues.block["overflow"]
+
+    currentBlock.name = "x".repeat(MAX_NAME_CHARS + 1)
+    expect(hasCode(config, "single", "NAME_LIMIT")).toBe(true)
+    currentBlock.name = "Block"
+    currentBlock.content = "x".repeat(MAX_BLOCK_CONTENT_BYTES + 1)
+    expect(hasCode(config, "single", "BLOCK_CONTENT_LIMIT")).toBe(true)
+    currentBlock.content = "content"
+    currentBlock.variables[0].description = "x".repeat(MAX_DESCRIPTION_BYTES + 1)
+    expect(hasCode(config, "single", "DESCRIPTION_LIMIT")).toBe(true)
+    currentBlock.variables[0].description = "description"
+    currentBlock.variables[0].defaultValue = "x".repeat(MAX_LITERAL_BYTES + 1)
+    expect(hasCode(config, "single", "LITERAL_LIMIT")).toBe(true)
   })
 
   test("sorts issues deterministically by encoded path and code", () => {

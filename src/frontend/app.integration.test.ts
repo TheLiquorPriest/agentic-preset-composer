@@ -1128,6 +1128,12 @@ describe("APC public frontend application", () => {
     expect(toolbarStyleText).not.toContain("--focus-ring")
     expect(toolbarStyleText).toContain(".apc-mode-toolbar button:focus-visible")
 
+    expect(toolbarStyleText).toContain("container-name: apc-toolbar")
+    expect(toolbarStyleText).toContain("@container apc-toolbar (max-width: 48rem)")
+    expect(toolbarStyleText).toContain(".apc-disabled-reason")
+    expect(toolbarStyleText).toContain("grid-column: 1 / -1")
+    expect(toolbarStyleText).toContain("@media (forced-colors: active)")
+    expect(toolbarStyleText).toContain("forced-color-adjust: auto")
     fixture.editor.switchPreset(PRESET_A, graphConfig("A"))
     await settleUntil(
       () => app.state.getSnapshot().hydrated && fixture.backend.requests("list_connections").length > 0,
@@ -1260,7 +1266,9 @@ describe("APC public frontend application", () => {
     await settleUntil(
       () => {
         const summary = app.state.getSnapshot().traces.summaries[0]
-        return summary?.preview === "Safe trace summary" &&
+        return summary?.status === "completed" &&
+          summary.eventCount === 1 &&
+          !Object.prototype.hasOwnProperty.call(summary, "preview") &&
           inspector?.querySelector(".apc-inspector-trace") !== null
       },
       "safe trace summary projection",
@@ -1314,7 +1322,9 @@ describe("APC public frontend application", () => {
     })
     await settleUntil(
       () => Object.values(app.state.getSnapshot().traces.details)
-        .some((detail) => detail.events.some((event) => event.preview === "Safe trace event")),
+        .some((detail) => detail.events.length === 1 &&
+          !Object.prototype.hasOwnProperty.call(detail, "preview") &&
+          !Object.prototype.hasOwnProperty.call(detail.events[0] ?? {}, "preview")),
       "safe trace detail projection",
     )
     expect(inspector?.textContent).not.toContain("Safe trace event")

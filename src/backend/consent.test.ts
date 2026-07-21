@@ -21,6 +21,8 @@ const HOST_ID = "11111111-1111-4111-8111-111111111111"
 const USER_ID = "22222222-2222-4222-8222-222222222222"
 const OTHER_USER_ID = "33333333-3333-4333-8333-333333333333"
 const PRESET_ID = "44444444-4444-4444-8444-444444444444"
+const OTHER_PRESET_ID = "88888888-8888-4888-8888-888888888888"
+const ROTATED_HOST_ID = "99999999-9999-4999-8999-999999999999"
 const THREAD_ID = "55555555-5555-4555-8555-555555555555"
 const THREAD_B = "55555555-5555-4555-8555-555555555556"
 const THREAD_C = "55555555-5555-4555-8555-555555555557"
@@ -144,9 +146,9 @@ class DeferredConsentStore extends AtomicJsonStore {
   }
 }
 
-function descriptor(revision: string): ConnectionDispatchDescriptorDTO {
+function descriptor(revision: string, connectionId = CONNECTION_ID): ConnectionDispatchDescriptorDTO {
   return Object.freeze({
-    connectionId: CONNECTION_ID,
+    connectionId,
     connectionName: "Consent connection",
     provider: "openai",
     model: "model-a",
@@ -219,13 +221,13 @@ function generatedUuid(index: number): string {
 
 function maxConsentDocument(): Record<string, unknown> {
   const maxConsents = MAX_CONSENT_VIEWS
-  const sourceKeys = [
+  const sourceKeys: Array<"main" | `slot:${string}`> = [
     `slot:${SLOT_ID}`,
     "main",
     `slot:${OTHER_SLOT_ID}`,
     ...Array.from(
       { length: MAX_CONNECTION_SLOTS - 2 },
-      (_, index) => `slot:${generatedUuid(0x400 + index)}`,
+      (_, index) => `slot:${generatedUuid(0x400 + index)}` as `slot:${string}`,
     ),
   ]
   const consents: Record<string, unknown> = {}
@@ -578,11 +580,11 @@ describe("ConsentService", () => {
 
   it("retains a slot disclosure across an unrelated document revision conflict", async () => {
     const { service, store } = await setup()
-    remember(service)
+    const pending = remember(service)
 
     await expect(service.grant({
       userId: USER_ID,
-      disclosure: disclosure(),
+      disclosure: pending,
       expectedDocumentRevision: 0,
     })).rejects.toMatchObject<Partial<ConsentError>>({ code: "STALE_DOCUMENT" })
 
@@ -699,6 +701,208 @@ describe("ConsentService", () => {
         connectionSourceKey: `slot:${SLOT_ID}`,
       })).toBeUndefined()
     }
+  })
+
+
+  it("rejects grant, saveConsent, and updateConsent across disclosure presets", async () => {
+    const { service } = await setup()
+    const pending = remember(service)
+    const input = {
+      userId: USER_ID,
+      presetId: OTHER_PRESET_ID,
+      disclosure: pending,
+    }
+
+    await expect(service.grant(input)).rejects.toMatchObject<Partial<ConsentError>>({ code: "WRONG_USER" })
+    await expect(service.saveConsent(input)).rejects.toMatchObject<Partial<ConsentError>>({ code: "WRONG_USER" })
+    await expect(service.updateConsent(input)).rejects.toMatchObject<Partial<ConsentError>>({ code: "WRONG_USER" })
+
+    let presetReads = 0
+    const queuedMismatch = {
+      userId: USER_ID,
+      disclosure: pending,
+      get presetId(): string | undefined {
+        presetReads += 1
+        return presetReads === 1 ? undefined : OTHER_PRESET_ID
+      },
+    }
+    await expect(service.grant(queuedMismatch)).rejects.toMatchObject<Partial<ConsentError>>({ code: "WRONG_USER" })
+    expect(presetReads).toBe(2)
+
+    expect(service.resolveDisclosure(USER_ID, {
+      presetId: PRESET_ID,
+      threadId: THREAD_ID,
+      connectionSourceKey: `slot:${SLOT_ID}`,
+    })).toBeDefined()
+  })
+
+  it("retains the revokeConsent instance alias", async () => {
+    const { service } = await setup()
+    await service.grant({ userId: USER_ID, disclosure: remember(service) })
+    const revoked = await service.revokeConsent({
+      userId: USER_ID,
+      selector: {
+        presetId: PRESET_ID,
+        threadId: THREAD_ID,
+        workspaceSource: "main-context",
+        connectionSourceKey: `slot:${SLOT_ID}`,
+        connectionId: CONNECTION_ID,
+      },
+    })
+    expect(revoked.consents).toHaveLength(0)
+  })
+
+  it("atomically invalidates slot consent on A-to-B rebind while preserving Main approval", async () => {
+    const { service, store } = await setup()
+    await service.grant({ userId: USER_ID, disclosure: remember(service) })
+    await service.grant({ userId: USER_ID, disclosure: remember(service, mainDisclosure()) })
+
+    await store.applyBindingIntent(USER_ID, PRESET_ID, {
+      type: "bind",
+      presetId: PRESET_ID,
+      slotId: OTHER_SLOT_ID,
+      connectionSourceKey: `slot:${OTHER_SLOT_ID}`,
+      connectionId: OTHER_CONNECTION_ID,
+      dispatchRevision: "unrelated-revision",
+    })
+    const unrelated = {
+      ...disclosure("unrelated-revision", USER_ID, THREAD_C),
+      connectionSourceKey: `slot:${OTHER_SLOT_ID}` as `slot:${string}`,
+      connectionId: OTHER_CONNECTION_ID,
+      descriptor: descriptor("unrelated-revision", OTHER_CONNECTION_ID),
+    }
+    await service.grant({
+      userId: USER_ID,
+      disclosure: remember(service, unrelated),
+    })
+
+    await bindSlot(store, "revision-b", OTHER_CONNECTION_ID)
+
+    const latest = await store.readLatest(USER_ID, PRESET_ID)
+    expect(Object.values(latest.bindings).find((binding) => binding.slotId === SLOT_ID)).toMatchObject({
+      connectionId: OTHER_CONNECTION_ID,
+      dispatchRevision: "revision-b",
+    })
+    expect(Object.values(latest.consents)).toHaveLength(2)
+    expect(Object.values(latest.consents).some((consent) => (
+      consent.connectionSourceKey === `slot:${SLOT_ID}`
+    ))).toBe(false)
+    expect(Object.values(latest.consents).find((consent) => (
+      consent.connectionSourceKey === `slot:${OTHER_SLOT_ID}`
+    ))).toMatchObject({
+      connectionId: OTHER_CONNECTION_ID,
+      dispatchRevision: "unrelated-revision",
+    })
+    expect(Object.values(latest.consents).find((consent) => (
+      consent.connectionSourceKey === "main"
+    ))).toBeDefined()
+    await expect(service.authorize({
+      userId: USER_ID,
+      presetId: PRESET_ID,
+      threadId: THREAD_B,
+      workspaceSource: "main-context",
+      connectionSourceKey: "main",
+      connectionId: null,
+      descriptor: descriptor("main-revision"),
+    })).resolves.toMatchObject({ consent: { connectionSourceKey: "main" } })
+    await expect(service.authorize({
+      userId: USER_ID,
+      presetId: PRESET_ID,
+      threadId: THREAD_ID,
+      workspaceSource: "main-context",
+      connectionSourceKey: `slot:${SLOT_ID}`,
+      connectionId: CONNECTION_ID,
+      descriptor: descriptor("revision-a"),
+    })).rejects.toMatchObject<Partial<ConsentError>>({ code: "REVOKED_CONSENT" })
+  })
+
+  it("replaces install-scoped disclosure and revocation state after rotation", async () => {
+    const store = new AtomicJsonStore(
+      new MemoryStorage(),
+      { nonceGenerator: () => "a".repeat(32) },
+    )
+    const { service } = await setup({ store })
+    remember(service)
+    const resolved = service.resolveDisclosure(USER_ID, {
+      presetId: PRESET_ID,
+      threadId: THREAD_ID,
+      connectionSourceKey: `slot:${SLOT_ID}`,
+    })
+    if (resolved === undefined) throw new Error("expected a public disclosure")
+    await service.revoke({
+      userId: USER_ID,
+      selector: {
+        presetId: PRESET_ID,
+        threadId: THREAD_B,
+        workspaceSource: "main-context",
+        connectionSourceKey: `slot:${SLOT_ID}`,
+        connectionId: CONNECTION_ID,
+        dispatchRevision: "revision-a",
+      },
+    })
+
+    await store.initialize(ROTATED_HOST_ID)
+
+    expect(service.resolveDisclosure(USER_ID, {
+      presetId: PRESET_ID,
+      threadId: THREAD_ID,
+      connectionSourceKey: `slot:${SLOT_ID}`,
+    })).toBeUndefined()
+    remember(service)
+    expect(service.resolveDisclosure(USER_ID, {
+      presetId: PRESET_ID,
+      threadId: THREAD_ID,
+      connectionSourceKey: `slot:${SLOT_ID}`,
+    })).toBeDefined()
+    await expect(service.grant({ userId: USER_ID, disclosure: resolved }))
+      .rejects.toMatchObject<Partial<ConsentError>>({ code: "INSTALL_MISMATCH" })
+    const serialized = JSON.parse(JSON.stringify(resolved)) as ConsentDisclosure
+    await expect(service.grant({ userId: USER_ID, disclosure: serialized }))
+      .rejects.toMatchObject<Partial<ConsentError>>({ code: "MISSING_DISCLOSURE" })
+    expect(await service.status({
+      userId: USER_ID,
+      presetId: PRESET_ID,
+      threadId: THREAD_B,
+      workspaceSource: "main-context",
+      connectionSourceKey: `slot:${SLOT_ID}`,
+      connectionId: CONNECTION_ID,
+      descriptor: descriptor("revision-a"),
+    })).toBe("required")
+    expect((await service.listConsents(USER_ID, PRESET_ID)).consents).toHaveLength(0)
+  })
+
+
+  it("replaces the mutation queue epoch during install rotation", async () => {
+    const store = new DeferredConsentStore(
+      new MemoryStorage(),
+      { nonceGenerator: () => "a".repeat(32) },
+    )
+    const { service } = await setup({ store })
+    const pending = remember(service)
+    const oldRead = store.deferNextRead()
+    const staleGrant = service.grant({ userId: USER_ID, disclosure: pending })
+    await oldRead.started
+
+    await store.initialize(ROTATED_HOST_ID)
+
+    const newRead = store.deferNextRead()
+    const currentRevoke = service.revoke({
+      userId: USER_ID,
+      selector: {
+        presetId: PRESET_ID,
+        threadId: THREAD_B,
+        workspaceSource: "main-context",
+        connectionSourceKey: `slot:${SLOT_ID}`,
+        connectionId: CONNECTION_ID,
+        dispatchRevision: "revision-a",
+      },
+    })
+    await newRead.started
+    newRead.release()
+    await expect(currentRevoke).resolves.toMatchObject({ installId: ROTATED_HOST_ID })
+
+    oldRead.release()
+    await expect(staleGrant).rejects.toMatchObject<Partial<ConsentError>>({ code: "INSTALL_MISMATCH" })
   })
 
 

@@ -268,27 +268,8 @@ function retainFinalRouteAncestors(
   pipeline: ApcPipelineV1,
   route: ApcFinalResponseV1,
 ): ApcPipelineV1 {
-  const runs = pipeline.stages.flatMap((stage) => stage.runs)
-  const runById = new Map(runs.map((run) => [run.id, run]))
-  const retained = new Set<string>()
-  const pending = route.source === "thread"
-    ? [route.runId]
-    : route.inputs.filter((input) => input.source === "output").map((input) => input.runId)
-  while (pending.length > 0) {
-    const runId = pending.pop()
-    if (runId === undefined || retained.has(runId)) continue
-    const run = runById.get(runId)
-    if (!run) continue
-    retained.add(runId)
-    for (const input of run.inputs) {
-      if (input.source === "output") pending.push(input.runId)
-    }
-  }
   return {
     ...pipeline,
-    stages: pipeline.stages
-      .map((stage) => ({ ...stage, runs: stage.runs.filter((run) => retained.has(run.id)) }))
-      .filter((stage) => stage.runs.length > 0),
     finalResponse: clone(route),
   }
 }
@@ -625,6 +606,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   let pendingConfirmation: PendingConfirmation | null = null
   let focusAfterRender: Readonly<Record<string, string>> | null = null
   let renderRevision = 0
+  let authoritativeRenderRevision = 0
   let liveRegion = options.liveRegion ?? options.accessibility?.liveRegion
   let connectionSlotMutationPending = false
   let unsubscribeState: (() => void) | undefined
@@ -783,35 +765,65 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       return
     }
     dismissPendingConfirmation()
+    const previousSnapshot = current
     const nextConfig = clone(config)
+    const optimisticConfigKey = JSON.stringify(nextConfig)
     const nextSelection = selectionExists(nextConfig, current.selection, nextConfig.activeMode) ? current.selection : null
     const selectionChanged = !sameSelection(nextSelection, current.selection)
     connectionSlotMutationPending = true
     current = { ...current, config: nextConfig, activeMode: nextConfig.activeMode, selection: nextSelection, dirty: true }
     const revisionBeforeCallbacks = renderRevision
     if (selectionChanged) invoke(() => options.onSelectionChange?.(nextSelection))
-    announce(t("a11y.changeUnsaved", { change: copy(t, announcementKey, fallback) }))
     if (renderRevision === revisionBeforeCallbacks) renderCurrent()
-    const finish = (): void => {
+    let callbackAuthorityRevision = authoritativeRenderRevision
+    const rollback = (): void => {
+      const shouldRestore = authoritativeRenderRevision === callbackAuthorityRevision
+        && current.config !== null
+        && JSON.stringify(current.config) === optimisticConfigKey
       connectionSlotMutationPending = false
-      if (!destroyed) renderCurrent()
+      if (destroyed) return
+      if (shouldRestore) {
+        current = {
+          ...current,
+          config: previousSnapshot.config,
+          activeMode: previousSnapshot.activeMode,
+          selection: previousSnapshot.selection,
+          dirty: previousSnapshot.dirty,
+        }
+      }
+      renderCurrent()
+    }
+    const publish = (): void => {
+      connectionSlotMutationPending = false
+      if (destroyed) return
+      if (
+        authoritativeRenderRevision !== callbackAuthorityRevision ||
+        current.config === null ||
+        JSON.stringify(current.config) !== optimisticConfigKey
+      ) {
+        renderCurrent()
+        return
+      }
+      const revisionBeforeObservers = renderRevision
+      invoke(() => options.onMutation?.(mutation))
+      invoke(() => options.onConfigChange?.(clone(nextConfig), mutation))
+      announce(t("a11y.changeUnsaved", { change: copy(t, announcementKey, fallback) }))
+      if (renderRevision === revisionBeforeObservers) renderCurrent()
+    }
+    const fail = (): void => {
+      rollback()
+      announce(t("a11y.error", { message: t("status.editorBusyOrBlocked") }), "assertive")
     }
     try {
       const result = callback()
+      callbackAuthorityRevision = authoritativeRenderRevision
       if (result && typeof (result as Promise<void>).then === "function") {
-        void (result as Promise<void>).then(
-          () => finish(),
-          () => {
-            finish()
-            announce(t("a11y.error", { message: t("status.editorBusyOrBlocked") }), "assertive")
-          },
-        )
+        void (result as Promise<void>).then(publish, fail)
       } else {
-        finish()
+        publish()
       }
     } catch {
-      finish()
-      announce(t("a11y.error", { message: t("status.editorBusyOrBlocked") }), "assertive")
+      fail()
     }
   }
 
@@ -1551,9 +1563,10 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       empty.textContent = t("graph.connectionSlotEmpty")
       list.append(empty)
     }
-    config.connectionSlots.forEach((slot) => {
+    config.connectionSlots.forEach((slot, index) => {
       const item = document.createElement("li")
       const slotKey = uiKeyFor("slot", slot.id)
+      const slotContext = `${t("graph.connectionSlotLabel")} ${index + 1}: ${slot.label}`
       item.dataset.apcConnectionSlot = "true"
       item.dataset.apcSlotKey = slotKey
       const field = document.createElement("label")
@@ -1566,7 +1579,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       input.dataset.apcConnectionSlotLabel = "true"
       input.dataset.apcSlotKey = slotKey
       input.disabled = locked()
-      input.setAttribute("aria-label", t("graph.connectionSlotLabel"))
+      input.setAttribute("aria-label", slotContext)
       input.addEventListener("input", () => {
         if (characterCount(input.value) > MAX_NAME_CHARS) {
           input.value = [...input.value].slice(0, MAX_NAME_CHARS).join("")
@@ -1584,6 +1597,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       const actions = htmlElement(document, "div", "apc-card-actions")
       const referenced = config.threads.some((thread) => thread.connectionSlotId === slot.id)
       const remove = actionButton(document, t("action.removeConnectionSlot"), "remove-connection-slot", { apcSlotKey: slotKey }, true)
+      remove.setAttribute("aria-label", `${t("action.removeConnectionSlot")} · ${slotContext}`)
       remove.disabled = locked() || referenced
       actions.append(remove)
       item.append(field, actions)
@@ -1626,22 +1640,26 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       const threadKey = uiKeyFor("thread", thread.id)
       const selected = current.selection?.kind === "thread" && current.selection.threadId === thread.id
       const label = thread.name || t("graph.defaultThreadName", { index: index + 1 })
+      const threadContext = copy(t, "graph.selectThread", "Select thread {{thread}}", { thread: `${index + 1}: ${label}` })
       const control = actionButton(document, label, "select-thread", { apcThreadKey: threadKey })
       control.dataset.apcThreadSelect = "true"
       control.dataset.selected = String(selected)
       control.setAttribute("aria-pressed", String(selected))
-      control.setAttribute("aria-label", copy(t, "graph.selectThread", "Select thread {{thread}}", { thread: label }))
+      control.setAttribute("aria-label", threadContext)
       const source = htmlElement(document, "span", "apc-thread-source")
       source.textContent = thread.workspaceSource === "native-blocks" ? t("workspace.nativeBlocks") : t("workspace.mainContext")
       const actions = htmlElement(document, "div", "apc-card-actions")
       item.append(control, source, actions)
       const up = actionButton(document, t("action.moveUp"), "move-thread", { apcThreadKey: threadKey, direction: "up" }, true)
+      up.setAttribute("aria-label", `${t("action.moveUp")} · ${threadContext}`)
       const down = actionButton(document, t("action.moveDown"), "move-thread", { apcThreadKey: threadKey, direction: "down" }, true)
+      down.setAttribute("aria-label", `${t("action.moveDown")} · ${threadContext}`)
       up.disabled = index === 0
       down.disabled = index === config.threads.length - 1
       const finalBlocked = threadOwnsFinalRoute(config, thread.id)
       const pipelineBlocked = threadOwnsEveryRunInPipeline(config, thread.id)
       const remove = actionButton(document, t("action.removeThread"), "remove-thread", { apcThreadKey: threadKey }, true)
+      remove.setAttribute("aria-label", `${t("action.removeThread")} · ${threadContext}`)
       remove.disabled = config.threads.length <= 1 || finalBlocked || pipelineBlocked
       if (options.onOpenLoom) {
         const openLoomLabel = t("threadEditor.workspaceAria", { name: label })
@@ -1681,14 +1699,15 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
           const runKey = uiKeyFor("run", run.id)
           const selected = current.selection?.kind === "run" && current.selection.runId === run.id
           const label = runLabel(config, run)
+          const runContext = copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", {
+            run: `${runIndex + 1}: ${label}`,
+            stage: stageIndex + 1,
+          })
           const control = actionButton(document, label, "select-run", { apcRunKey: runKey })
           control.dataset.apcRunSelect = "true"
           control.dataset.selected = String(selected)
           control.setAttribute("aria-pressed", String(selected))
-          control.setAttribute("aria-label", copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", {
-            run: label,
-            stage: stageIndex + 1,
-          }))
+          control.setAttribute("aria-label", runContext)
           const position = htmlElement(document, "span", "apc-run-meta")
           position.textContent = copy(t, "graph.runStagePosition", "Run {{run}} · Stage {{stage}}", {
             run: runIndex + 1,
@@ -1724,6 +1743,10 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const label = runLabel(config, run)
     const selected = current.selection?.kind === "run" && current.selection.runId === run.id
     const runKey = uiKeyFor("run", run.id)
+    const runContext = copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", {
+      run: `${runIndex + 1}: ${label}`,
+      stage: stageIndex + 1,
+    })
     const card = htmlElement(document, "article", "apc-run-card")
     card.dataset.apcRunKey = runKey
     card.dataset.selected = String(selected)
@@ -1736,7 +1759,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     selectRun.dataset.apcRunSelect = "true"
     selectRun.dataset.selected = String(selected)
     selectRun.setAttribute("aria-pressed", String(selected))
-    selectRun.setAttribute("aria-label", copy(t, "graph.selectRun", "Select run {{run}}, stage {{stage}}", { run: label, stage: stageIndex + 1 }))
+    selectRun.setAttribute("aria-label", runContext)
     const runHeading = htmlElement(document, "h4")
     runHeading.append(selectRun)
     const meta = htmlElement(document, "p", "apc-run-meta")
@@ -1772,7 +1795,9 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const actions = htmlElement(document, "div", "apc-card-actions")
     if (mode === "parallel") {
       const up = actionButton(document, t("action.moveUp"), "move-run", { apcRunKey: runKey, direction: "up" }, true)
+      up.setAttribute("aria-label", `${t("action.moveUp")} · ${runContext}`)
       const down = actionButton(document, t("action.moveDown"), "move-run", { apcRunKey: runKey, direction: "down" }, true)
+      down.setAttribute("aria-label", `${t("action.moveDown")} · ${runContext}`)
       up.disabled = runIndex === 0
       down.disabled = runIndex === stage.runs.length - 1
       actions.append(up, down)
@@ -1780,6 +1805,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const finalBlocked = finalRouteUsesRun(pipeline, run.id)
     const remove = actionButton(document, t("action.removeRun"), "remove-run", { apcRunKey: runKey }, true)
     remove.disabled = finalBlocked || (mode === "parallel" ? stage.runs.length <= 1 : pipeline.stages.length <= 1)
+    remove.setAttribute("aria-label", `${t("action.removeRun")} · ${runContext}`)
     actions.append(remove)
     card.append(actions)
     if (finalBlocked) {
@@ -1806,12 +1832,16 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     card.dataset.apcStageKey = stageKey
     card.dataset.apcStage = "true"
     card.dataset.stagePosition = String(stageIndex + 1)
+    card.setAttribute("role", "listitem")
     if (mode === "sequential") {
       card.dataset.apcCausalStage = "true"
-      card.setAttribute("role", "listitem")
     }
     const heading = htmlElement(document, "h3")
     heading.textContent = copy(t, "graph.stageHeading", "Stage {{index}} · {{name}}", {
+      index: stageIndex + 1,
+      name: stage.name || t("graph.defaultStageName", { index: stageIndex + 1 }),
+    })
+    const stageContext = copy(t, "graph.stageHeading", "Stage {{index}} · {{name}}", {
       index: stageIndex + 1,
       name: stage.name || t("graph.defaultStageName", { index: stageIndex + 1 }),
     })
@@ -1824,11 +1854,14 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     }
     const actions = htmlElement(document, "div", "apc-card-actions")
     const up = actionButton(document, t("action.moveUp"), "move-stage", { apcStageKey: stageKey, direction: "up" }, true)
+    up.setAttribute("aria-label", `${t("action.moveUp")} · ${stageContext}`)
     const down = actionButton(document, t("action.moveDown"), "move-stage", { apcStageKey: stageKey, direction: "down" }, true)
+    down.setAttribute("aria-label", `${t("action.moveDown")} · ${stageContext}`)
     up.disabled = stageIndex === 0
     down.disabled = stageIndex === pipeline.stages.length - 1
     const finalBlocked = stage.runs.some((run) => finalRouteUsesRun(pipeline, run.id))
     const remove = actionButton(document, t("action.removeStage"), "remove-stage", { apcStageKey: stageKey }, true)
+    remove.setAttribute("aria-label", `${t("action.removeStage")} · ${stageContext}`)
     remove.disabled = pipeline.stages.length <= 1 || finalBlocked
     actions.append(up, down, remove)
     if (finalBlocked) {
@@ -2039,10 +2072,10 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       warning.append(warningHeading, warningText)
       topology.append(heading, description, warning)
       const stages = htmlElement(document, "div", "apc-topology-stages")
+      stages.setAttribute("role", "list")
       if (mode === "sequential") {
         stages.dataset.apcCausalChain = "true"
         stages.dataset.connectionSource = "main"
-        stages.setAttribute("role", "list")
       }
       const reachableRunIds = mode === "parallel"
         ? validateConfigForMode(config, "parallel").reachableRunIds
@@ -2360,6 +2393,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
 
   const render = (snapshot: GraphEditorSnapshot): void => {
     if (destroyed) return
+    authoritativeRenderRevision += 1
     captureFocusedAction()
     const next = normalizeSnapshot(snapshot)
     observeImportedIds(next.config)

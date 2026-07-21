@@ -774,7 +774,7 @@ describe("APC thread center workspace", () => {
     editor.destroy()
   })
 
-  test("projects consent review across split controllers and defers workspace publishing until close", async () => {
+  test("keeps queued workspace publishing inert after lock changes during consent review", async () => {
     const workspaceBridge = createBridge()
     let projectedReviewOpen = false
     let workspaceLocked = false
@@ -854,7 +854,7 @@ describe("APC thread center workspace", () => {
     await flushPromise
     expect(projectedReviewOpen).toBe(false)
     expect(phaseChanges).toEqual([true, false])
-    expect(dirty).toEqual([[THREAD_A, keptValue]])
+    expect(dirty).toEqual([])
     expect(flushCount).toBe(1)
     expect(workspaceBridge.handles[0]!.updates.at(-1)?.readOnly).toBe(true)
 
@@ -1086,6 +1086,37 @@ describe("APC thread center workspace", () => {
     editor.destroy()
   })
 
+  test("drops a queued dirty write after the rendered thread context changes", async () => {
+    const { bridge, calls } = createBridge()
+    const dirty: Array<[string, SpindleLoomBlockEditorValue]> = []
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onDirty: (threadId, value) => {
+        dirty.push([threadId, value])
+      },
+    })
+    editor.render(snapshot())
+    calls[0]!.options.onChange?.({
+      blocks: [],
+      promptVariableValues: { draft: { value: "stale" } },
+    })
+    editor.render(snapshot({ consentReviewOpen: true }))
+    const flushPromise = editor.flush()
+    await Promise.resolve()
+    editor.render(snapshot({
+      selectedThreadId: THREAD_B,
+      contextAuthorityGeneration: 2,
+      consentReviewOpen: false,
+    }))
+    await flushPromise
+    expect(dirty).toEqual([])
+    editor.destroy()
+  })
+
   test("shows run-only configuration and updates requiredness, timeout, and earlier-output bindings", () => {
     const { bridge } = createBridge()
     const runChanges: Array<[string, ThreadEditorRunChange]> = []
@@ -1266,6 +1297,75 @@ describe("APC thread center workspace", () => {
     position.value = "run-position-1"
     position.dispatchEvent(new Event("change"))
     expect(changes).toHaveLength(2)
+    editor.destroy()
+  })
+
+  test("ignores an asynchronous run-position completion after rerender", async () => {
+    const { bridge } = createBridge()
+    let resolveMove: ((accepted: boolean) => void) | undefined
+    const pendingMove = new Promise<boolean>((resolve) => {
+      resolveMove = resolve
+    })
+    let changes = 0
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onRunChange: () => {
+        changes += 1
+        return pendingMove
+      },
+    })
+    editor.render(snapshot({ selectedRun: selectedRun() }))
+    const detachedPosition = editor.element.querySelector<HTMLSelectElement>("[data-apc-run-position]")!
+    detachedPosition.value = "run-position-3"
+    detachedPosition.dispatchEvent(new Event("change"))
+    expect(changes).toBe(1)
+
+    editor.render(snapshot({ selectedRun: selectedRun(), contextAuthorityGeneration: 2 }))
+    resolveMove?.(true)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(editor.element.querySelector("[data-apc-thread-live-region]")?.textContent).toBe("")
+    expect(editor.element.querySelector<HTMLSelectElement>("[data-apc-run-position]")?.value).toBe("run-position-2")
+    expect(changes).toBe(1)
+    editor.destroy()
+  })
+
+  test("announces a synchronous run move after its authoritative rerender", () => {
+    const { bridge } = createBridge()
+    const initialRun = selectedRun()
+    const movedRun: NonNullable<ThreadEditorSnapshot["selectedRun"]> = {
+      ...initialRun,
+      stageName: "Final stage",
+      stageOrdinal: 4,
+      ordinal: 1,
+    }
+    let rerender: (() => void) | undefined
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      surface: "configuration",
+      parent: fakeParent,
+      onRunChange: () => {
+        rerender?.()
+      },
+    })
+    rerender = () => editor.render(snapshot({ selectedRun: movedRun }))
+    editor.render(snapshot({ selectedRun: initialRun }))
+    const position = editor.element.querySelector<HTMLSelectElement>("[data-apc-run-position]")!
+    position.value = "run-position-3"
+    position.dispatchEvent(new Event("change"))
+
+    expect(editor.element.querySelector("[data-apc-thread-live-region]")?.textContent)
+      .toContain("en:a11y.runReordered")
+    expect(editor.element.querySelector<HTMLSelectElement>("[data-apc-run-position]")?.value)
+      .toBe("run-position-3")
     editor.destroy()
   })
 
@@ -1994,6 +2094,7 @@ describe("APC thread center workspace", () => {
     close.dispatchEvent(tabEvent)
     expect(document.activeElement).toBe(close)
     close.click()
+    expect(fakeElement(document.activeElement!).dataset.apcThreadWorkspaceHeading).toBe("true")
     expect(editor.element.querySelector("[data-apc-consent-review]")).toBe(null)
     expect(editor.element.querySelector<HTMLInputElement>("[data-apc-workspace-source-option]")!.disabled).toBe(true)
 
@@ -2010,6 +2111,7 @@ describe("APC thread center workspace", () => {
     editor.render(freshView)
     expect(editor.element.querySelector("[data-apc-consent-review]")).toBe(null)
     expect(editor.element.querySelectorAll<HTMLInputElement>("[data-apc-workspace-source-option]")[1]!.disabled).toBe(false)
+    expect(fakeElement(document.activeElement!).dataset.apcThreadWorkspaceHeading).toBe("true")
     releases[0]?.()
     await Promise.resolve()
     expect(editor.element.querySelector("[data-apc-consent-review]")).toBe(null)

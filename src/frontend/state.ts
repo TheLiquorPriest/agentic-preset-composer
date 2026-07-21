@@ -127,8 +127,8 @@ export type ApcExecutionState = Readonly<{
   topologyApplicable: boolean
 }>
 
-export type ApcTraceEventSurface = Readonly<Pick<TraceEvent, "kind" | "sequence" | "timestamp" | "status" | "preview">>
-export type ApcTraceSummarySurface = Readonly<Pick<TraceSummary, "status" | "startedAt" | "finishedAt" | "eventCount" | "preview" | "truncated"> & { key: string }>
+export type ApcTraceEventSurface = Readonly<Pick<TraceEvent, "kind" | "sequence" | "timestamp" | "status">>
+export type ApcTraceSummarySurface = Readonly<Pick<TraceSummary, "status" | "startedAt" | "finishedAt" | "eventCount" | "truncated"> & { key: string }>
 export type ApcTraceDetailSurface = Readonly<ApcTraceSummarySurface & { events: readonly ApcTraceEventSurface[] }>
 
 export type ApcTraceState = Readonly<{
@@ -159,6 +159,8 @@ export interface ApcFrontendSnapshot {
   readonly connectionBindings: Readonly<Record<string, ApcConnectionBinding>>
   readonly consent: Readonly<Record<string, ApcConsent>>
   readonly execution: ApcExecutionState
+  /** Monotonic authority epoch for execution-lock transitions. */
+  readonly executionLockEpoch: number
   readonly executionMutationLocked: boolean
   readonly traces: ApcTraceState
   readonly busy: boolean
@@ -502,6 +504,7 @@ type ApcOperationToken = Readonly<{
   presetGeneration: number
   requestGeneration: number
   executionId?: string | null
+  executionLockEpoch: number
   traceGeneration?: number
 }>
 
@@ -528,9 +531,11 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
   #pendingRaw: unknown = undefined
   #flushPromise: Promise<void> | null = null
   #traceGeneration = 0
+  #traceNamespace = 0
   #presetGeneration = 0
   #disposed = false
   #executionActivityGeneration = 0
+  #executionLockEpoch = 0
   #busyReason: ApcBusyReason | null = null
   #executionBusy = false
   #traceSummaries: TraceSummary[] = []
@@ -593,14 +598,14 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#startConnectionDiscovery(this.#nextOperation("connections", presetId), presetId)
       }
     } catch (error) {
-      if (this.#isCurrent(token)) {
+      if (this.#isRequestCurrent(token)) {
         const surface = saveErrorSurface(error)
         this.#snapshot = this.#makeSnapshot({ ...this.#snapshot, hydrating: false, hydrated: false, saveError: surface, stale: false })
         this.#notify()
       }
       throw error
     } finally {
-      if (this.#isCurrent(token)) this.#setBusy(null)
+      if (this.#isRequestCurrent(token)) this.#setBusy(null)
     }
     return this.#snapshot
   }
@@ -731,12 +736,13 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#notify()
       return this.#snapshot.availableConnections
     } finally {
-      if (this.#isCurrent(token)) this.#setBusy(null)
+      if (this.#isRequestCurrent(token)) this.#setBusy(null)
     }
   }
 
   async bindConnection(slotId: string, connectionKey: string): Promise<ApcConnectionBinding> {
     this.#assertUsable()
+    this.#assertExecutionMutationUnlocked("bind connection")
     const presetId = this.#requirePreset()
     const connectionId = this.#connectionIdsByKey.get(connectionKey)
     if (connectionId === undefined) throw staleOperationError("bind connection")
@@ -754,10 +760,10 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#notify()
     return cloneValue(binding)
   }
-
   async unbindConnection(slotId: string): Promise<ApcConnectionBinding> {
     this.#assertUsable()
     const presetId = this.#requirePreset()
+    this.#assertExecutionMutationUnlocked("unbind connection")
     const token = this.#nextOperation(`binding:${slotId}`, presetId)
     const payload = await this.#persistence.unbindSlot(presetId, slotId)
     this.#assertCurrent(token)
@@ -777,6 +783,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#assertUsable()
     const presetId = this.#requirePreset()
     if (selector.presetId !== presetId) throw staleOperationError("approve consent")
+    this.#assertExecutionMutationUnlocked("approve consent")
     const token = this.#nextOperation(`consent:${consentKey(selector)}`, presetId)
     const payload = await this.#persistence.approveConsent(selector)
     this.#assertCurrent(token)
@@ -786,16 +793,17 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#assertUsable()
     const presetId = this.#requirePreset()
     if (selector.presetId !== presetId) throw staleOperationError("revoke consent")
+    this.#assertExecutionMutationUnlocked("revoke consent")
     const token = this.#nextOperation(`consent:${consentKey(selector)}`, presetId)
     const payload = await this.#persistence.revokeConsent(selector)
     this.#assertCurrent(token)
     return this.#setConsent(payload)
   }
-
   async resolveConsent(selector: ConsentSelector): Promise<ApcConsent> {
     this.#assertUsable()
     const presetId = this.#requirePreset()
     if (selector.presetId !== presetId) throw staleOperationError("resolve consent")
+    this.#assertExecutionMutationUnlocked("resolve consent")
     const token = this.#nextOperation(`consent:${consentKey(selector)}`, presetId)
     const payload = await this.#persistence.resolveConsent(selector)
     this.#assertCurrent(token)
@@ -806,7 +814,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#assertUsable()
     const presetId = this.#requirePreset()
     const executionId = options.executionKey === undefined
-      ? undefined
+      ? this.#executionId ?? undefined
       : this.#executionIdsByKey(options.executionKey)
     if (options.executionKey !== undefined && executionId === undefined) throw staleOperationError("load traces")
     this.#traceGeneration += 1
@@ -822,11 +830,15 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         ? { ...traceOptions, presetId }
         : { ...traceOptions, executionId, presetId })
       this.#assertCurrent(token)
+      const traces = payload.traces.filter((trace) =>
+        trace.presetId === presetId &&
+        (executionId === undefined || trace.executionId === executionId)
+      )
       for (const key of Object.keys(this.#traceDetails)) delete this.#traceDetails[key]
       this.#traceIdsByKey.clear()
-      this.#traceSummaries = [...payload.traces]
+      this.#traceSummaries = [...traces]
       this.#traceCursor = payload.nextCursor
-      for (const trace of payload.traces) {
+      for (const trace of traces) {
         const key = this.#traceKey(trace.executionId, trace.traceId)
         this.#traceIdsByKey.set(key, { executionId: trace.executionId, traceId: trace.traceId })
       }
@@ -834,7 +846,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#notify()
       return this.#snapshot.traces
     } finally {
-      if (this.#isCurrent(token)) this.#setBusy(null)
+      if (this.#isRequestCurrent(token)) this.#setBusy(null)
     }
   }
 
@@ -887,7 +899,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#assertCurrent(token)
       if (cancellation.executionId !== executionId || cancellation.presetId !== presetId) throw staleOperationError("cancel execution")
     } finally {
-      if (this.#isCurrent(token)) this.#setBusy(null)
+      if (this.#isRequestCurrent(token)) this.#setBusy(null)
     }
   }
 
@@ -1001,6 +1013,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       connectionBindings: cloneValue(values.connectionBindings ?? this.#connectionBindings),
       consent: cloneValue(values.consent ?? this.#consent),
       execution,
+      executionLockEpoch: this.#executionLockEpoch,
       executionMutationLocked,
       traces: cloneValue(values.traces ?? this.#traceState()),
       busy: values.busy ?? this.#currentBusyReason() !== null,
@@ -1010,20 +1023,32 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       hydrating: values.hydrating,
     })
   }
+
+  #clearTraceState(): void {
+    this.#traceGeneration = this.#traceGeneration >= Number.MAX_SAFE_INTEGER ? 0 : this.#traceGeneration + 1
+    this.#traceNamespace = this.#traceNamespace >= Number.MAX_SAFE_INTEGER ? 0 : this.#traceNamespace + 1
+    for (const key of Object.keys(this.#traceDetails)) delete this.#traceDetails[key]
+    this.#traceIdsByKey.clear()
+    this.#traceSummaries = []
+    this.#traceCursor = undefined
+  }
+
+  #advanceExecutionLockEpoch(): void {
+    this.#executionLockEpoch = this.#executionLockEpoch >= Number.MAX_SAFE_INTEGER
+      ? 0
+      : this.#executionLockEpoch + 1
+  }
+
   #replacePresetState(presetId: string | null): void {
     this.#persistedConfig = null
     this.#persistedRaw = null
     this.#pendingRaw = undefined
     this.#availableConnections = []
     this.#connectionIdsByKey.clear()
-    this.#traceIdsByKey.clear()
-    this.#traceGeneration += 1
+    this.#clearTraceState()
     this.#retiredExecutionIds.clear()
     for (const key of Object.keys(this.#connectionBindings)) delete this.#connectionBindings[key]
     for (const key of Object.keys(this.#consent)) delete this.#consent[key]
-    for (const key of Object.keys(this.#traceDetails)) delete this.#traceDetails[key]
-    this.#traceSummaries = []
-    this.#traceCursor = undefined
     this.#execution = { executionKey: null, phase: "idle", status: "idle", terminal: false, activity: [], topologyActivity: [], topologyApplicable: false }
     this.#executionTopologyInvalidated = false
     this.#executionBusy = false
@@ -1032,8 +1057,29 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#executionId = null
     this.#executionPresetId = presetId
     this.#executionTraceId = null
-    this.#snapshot = this.#makeSnapshot({ ...this.#snapshot, presetId, decoded: null, config: null, activeMode: "single", selection: null, dirty: false, revision: 0, saveError: null, stale: false, hydrated: false, hydrating: false, availableConnections: this.#availableConnections, connectionBindings: {}, consent: {}, execution: this.#execution, traces: this.#traceState(), busy: false, busyReason: null })
+    this.#snapshot = this.#makeSnapshot({
+      ...this.#snapshot,
+      presetId,
+      decoded: null,
+      config: null,
+      activeMode: "single",
+      selection: null,
+      dirty: false,
+      revision: 0,
+      saveError: null,
+      stale: false,
+      hydrated: false,
+      hydrating: false,
+      availableConnections: this.#availableConnections,
+      connectionBindings: {},
+      consent: {},
+      execution: this.#execution,
+      traces: this.#traceState(),
+      busy: false,
+      busyReason: null,
+    })
   }
+
   #executionIdsByKey(executionKey: string): string | undefined {
     if (this.#execution.executionKey !== executionKey) return undefined
     return this.#executionId ?? undefined
@@ -1044,8 +1090,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       if (identity.executionId === executionId && identity.traceId === traceId) return key
     }
     let index = this.#traceIdsByKey.size + 1
-    let key = `trace-${index}`
-    while (this.#traceIdsByKey.has(key)) key = `trace-${++index}`
+    let key = `trace-${this.#traceNamespace}-${index}`
+    while (this.#traceIdsByKey.has(key)) key = `trace-${this.#traceNamespace}-${++index}`
     this.#traceIdsByKey.set(key, { executionId, traceId })
     return key
   }
@@ -1057,7 +1103,6 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       startedAt: trace.startedAt,
       ...(trace.finishedAt === undefined ? {} : { finishedAt: trace.finishedAt }),
       eventCount: trace.eventCount,
-      ...(trace.preview === undefined ? {} : { preview: trace.preview }),
       ...(trace.truncated === undefined ? {} : { truncated: trace.truncated }),
     }
   }
@@ -1123,6 +1168,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         throw new ApcFrontendStateError("INVALID_HYDRATION", "APC hydration contained invalid execution activity")
       }
       if (this.#executionActivityGeneration === activityGenerationAtHydrationStart) {
+        this.#clearTraceState()
+        this.#advanceExecutionLockEpoch()
         this.#executionSerial += 1
         this.#executionId = hydratedExecution.executionId
         this.#executionPresetId = hydratedExecution.presetId
@@ -1151,7 +1198,6 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         sequence: event.sequence,
         timestamp: event.timestamp,
         ...(event.status === undefined ? {} : { status: event.status }),
-        ...(event.preview === undefined ? {} : { preview: event.preview }),
       })),
     }
   }
@@ -1233,14 +1279,15 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#assertCurrent(token)
         this.#acceptSave(result, batchRevision)
       } catch (error) {
-        if (!this.#isCurrent(token)) throw error
+        if (!this.#isRequestCurrent(token)) throw error
         if (this.#pendingRaw === undefined && this.#snapshot.revision === batchRevision) this.#pendingRaw = raw
+        if (!this.#isCurrent(token)) throw error
         const surface = saveErrorSurface(error)
         this.#snapshot = this.#makeSnapshot({ ...this.#snapshot, saveError: surface, stale: false, dirty: true })
         this.#notify()
         throw error
       } finally {
-        if (this.#isCurrent(token)) this.#setBusy(null)
+        if (this.#isRequestCurrent(token)) this.#setBusy(null)
       }
       if (this.#pendingRaw === undefined && !this.#snapshot.dirty) return
     }
@@ -1369,6 +1416,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     const currentId = this.#executionId
     if (currentId === null) {
       if (phase !== "started" || this.#retiredExecutionIds.has(message.payload.executionId)) return
+      this.#clearTraceState()
+      this.#advanceExecutionLockEpoch()
       this.#executionSerial += 1
       this.#executionId = message.payload.executionId
       this.#executionPresetId = message.payload.presetId
@@ -1384,6 +1433,8 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         if (typeof oldest !== "string") break
         this.#retiredExecutionIds.delete(oldest)
       }
+      this.#clearTraceState()
+      this.#advanceExecutionLockEpoch()
       this.#executionSerial += 1
       this.#executionId = message.payload.executionId
       this.#executionPresetId = message.payload.presetId
@@ -1393,6 +1444,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     } else {
       if (this.#execution.terminal || phase === "started") return
       if (phase !== "progress" && !expectedTerminal) return
+      const wasTerminal = this.#execution.terminal
       this.#executionTraceId = message.payload.traceId ?? this.#executionTraceId
       this.#execution = executionFromActivity(
         message.payload,
@@ -1401,6 +1453,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#execution.usage,
         this.#execution.topologyActivity,
       )
+      if (wasTerminal !== this.#execution.terminal) this.#advanceExecutionLockEpoch()
     }
     if (this.#executionTopologyInvalidated) this.#invalidateExecutionTopology()
     this.#executionActivityGeneration += 1
@@ -1408,6 +1461,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     const busyReason = this.#currentBusyReason()
     this.#snapshot = this.#makeSnapshot({
       ...this.#snapshot,
+      traces: this.#traceState(),
       execution: this.#execution,
       busy: busyReason !== null,
       busyReason,
@@ -1428,9 +1482,17 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       presetId,
       presetGeneration: this.#presetGeneration,
       requestGeneration,
+      executionLockEpoch: this.#executionLockEpoch,
       ...(executionId === undefined ? {} : { executionId }),
       ...(traceGeneration === undefined ? {} : { traceGeneration }),
     }
+  }
+
+  #isRequestCurrent(token: ApcOperationToken): boolean {
+    return !this.#disposed &&
+      token.presetGeneration === this.#presetGeneration &&
+      token.presetId === this.#snapshot.presetId &&
+      this.#operationGenerations.get(token.operation) === token.requestGeneration
   }
 
   #isCurrent(token: ApcOperationToken): boolean {
@@ -1438,6 +1500,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       token.presetGeneration === this.#presetGeneration &&
       token.presetId === this.#snapshot.presetId &&
       this.#operationGenerations.get(token.operation) === token.requestGeneration &&
+      token.executionLockEpoch === this.#executionLockEpoch &&
       (token.executionId === undefined || token.executionId === this.#executionId) &&
       (token.traceGeneration === undefined || token.traceGeneration === this.#traceGeneration)
   }
@@ -1450,6 +1513,11 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
   #requirePreset(): string {
     if (this.#snapshot.presetId === null || !this.#snapshot.hydrated) throw new ApcFrontendStateError("NO_PRESET", "APC preset is not hydrated")
     return this.#snapshot.presetId
+  }
+  #assertExecutionMutationUnlocked(operation: string): void {
+    if (this.#snapshot.executionMutationLocked) {
+      throw new ApcFrontendStateError("EXECUTION_LOCKED", `APC ${operation} is unavailable while execution is active`)
+    }
   }
 
   #assertUsable(): void {

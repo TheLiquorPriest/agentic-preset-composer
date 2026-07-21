@@ -796,8 +796,10 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
   const abortExecution = (execution: ActiveExecution, reason: CancellationReason): void => {
     const source = cancellationSourceFor(reason)
     const key = executionKey(execution.userId, execution.presetId, execution.executionId)
-    if (source !== undefined && !cancellationSources.has(key)) cancellationSources.set(key, source)
-    execution.cancellation.stop(reason)
+    const accepted = execution.cancellation.stop(reason)
+    if (accepted && source !== undefined && !cancellationSources.has(key)) {
+      cancellationSources.set(key, source)
+    }
   }
   const revokeAndAbort = (reason: CancellationReason): void => {
     registry.revoke()
@@ -1682,19 +1684,45 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
   const disposeWithReason = (reason: CancellationReason): Promise<void> => {
     if (disposePromise !== undefined) return disposePromise
     if (startPromise === undefined && !started) readyStartupCancelled = true
-    disposePromise = (async () => {
-      if (disposed) return
+    const completion = Promise.withResolvers<void>()
+    disposePromise = completion.promise
+    const run = async (): Promise<void> => {
+      if (disposed) {
+        completion.resolve()
+        return
+      }
+      const cancellationSource = cancellationSourceFor(reason) ?? "disposed"
       for (const execution of activeExecutions.values()) {
         abortExecution(execution, reason)
+        const executionCancellationReason = execution.cancellation.reason ?? reason
+        const integrityFatal = executionCancellationReason === "integrity-fatal"
+        const graphFallback =
+          executionCancellationReason === "deadline" ||
+          executionCancellationReason === "child-timeout" ||
+          executionCancellationReason === "required-failure"
+        const executionCancellationSource =
+          cancellationSources.get(executionKey(execution.userId, execution.presetId, execution.executionId)) ??
+          cancellationSourceFor(executionCancellationReason) ??
+          cancellationSource
+        const terminalPhase: ActivityPhase = integrityFatal ? "failed" : graphFallback ? "completed" : "cancelled"
+        const terminalOutcome: ActivityOutcome = integrityFatal
+          ? "integrity-fatal"
+          : graphFallback
+            ? "graph-fallback"
+            : "parent-cancel"
         emitExecutionActivity(execution, {
           executionId: execution.executionId,
           presetId: execution.presetId,
           kind: "execution-terminal",
-          phase: "cancelled",
+          phase: terminalPhase,
           terminal: true,
           traceId: execution.executionId,
-          outcome: "parent-cancel",
-          cancellationSource: cancellationSourceFor(reason) ?? "disposed",
+          outcome: terminalOutcome,
+          ...(integrityFatal
+            ? { errorCategory: "integrity" as const }
+            : terminalPhase === "cancelled"
+              ? { cancellationSource: executionCancellationSource }
+              : {}),
         })
         try {
           claimReplayTombstone(execution.userId, execution.presetId, execution.executionId)
@@ -1705,14 +1733,23 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         try {
           finalizeTrace(traces, execution.userId, execution.presetId, execution.executionId, {
             sequence: (trace?.lastSequence ?? 0) + 1,
+            status: terminalPhase === "cancelled" ? "cancelled" : "completed",
             kind: "terminal",
             type: "terminal",
-            metadata: Object.freeze({
-              outcome: "parent-cancel",
-              outcomeCode: reason,
-              finishedAt: now(),
-            }),
-            preview: "parent-cancel",
+            metadata: terminalPhase === "cancelled"
+              ? Object.freeze({
+                  status: "cancelled",
+                  cancellationSource: executionCancellationSource,
+                  outcome: terminalOutcome,
+                  outcomeCode: executionCancellationReason,
+                  finishedAt: now(),
+                })
+              : Object.freeze({
+                  outcome: terminalOutcome,
+                  outcomeCode: executionCancellationReason,
+                  finishedAt: now(),
+                }),
+            preview: terminalOutcome,
           })
         } catch {
           // Bounded trace retention may evict a completed trace before finalization.
@@ -1739,8 +1776,12 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       started = false
       await Promise.allSettled([...activeInterceptorCalls])
       if (runtimeGlobals()[ACTIVE_RUNTIME_KEY] === runtime) delete runtimeGlobals()[ACTIVE_RUNTIME_KEY]
-    })()
-    return disposePromise
+      completion.resolve()
+    }
+    void run().catch(error => {
+      completion.reject(error)
+    })
+    return completion.promise
   }
 
   const watchLifecycle = (event: string, reason: CancellationReason): void => {

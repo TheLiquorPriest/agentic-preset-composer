@@ -78,7 +78,8 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
     return false
   }
   try {
-    return Object.getPrototypeOf(value) === Object.prototype
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
   } catch {
     return false
   }
@@ -307,6 +308,114 @@ function checkArray(
   }
   return value
 }
+function checkLiteral(
+  value: unknown,
+  path: Path,
+  issues: ApcIssue[],
+  mode?: ModeIssue,
+): value is string {
+  if (typeof value !== "string") {
+    addIssue(issues, path, "LITERAL_TYPE", "Expected literal text.", mode)
+    return false
+  }
+  if (utf8Bytes(value) > MAX_LITERAL_BYTES) {
+    addIssue(issues, path, "LITERAL_LIMIT", `Literal exceeds ${MAX_LITERAL_BYTES} UTF-8 bytes.`, mode)
+  }
+  return true
+}
+
+function validatePromptStringArray(
+  value: unknown,
+  path: Path,
+  issues: ApcIssue[],
+  mode?: ModeIssue,
+): void {
+  const values = checkArray(value, path, MAX_BLOCKS_PER_THREAD, "PROMPT_ARRAY_LIMIT", issues, mode)
+  if (!values || values.length > MAX_BLOCKS_PER_THREAD) return
+  for (let index = 0; index < values.length; index += 1) {
+    checkLiteral(arrayValue(values, index), [...path, index], issues, mode)
+  }
+}
+
+function validatePromptVariableDefinition(
+  value: unknown,
+  path: Path,
+  issues: ApcIssue[],
+  mode?: ModeIssue,
+): void {
+  if (!isPlainRecord(value)) {
+    addIssue(issues, path, "VARIABLE_TYPE", "Expected a plain prompt variable definition.", mode)
+    return
+  }
+  checkLabel(ownValue(value, "id"), [...path, "id"], issues, mode)
+  checkLabel(ownValue(value, "name"), [...path, "name"], issues, mode)
+  checkLabel(ownValue(value, "label"), [...path, "label"], issues, mode)
+  const description = ownValue(value, "description")
+  if (description !== MISSING && description !== undefined) checkDescription(description, [...path, "description"], issues, mode)
+  const type = ownValue(value, "type")
+  if (type === "text" || type === "textarea") {
+    checkLiteral(ownValue(value, "defaultValue"), [...path, "defaultValue"], issues, mode)
+    return
+  }
+  if (type === "number") {
+    const defaultValue = ownValue(value, "defaultValue")
+    if (typeof defaultValue !== "number" || !Number.isFinite(defaultValue)) {
+      addIssue(issues, [...path, "defaultValue"], "FINITE_NUMBER_REQUIRED", "Expected a finite number.", mode)
+    }
+    return
+  }
+  if (type === "slider") {
+    for (const key of ["defaultValue", "min", "max"] as const) {
+      const field = ownValue(value, key)
+      if (typeof field !== "number" || !Number.isFinite(field)) {
+        addIssue(issues, [...path, key], "FINITE_NUMBER_REQUIRED", "Expected a finite number.", mode)
+      }
+    }
+    return
+  }
+  if (type === "select" || type === "multiselect") {
+    const options = checkArray(
+      ownValue(value, "options"),
+      [...path, "options"],
+      MAX_BLOCKS_PER_THREAD,
+      "PROMPT_OPTIONS_LIMIT",
+      issues,
+      mode,
+    )
+    if (options) {
+      if (options.length > MAX_BLOCKS_PER_THREAD) {
+        return
+      }
+      for (let index = 0; index < options.length; index += 1) {
+        const optionPath: Path = [...path, "options", index]
+        const option = arrayValue(options, index)
+        if (!isPlainRecord(option)) {
+          addIssue(issues, optionPath, "OPTION_TYPE", "Expected a plain prompt option.", mode)
+          continue
+        }
+        checkLabel(ownValue(option, "id"), [...optionPath, "id"], issues, mode)
+        checkLabel(ownValue(option, "label"), [...optionPath, "label"], issues, mode)
+        checkLiteral(ownValue(option, "value"), [...optionPath, "value"], issues, mode)
+      }
+    }
+    if (type === "select") {
+      checkLiteral(ownValue(value, "defaultValue"), [...path, "defaultValue"], issues, mode)
+    } else {
+      validatePromptStringArray(ownValue(value, "defaultValue"), [...path, "defaultValue"], issues, mode)
+    }
+    const separator = ownValue(value, "separator")
+    if (separator !== MISSING && separator !== undefined) checkLiteral(separator, [...path, "separator"], issues, mode)
+    return
+  }
+  if (type === "switch") {
+    const defaultValue = ownValue(value, "defaultValue")
+    if (defaultValue !== 0 && defaultValue !== 1) {
+      addIssue(issues, [...path, "defaultValue"], "SWITCH_VALUE_REQUIRED", "switch defaultValue must be 0 or 1", mode)
+    }
+    return
+  }
+  addIssue(issues, [...path, "type"], "VARIABLE_TYPE", "Expected a supported prompt variable type.", mode)
+}
 
 function validateHint(
   value: unknown,
@@ -334,6 +443,8 @@ function validateBlock(
     addIssue(issues, path, "BLOCK_TYPE", "Expected a plain prompt block.", mode)
     return
   }
+  checkLabel(ownValue(value, "id"), [...path, "id"], issues, mode)
+  checkLabel(ownValue(value, "name"), [...path, "name"], issues, mode)
   const content = ownValue(value, "content")
   if (typeof content !== "string") {
     addIssue(issues, [...path, "content"], "BLOCK_CONTENT_TYPE", "Expected block content text.", mode)
@@ -345,6 +456,94 @@ function validateBlock(
       `Block content exceeds ${MAX_BLOCK_CONTENT_BYTES} UTF-8 bytes.`,
       mode,
     )
+  }
+  for (const key of ["marker", "color", "group"] as const) {
+    const field = ownValue(value, key)
+    if (field !== MISSING && field !== undefined && field !== null) checkLabel(field, [...path, key], issues, mode)
+  }
+  validatePromptStringArray(ownValue(value, "injectionTrigger"), [...path, "injectionTrigger"], issues, mode)
+  const characterTagTrigger = ownValue(value, "characterTagTrigger")
+  if (characterTagTrigger !== MISSING && characterTagTrigger !== undefined) {
+    validatePromptStringArray(characterTagTrigger, [...path, "characterTagTrigger"], issues, mode)
+  }
+  const variablesValue = ownValue(value, "variables")
+  if (variablesValue !== MISSING && variablesValue !== undefined) {
+    const variables = checkArray(
+      variablesValue,
+      [...path, "variables"],
+      MAX_BLOCKS_PER_THREAD,
+      "PROMPT_VARIABLES_LIMIT",
+      issues,
+      mode,
+    )
+    if (variables) {
+      if (variables.length > MAX_BLOCKS_PER_THREAD) return
+      for (let index = 0; index < variables.length; index += 1) {
+        validatePromptVariableDefinition(arrayValue(variables, index), [...path, "variables", index], issues, mode)
+      }
+    }
+  }
+}
+function validatePromptVariableValues(
+  value: unknown,
+  path: Path,
+  issues: ApcIssue[],
+  mode?: ModeIssue,
+): void {
+  if (!isPlainRecord(value)) {
+    addIssue(issues, path, "PROMPT_VALUES_TYPE", "Expected a plain prompt-variable values object.", mode)
+    return
+  }
+  let blockIds: string[]
+  try {
+    blockIds = Object.keys(value)
+  } catch {
+    addIssue(issues, path, "PROMPT_VALUES_TYPE", "Prompt-variable values could not be inspected.", mode)
+    return
+  }
+  if (blockIds.length > MAX_BLOCKS_PER_THREAD) {
+    addIssue(issues, path, "PROMPT_VALUES_LIMIT", `Prompt-variable blocks exceed ${MAX_BLOCKS_PER_THREAD} entries.`, mode)
+    return
+  }
+  for (const blockId of blockIds) {
+    const blockPath: Path = [...path, blockId]
+    if (characterCount(blockId) > MAX_NAME_CHARS) {
+      addIssue(issues, blockPath, "NAME_LIMIT", `Block ID exceeds ${MAX_NAME_CHARS} characters.`, mode)
+      continue
+    }
+    const block = ownValue(value, blockId)
+    if (!isPlainRecord(block)) {
+      addIssue(issues, blockPath, "PROMPT_VALUES_TYPE", "Expected a plain block values object.", mode)
+      continue
+    }
+    let names: string[]
+    try {
+      names = Object.keys(block)
+    } catch {
+      addIssue(issues, blockPath, "PROMPT_VALUES_TYPE", "Block values could not be inspected.", mode)
+      continue
+    }
+    if (names.length > MAX_BLOCKS_PER_THREAD) {
+      addIssue(issues, blockPath, "PROMPT_VALUES_LIMIT", `Prompt-variable values exceed ${MAX_BLOCKS_PER_THREAD} entries.`, mode)
+      continue
+    }
+    for (const name of names) {
+      const valuePath: Path = [...blockPath, name]
+      if (characterCount(name) > MAX_NAME_CHARS) {
+        addIssue(issues, valuePath, "NAME_LIMIT", `Variable name exceeds ${MAX_NAME_CHARS} characters.`, mode)
+        continue
+      }
+      const item = ownValue(block, name)
+      if (typeof item === "string") {
+        checkLiteral(item, valuePath, issues, mode)
+      } else if (typeof item === "number") {
+        if (!Number.isFinite(item)) addIssue(issues, valuePath, "FINITE_NUMBER_REQUIRED", "Expected a finite number.", mode)
+      } else if (Array.isArray(item)) {
+        validatePromptStringArray(item, valuePath, issues, mode)
+      } else {
+        addIssue(issues, valuePath, "PROMPT_VALUE_REQUIRED", "Prompt variable values must be strings, finite numbers, or string arrays", mode)
+      }
+    }
   }
 }
 
@@ -393,6 +592,7 @@ function validateThread(
     }
   }
   const variables = ownValue(value, "promptVariableValues")
+  validatePromptVariableValues(variables, [...path, "promptVariableValues"], issues, mode)
   if (!checkSerializedLimit(
     variables,
     [...path, "promptVariableValues"],

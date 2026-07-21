@@ -272,6 +272,8 @@ const ENDPOINT_VALUE = /\b(?:https?|wss?|ftp):\/\/[^\s<>"'`]+/giu
 const RAW_PAYLOAD = /^\s*(?:\{[\s\S]*\}|\[[\s\S]*\])\s*$/u
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu
 const OPAQUE_IDENTIFIER = /^(?:[0-9a-f]{24,}|[A-Za-z0-9_-]{32,})$/u
+let nextInspectorInstanceId = 0
+
 const SAFE_ERROR_MESSAGE_KEYS: Readonly<Partial<Record<ApcCatalogKey, true>>> = Object.freeze({
   "error.graph": true,
   "error.connection": true,
@@ -461,14 +463,16 @@ function appendStatusField(
   value: string,
   key: string,
   kind: string,
-): void {
+): HTMLElement {
   const row = createElement(documentRef, "p", "apc-inspector-field")
   row.dataset.inspectorField = key
+  const status = statusToken(documentRef, value, kind)
   row.append(
     createElement(documentRef, "span", "apc-inspector-field-label", label),
-    statusToken(documentRef, value, kind),
+    status,
   )
   parent.append(row)
+  return status
 }
 
 function createQuestionSection(documentRef: Document, key: string, title: string): HTMLElement {
@@ -669,6 +673,7 @@ class InspectorController implements ExecutionInspectorController {
   readonly #live: LiveRegion
   readonly #cleanups: Cleanup[]
   readonly #maxItems: number
+  readonly #instanceId = ++nextInspectorInstanceId
   #snapshot: ExecutionInspectorSnapshot | undefined
   #localError: InspectorSafeError | undefined
   #stopRequested = false
@@ -766,11 +771,15 @@ class InspectorController implements ExecutionInspectorController {
         ? null
         : [...this.element.querySelectorAll<HTMLButtonElement>("[data-inspector-action]")].find((candidate) => {
             if (candidate.dataset.inspectorAction !== activeAction) return false
+            if (candidate.disabled || candidate.getAttribute("aria-disabled") === "true") return false
             if (activeTraceKey !== undefined) return this.#traceKeyByButton.get(candidate) === activeTraceKey
             return activeTracePosition === undefined ||
               candidate.dataset.inspectorTracePosition === activeTracePosition
           }) ?? null
-      focusElement(replacement ?? this.element)
+      const focused = replacement !== null &&
+        focusElement(replacement) &&
+        this.#document.activeElement === replacement
+      if (!focused) focusElement(this.element)
     }
 
     const signature = this.#statusSignature(snapshot)
@@ -914,7 +923,7 @@ class InspectorController implements ExecutionInspectorController {
     }
     if (run.dispatch) node.append(this.#renderDispatch(run.dispatch))
     if (run.deadline) node.append(this.#renderBudget(run.deadline))
-    node.append(this.#renderInputs(run.inputSources ?? []), this.#renderOutput(run.output))
+    node.append(this.#renderInputs(run.inputSources ?? []), this.#renderOutput(run.output, run.status))
     if (run.error) node.append(this.#renderError(run.error, "run"))
     if (snapshot.canUseMainFallback === true && this.#options.onUseMainFallback) {
       node.append(this.#mainFallbackButton())
@@ -1089,6 +1098,7 @@ class InspectorController implements ExecutionInspectorController {
       run.optional === true ? this.#options.t("binding.optional") : this.#options.t("binding.required"),
       run.optional === true ? "optional" : "required",
     ))
+    node.append(this.#renderOutput(run.output, run.status))
     if (run.error) node.append(this.#renderError(run.error, "run"))
     return node
   }
@@ -1200,7 +1210,7 @@ class InspectorController implements ExecutionInspectorController {
     return node
   }
 
-  #renderOutput(output: InspectorOutputSummary | undefined): HTMLElement {
+  #renderOutput(output: InspectorOutputSummary | undefined, status?: InspectorRunStatus): HTMLElement {
     const node = createSection(this.#document, "output", this.#options.t("agentGraph.final"))
     appendField(
       this.#document,
@@ -1209,14 +1219,15 @@ class InspectorController implements ExecutionInspectorController {
       displayLabel(output?.label, this.#options.t),
       "output-label",
     )
-    if (output?.available !== undefined) {
+    const available = output?.available ?? (output === undefined || status === undefined ? undefined : status === "completed")
+    if (available !== undefined) {
       appendStatusField(
         this.#document,
         node,
         this.#options.t("inspector.fieldStatus"),
-        output.available ? this.#options.t("terminal.ready") : this.#options.t("terminal.unavailable"),
+        available ? this.#options.t("terminal.ready") : this.#options.t("terminal.unavailable"),
         "output-availability",
-        output.available ? "completed" : "failed",
+        available ? "completed" : "failed",
       )
     }
     return node
@@ -1320,14 +1331,29 @@ class InspectorController implements ExecutionInspectorController {
       const key = safeTraceKey(summary.key)
       if (key === undefined) continue
       const item = createElement(this.#document, "li", "apc-inspector-trace")
-      item.dataset.inspectorTracePosition = String(rendered + 1)
-      item.append(createElement(
+      const position = rendered + 1
+      item.dataset.inspectorTracePosition = String(position)
+      const ordinal = this.#options.t("inspector.runTitle", { index: position })
+      const title = createElement(
         this.#document,
         "h4",
         "apc-inspector-trace-title",
-        this.#options.t("inspector.fieldTrace"),
-      ))
-      appendStatusField(this.#document, item, this.#options.t("inspector.fieldStatus"), statusLabel(summary.status, this.#options.t), "trace-status", summary.status)
+        this.#options.t("inspector.fieldValue", {
+          label: this.#options.t("inspector.fieldTrace"),
+          value: ordinal,
+        }),
+      )
+      title.id = this.#traceAriaId(position, "label")
+      item.append(title)
+      const traceStatus = appendStatusField(
+        this.#document,
+        item,
+        this.#options.t("inspector.fieldStatus"),
+        statusLabel(summary.status, this.#options.t),
+        "trace-status",
+        summary.status,
+      )
+      traceStatus.id = this.#traceAriaId(position, "status")
 
       const count = finiteNonNegative(summary.eventCount)
       appendField(
@@ -1345,25 +1371,47 @@ class InspectorController implements ExecutionInspectorController {
       }
 
       const detail = snapshot.traceDetails?.[key]
-      if (detail !== undefined && Array.isArray(detail.events)) {
+      const detailRecord = detail !== null && typeof detail === "object" ? detail : undefined
+      const detailHasOmittedEvents = detailRecord !== undefined &&
+        Array.isArray(detailRecord.events) &&
+        detailRecord.events.length > MAX_TRACE_EVENTS
+      const detailCount = detailRecord === undefined ? undefined : finiteNonNegative(detailRecord.eventCount)
+      const detailMetadataIncomplete = detailCount !== undefined &&
+        (detailCount > MAX_TRACE_EVENTS ||
+          (Array.isArray(detailRecord?.events) && detailCount > detailRecord.events.length))
+      if (
+        summary.truncated === true ||
+        detailRecord?.truncated === true ||
+        (count !== undefined && count > MAX_TRACE_EVENTS) ||
+        detailMetadataIncomplete ||
+        detailHasOmittedEvents
+      ) {
+        item.append(createElement(this.#document, "p", "apc-inspector-trace-truncated", this.#options.t("inspector.previewTruncated")))
+      }
+      if (detailRecord !== undefined && Array.isArray(detailRecord.events)) {
         const details = createElement(this.#document, "details", "apc-inspector-trace-details")
         details.append(createElement(this.#document, "summary", undefined, this.#options.t("inspector.traceDetails")))
         const events = createElement(this.#document, "ol", "apc-inspector-trace-events")
-        for (const event of detail.events.slice(0, MAX_TRACE_EVENTS)) {
+        for (const event of detailRecord.events.slice(0, MAX_TRACE_EVENTS)) {
           if (event === null || typeof event !== "object") continue
           events.append(this.#renderTraceEvent(event))
         }
         details.append(events)
-        if (detail.events.length > MAX_TRACE_EVENTS) {
+        if (detailRecord.events.length > MAX_TRACE_EVENTS) {
           details.append(createElement(this.#document, "p", "apc-inspector-trace-omitted", this.#options.t("inspector.additionalEventsOmitted")))
         }
         item.append(details)
       }
 
-      const load = createElement(this.#document, "button", "apc-inspector-trace-load", this.#options.t("inspector.traceDetails"))
+      const load = createElement(this.#document, "button", "apc-inspector-trace-load")
       load.type = "button"
       load.dataset.inspectorAction = "load-trace"
-      load.dataset.inspectorTracePosition = String(rendered + 1)
+      load.dataset.inspectorTracePosition = String(position)
+      const actionLabel = createElement(this.#document, "span", "apc-inspector-trace-action-label", this.#options.t("inspector.traceDetails"))
+      actionLabel.id = this.#traceAriaId(position, "action")
+      load.append(actionLabel)
+      load.setAttribute("aria-labelledby", `${actionLabel.id} ${title.id}`)
+      load.setAttribute("aria-describedby", traceStatus.id)
       this.#traceKeyByButton.set(load, key)
       load.disabled = this.#options.onLoadTrace === undefined || this.#tracePending.has(`trace:${key}`)
       load.setAttribute("aria-disabled", load.disabled ? "true" : "false")
@@ -1379,6 +1427,9 @@ class InspectorController implements ExecutionInspectorController {
     return node
   }
 
+  #traceAriaId(position: number, part: "action" | "label" | "status"): string {
+    return `apc-inspector-${this.#instanceId}-trace-${position}-${part}`
+  }
   #renderTraceEvent(event: InspectorTraceEvent): HTMLElement {
     const item = createElement(this.#document, "li", "apc-inspector-trace-event")
     if (event.kind) appendField(this.#document, item, this.#options.t("inspector.fieldKind"), displayLabel(event.kind, this.#options.t), "trace-event-kind")

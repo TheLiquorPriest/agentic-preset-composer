@@ -2,6 +2,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   createBackendEndpointRouter,
+  MAX_ENDPOINT_SEQUENCE_LEDGERS,
   type BackendEndpointDependencies,
   type BackendEndpointRouter,
   type BackendBindingService,
@@ -169,6 +170,7 @@ function createFixture(options: {
   readonly bindSnapshot?: unknown
   readonly unbindSnapshot?: unknown
   readonly listConnectionsFailure?: Error
+  readonly listConnectionsGate?: Promise<void>
   readonly cancelAccepted?: boolean
   readonly consumeDisclosureAfterApproval?: boolean
   readonly initialConsent?: boolean
@@ -216,6 +218,7 @@ function createFixture(options: {
     listConnections: async userId => {
       calls.users.push(userId)
       if (options.listConnectionsFailure !== undefined) throw options.listConnectionsFailure
+      if (options.listConnectionsGate !== undefined) await options.listConnectionsGate
       return options.connectionProfiles ?? (userId === "user-a" ? [connectionProfile(userId)] : [])
     },
     ...(options.resolveSlot === undefined ? {} : { resolveSlot: options.resolveSlot }),
@@ -998,4 +1001,68 @@ describe("backend endpoint router", () => {
     )
     expect(errorCode(privateResponse)).toBe("APC_TRACE_NOT_FOUND")
   })
+  test("evicts only the deterministic oldest idle sequence ledger at exact capacity", async () => {
+    const { router } = createFixture()
+    for (let index = 0; index < MAX_ENDPOINT_SEQUENCE_LEDGERS; index += 1) {
+      const response = await router.handle(
+        { userId: `sequence-user-${index}` },
+        intent("list_connections", {}),
+      )
+      expect(response.type).toBe("connections")
+      if (response.type === "connections") expect(response.sequence).toBe(1)
+    }
+
+    const retained = await router.handle({ userId: "sequence-user-0" }, intent("list_connections", {}))
+    expect(retained.type).toBe("connections")
+    if (retained.type === "connections") expect(retained.sequence).toBe(2)
+
+    const overflow = await router.handle({ userId: "sequence-overflow" }, intent("list_connections", {}))
+    expect(overflow.type).toBe("connections")
+    if (overflow.type === "connections") expect(overflow.sequence).toBe(3)
+
+    const retainedAgain = await router.handle({ userId: "sequence-user-0" }, intent("list_connections", {}))
+    expect(retainedAgain.type).toBe("connections")
+    if (retainedAgain.type === "connections") expect(retainedAgain.sequence).toBe(3)
+
+    const evicted = await router.handle({ userId: "sequence-user-1" }, intent("list_connections", {}))
+    expect(evicted.type).toBe("connections")
+    if (evicted.type === "connections") expect(evicted.sequence).toBe(4)
+  })
+
+  test("fails closed when all sequence ledgers are retained by active requests", async () => {
+    const gate = Promise.withResolvers<void>()
+    const fixture = createFixture({ listConnectionsGate: gate.promise })
+    const pending = Array.from({ length: MAX_ENDPOINT_SEQUENCE_LEDGERS }, (_, index) =>
+      fixture.router.handle({ userId: `active-sequence-user-${index}` }, intent("list_connections", {})),
+    )
+    await Promise.resolve()
+    expect(fixture.calls.users).toHaveLength(MAX_ENDPOINT_SEQUENCE_LEDGERS)
+
+    const overflow = await fixture.router.handle({ userId: "active-sequence-overflow" }, intent("list_connections", {}))
+    expect(errorCode(overflow)).toBe("APC_SEQUENCE_CAPACITY")
+    if (overflow.type === "error") expect(overflow.sequence).toBeUndefined()
+
+    gate.resolve()
+    const activeResponses = await Promise.all(pending)
+    for (const response of activeResponses) {
+      expect(response.type).toBe("connections")
+      if (response.type === "connections") expect(response.sequence).toBe(1)
+    }
+    const retained = await fixture.router.handle({ userId: "active-sequence-user-0" }, intent("list_connections", {}))
+    expect(retained.type).toBe("connections")
+    if (retained.type === "connections") expect(retained.sequence).toBe(2)
+  })
+
+  test("retains an admitted in-flight response sequence through router disposal", async () => {
+    const gate = Promise.withResolvers<void>()
+    const fixture = createFixture({ listConnectionsGate: gate.promise })
+    const pending = fixture.router.handle({ userId: "dispose-active-user" }, intent("list_connections", {}))
+    await Promise.resolve()
+    fixture.router.dispose()
+    gate.resolve()
+    const response = await pending
+    expect(response.type).toBe("connections")
+    if (response.type === "connections") expect(response.sequence).toBe(1)
+  })
+
 })

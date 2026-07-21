@@ -1412,7 +1412,9 @@ describe("APC frontend application state", () => {
     const traces = await pending
     const summary = traces.summaries[0]
     if (summary === undefined) throw new Error("Expected a trace summary")
-    expect(summary.preview).toBe("Safe trace summary")
+    expect(summary.status).toBe("completed")
+    expect(summary.eventCount).toBe(1)
+    expect(Object.prototype.hasOwnProperty.call(summary, "preview")).toBe(false)
     expect(summary.key).not.toContain(traceId)
     expect(summary.key).not.toContain(executionId)
     expect(JSON.stringify(traces)).not.toContain(traceId)
@@ -1448,8 +1450,10 @@ describe("APC frontend application state", () => {
       },
     })
     const detail = await detailPending
-    expect(detail.preview).toBe("Safe trace summary")
-    expect(detail.events[0]?.preview).toBe("Safe trace event")
+    expect(detail.status).toBe("completed")
+    expect(detail.eventCount).toBe(1)
+    expect(Object.prototype.hasOwnProperty.call(detail, "preview")).toBe(false)
+    expect(Object.prototype.hasOwnProperty.call(detail.events[0] ?? {}, "preview")).toBe(false)
     expect(JSON.stringify(detail)).not.toContain(traceId)
     expect(JSON.stringify(detail)).not.toContain(executionId)
 

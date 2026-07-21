@@ -53,6 +53,16 @@ const CONSENT_REVISION_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u
 const CONSENT_SLOT_SOURCE_PATTERN = /^slot:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const MAX_CONSENT_THREAD_BYTES = 128
 const MAX_CONSENT_DISCLOSURE_VERSION = 1_000_000
+export const MAX_ENDPOINT_SEQUENCE_LEDGERS = 256
+
+type EndpointSequenceLedger = {
+  lastSequence: number
+  activeRequests: number
+}
+type SequenceWatermark = {
+  value: number
+  preserveEvicted: boolean
+}
 
 export interface BackendEndpointScope {
   readonly userId: string
@@ -380,21 +390,77 @@ function validTraceResponse(value: BackendTraceListResponse | BackendTraceDetail
   return value
 }
 
-function nextSequence(ledgers: Map<string, { lastSequence: number; accept(sequence: number): boolean }>, userId: string): number {
+function touchSequenceLedger(
+  ledgers: Map<string, EndpointSequenceLedger>,
+  userId: string,
+  ledger: EndpointSequenceLedger,
+): void {
+  ledgers.delete(userId)
+  ledgers.set(userId, ledger)
+}
+
+function admitSequenceLedger(
+  ledgers: Map<string, EndpointSequenceLedger>,
+  userId: string,
+  watermark: SequenceWatermark,
+): void {
   let ledger = ledgers.get(userId)
   if (ledger === undefined) {
+    if (ledgers.size >= MAX_ENDPOINT_SEQUENCE_LEDGERS) {
+      let evictedUserId: string | undefined
+      for (const [candidateUserId, candidate] of ledgers) {
+        if (candidate.activeRequests === 0) {
+          evictedUserId = candidateUserId
+          break
+        }
+      }
+      if (evictedUserId === undefined) {
+        throw new EndpointFailure(
+          "APC_SEQUENCE_CAPACITY",
+          "The APC response sequence capacity is unavailable",
+        )
+      }
+      watermark.preserveEvicted = true
+      ledgers.delete(evictedUserId)
+    }
     ledger = {
-      lastSequence: 0,
-      accept(sequence: number): boolean {
-        if (!Number.isSafeInteger(sequence) || sequence <= this.lastSequence) return false
-        this.lastSequence = sequence
-        return true
-      },
+      lastSequence: watermark.preserveEvicted ? watermark.value : 0,
+      activeRequests: 0,
     }
     ledgers.set(userId, ledger)
   }
+  if (!Number.isSafeInteger(ledger.activeRequests) || ledger.activeRequests >= Number.MAX_SAFE_INTEGER) {
+    throw new EndpointFailure("APC_SEQUENCE_CAPACITY", "The APC response sequence capacity is unavailable")
+  }
+  ledger.activeRequests += 1
+  touchSequenceLedger(ledgers, userId, ledger)
+}
+
+function releaseSequenceLedger(
+  ledgers: Map<string, EndpointSequenceLedger>,
+  userId: string,
+): void {
+  const ledger = ledgers.get(userId)
+  if (ledger === undefined) return
+  if (ledger.activeRequests > 0) ledger.activeRequests -= 1
+  touchSequenceLedger(ledgers, userId, ledger)
+}
+function nextSequence(
+  ledgers: Map<string, EndpointSequenceLedger>,
+  userId: string,
+  watermark: SequenceWatermark,
+): number {
+  const ledger = ledgers.get(userId)
+  if (ledger === undefined) {
+    throw new EndpointFailure("APC_SEQUENCE_CAPACITY", "The APC response sequence capacity is unavailable")
+  }
   const next = ledger.lastSequence + 1
-  if (!ledger.accept(next)) throw new EndpointFailure("APC_SEQUENCE_EXHAUSTED", "Response sequence is exhausted")
+  if (!Number.isSafeInteger(next) || next <= ledger.lastSequence) {
+    throw new EndpointFailure("APC_SEQUENCE_EXHAUSTED", "Response sequence is exhausted")
+  }
+  ledger.lastSequence = next
+  watermark.value = Math.max(watermark.value, next)
+  touchSequenceLedger(ledgers, userId, ledger)
   return next
 }
 
@@ -1072,15 +1138,23 @@ function traceForExecution(traces: TraceStore, userId: string, presetId: string,
 }
 
 export function createBackendEndpointRouter(deps: BackendEndpointDependencies): BackendEndpointRouter {
-  const ledgers = new Map<string, { lastSequence: number; accept(sequence: number): boolean }>()
+  const ledgers = new Map<string, EndpointSequenceLedger>()
+  const watermark: SequenceWatermark = { value: 0, preserveEvicted: false }
   let disposed = false
+
+  const clearLedgersIfIdle = (): void => {
+    for (const ledger of ledgers.values()) {
+      if (ledger.activeRequests > 0) return
+    }
+    ledgers.clear()
+  }
 
   const errorFor = (correlationId: string, userId: string | undefined, error: unknown): BackendErrorResponse => {
     const failure = normalizeFailure(error, "APC_INTERNAL_ERROR")
     let sequence: number | undefined
     if (userId !== undefined && userId.length > 0) {
       try {
-        sequence = nextSequence(ledgers, userId)
+        sequence = nextSequence(ledgers, userId, watermark)
       } catch {
         sequence = undefined
       }
@@ -1091,7 +1165,7 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
   const dispatch = async (scope: BackendEndpointScope, intent: FrontendIntent): Promise<BackendResponse> => {
     const userId = safeUserId(scope)
     if (disposed) throw new EndpointFailure("APC_ROUTER_DISPOSED", "APC backend router is disposed")
-    const sequence = () => nextSequence(ledgers, userId)
+    const sequence = () => nextSequence(ledgers, userId, watermark)
     switch (intent.type) {
 
       case "list_connections": {
@@ -1324,43 +1398,65 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
     handle: async (scope: BackendEndpointScope, input: unknown): Promise<BackendResponse> => {
       const correlationId = safeCorrelation(input)
       let userId: string | undefined
+      let admittedUserId: string | undefined
       try {
         userId = safeUserId(scope)
+        if (disposed) throw new EndpointFailure("APC_ROUTER_DISPOSED", "APC backend router is disposed")
+        admitSequenceLedger(ledgers, userId, watermark)
+        admittedUserId = userId
         const intent = decodeFrontendIntent(input)
         return await dispatch(scope, intent)
       } catch (error) {
-        return errorFor(correlationId, userId, error)
+        return errorFor(correlationId, admittedUserId, error)
+      } finally {
+        if (admittedUserId !== undefined) releaseSequenceLedger(ledgers, admittedUserId)
+        if (disposed) clearLedgersIfIdle()
       }
     },
     dispatchAndSend: async (scope: BackendEndpointScope, input: unknown): Promise<BackendResponse> => {
       const correlationId = safeCorrelation(input)
       let userId: string | undefined
-      let response: BackendResponse
+      let admittedUserId: string | undefined
       try {
-        userId = safeUserId(scope)
-        const intent = decodeFrontendIntent(input)
-        response = await dispatch(scope, intent)
-      } catch (error) {
-        response = errorFor(correlationId, userId, error)
+        let response: BackendResponse
+        try {
+          userId = safeUserId(scope)
+          if (disposed) throw new EndpointFailure("APC_ROUTER_DISPOSED", "APC backend router is disposed")
+          admitSequenceLedger(ledgers, userId, watermark)
+          admittedUserId = userId
+          const intent = decodeFrontendIntent(input)
+          response = await dispatch(scope, intent)
+        } catch (error) {
+          response = errorFor(correlationId, admittedUserId, error)
+        }
+        if (!disposed && deps.sendToFrontend !== undefined && userId !== undefined) {
+          deps.sendToFrontend(response, userId)
+        }
+        return response
+      } finally {
+        if (admittedUserId !== undefined) releaseSequenceLedger(ledgers, admittedUserId)
+        if (disposed) clearLedgersIfIdle()
       }
-      if (!disposed && deps.sendToFrontend !== undefined && userId !== undefined) {
-        deps.sendToFrontend(response, userId)
-      }
-      return response
     },
     emitActivity: (userId: string, input: BackendActivityEmissionInput): BackendActivityResponse["payload"] | undefined => {
       if (disposed) return undefined
-      let sequence: number
+      let admittedUserId: string | undefined
       let response: BackendActivityResponse
       try {
-        sequence = nextSequence(ledgers, userId)
+        const scopedUserId = safeUserId({ userId })
+        admitSequenceLedger(ledgers, scopedUserId, watermark)
+        admittedUserId = scopedUserId
+        const sequence = nextSequence(ledgers, scopedUserId, watermark)
         response = createBackendActivityResponse({ ...input, sequence })
       } catch {
         return undefined
+      } finally {
+        if (admittedUserId !== undefined) releaseSequenceLedger(ledgers, admittedUserId)
+        if (disposed) clearLedgersIfIdle()
       }
-      if (deps.sendToFrontend !== undefined) {
+      if (deps.sendToFrontend !== undefined && admittedUserId !== undefined) {
         try {
-          deps.sendToFrontend(response, userId)
+          deps.sendToFrontend(response, admittedUserId)
         } catch {
           // Activity retention remains authoritative when delivery is unavailable.
         }
@@ -1369,7 +1465,7 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
     },
     dispose: () => {
       disposed = true
-      ledgers.clear()
+      clearLedgersIfIdle()
     },
   })
 }

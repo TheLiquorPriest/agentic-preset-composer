@@ -13,6 +13,9 @@ import {
   MAX_BLOCK_CONTENT_BYTES,
   MAX_BLOCKS_PER_THREAD,
   MAX_CONFIG_BYTES,
+  MAX_PLAIN_JSON_DEPTH,
+  MAX_PLAIN_JSON_NODES,
+  MAX_PLAIN_JSON_PATH_CHARS,
   MAX_CONNECTION_SLOTS,
   MAX_DESCRIPTION_BYTES,
   MAX_FINAL_INPUTS,
@@ -70,6 +73,9 @@ describe("APC limits and UTF-8 helpers", () => {
       MIN_RUN_TIMEOUT_MS,
       MAX_RUN_TIMEOUT_MS,
       MAX_CONFIG_BYTES,
+      MAX_PLAIN_JSON_DEPTH,
+      MAX_PLAIN_JSON_NODES,
+      MAX_PLAIN_JSON_PATH_CHARS,
       MAX_CONNECTION_SLOTS,
       MAX_THREADS,
       MAX_STAGES_PER_PIPELINE,
@@ -103,6 +109,9 @@ describe("APC limits and UTF-8 helpers", () => {
       MIN_RUN_TIMEOUT_MS: 1_000,
       MAX_RUN_TIMEOUT_MS: 240_000,
       MAX_CONFIG_BYTES: 1_048_576,
+      MAX_PLAIN_JSON_DEPTH: 128,
+      MAX_PLAIN_JSON_NODES: 65_536,
+      MAX_PLAIN_JSON_PATH_CHARS: 4_096,
       MAX_CONNECTION_SLOTS: 16,
       MAX_THREADS: 16,
       MAX_STAGES_PER_PIPELINE: 32,
@@ -317,5 +326,96 @@ describe("plain JSON validation", () => {
     const result = serializedUtf8Bytes(object)
     expect(result.ok).toBe(false)
     expect(getterCalls).toBe(0)
+  })
+  test("rejects oversized strings before JSON serialization and UTF-8 encoding", () => {
+    const value = { payload: "x".repeat(MAX_CONFIG_BYTES) }
+    const originalStringify = JSON.stringify
+    const originalEncode = TextEncoder.prototype.encode
+    let stringifyCalls = 0
+    let encodeCalls = 0
+    let result: PlainJsonScanResult | undefined
+    try {
+      JSON.stringify = (() => {
+        stringifyCalls += 1
+        throw new Error("JSON.stringify must not run for oversized input")
+      }) as typeof JSON.stringify
+      TextEncoder.prototype.encode = (() => {
+        encodeCalls += 1
+        throw new Error("TextEncoder.encode must not run for oversized input")
+      }) as TextEncoder["encode"]
+      result = scanPlainJson(value)
+    } finally {
+      JSON.stringify = originalStringify
+      TextEncoder.prototype.encode = originalEncode
+    }
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        path: "$.payload",
+        code: "serialization-failed",
+      },
+    })
+    expect(stringifyCalls).toBe(0)
+    expect(encodeCalls).toBe(0)
+  })
+
+  test("bounds depth, node, and path work before traversal", () => {
+    const deep: Record<string, unknown> = {}
+    let cursor = deep
+    for (let index = 0; index <= MAX_PLAIN_JSON_DEPTH; index += 1) {
+      const child: Record<string, unknown> = {}
+      cursor.next = child
+      cursor = child
+    }
+    expectRejected(deep, "depth-limit")
+
+    const exact = Object.create(null) as Record<string, unknown>
+    for (let index = 0; index < MAX_PLAIN_JSON_NODES - 1; index += 1) {
+      exact[`k${index}`] = null
+    }
+    expect(scanPlainJson(exact)).toEqual({ ok: true })
+
+    const overNodes = Object.create(null) as Record<string, unknown>
+    for (let index = 0; index < MAX_PLAIN_JSON_NODES; index += 1) {
+      overNodes[`k${index}`] = null
+    }
+    expectRejected(overNodes, "node-limit")
+
+    const longKey = Object.create(null) as Record<string, unknown>
+    longKey["x".repeat(MAX_PLAIN_JSON_PATH_CHARS)] = true
+    expectRejected(longKey, "path-limit")
+  })
+
+  test("ignores inherited getters and toJSON while serializing own data", () => {
+    let getterCalls = 0
+    const priorGetter = Object.getOwnPropertyDescriptor(Object.prototype as Record<string, unknown>, "inheritedSecret")
+    const priorToJson = Object.getOwnPropertyDescriptor(Object.prototype as Record<string, unknown>, "toJSON")
+    Object.defineProperty(Object.prototype, "inheritedSecret", {
+      configurable: true,
+      enumerable: false,
+      get: () => {
+        getterCalls += 1
+        throw new Error("inherited getter must not run")
+      },
+    })
+    Object.defineProperty(Object.prototype, "toJSON", {
+      configurable: true,
+      enumerable: false,
+      value: () => ({ unsafe: true }),
+    })
+    try {
+      const value = { safe: "value" }
+      expect(scanPlainJson(value)).toEqual({ ok: true })
+      expect(serializedUtf8Bytes(value)).toEqual({
+        ok: true,
+        bytes: utf8Bytes('{"safe":"value"}'),
+      })
+      expect(getterCalls).toBe(0)
+    } finally {
+      if (priorGetter) Object.defineProperty(Object.prototype, "inheritedSecret", priorGetter)
+      else delete (Object.prototype as Record<string, unknown>).inheritedSecret
+      if (priorToJson) Object.defineProperty(Object.prototype, "toJSON", priorToJson)
+      else delete (Object.prototype as Record<string, unknown>).toJSON
+    }
   })
 })

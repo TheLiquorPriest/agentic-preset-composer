@@ -584,6 +584,71 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
   let dirtyGeneration = 0
   const reviewCloseWaiters = new Set<() => void>()
 
+  type DirtyAuthority = Readonly<{
+    renderGeneration: number
+    mountGeneration: number
+    installationId: string
+    presetId: string
+    threadId: string
+    contextAuthorityGeneration: number
+    workspaceSource: ApcWorkspaceSource
+    connectionSlotId: string | undefined
+  }>
+
+  function captureDirtyAuthority(threadId: string): DirtyAuthority | null {
+    const snapshot = currentSnapshot
+    if (
+      snapshot === null ||
+      destroyed ||
+      snapshot.installationId !== host.extensionInstallationId ||
+      snapshot.presetId !== options.presetId ||
+      snapshot.selectedThreadId !== threadId ||
+      snapshot.readOnly ||
+      snapshot.mutationLocked === true ||
+      consentReviewPhaseOpen(snapshot) ||
+      mountedThreadId !== threadId ||
+      mountedWorkspaceId !== buildThreadWorkspaceId(host.extensionInstallationId, snapshot.presetId, threadId) ||
+      loomHandle === null ||
+      loomTarget === null
+    ) return null
+    const thread = snapshot.threads.find((candidate) => candidate.id === threadId)
+    if (!thread) return null
+    return {
+      renderGeneration,
+      mountGeneration,
+      installationId: snapshot.installationId,
+      presetId: snapshot.presetId,
+      threadId,
+      contextAuthorityGeneration: snapshot.contextAuthorityGeneration,
+      workspaceSource: thread.workspaceSource,
+      connectionSlotId: thread.connectionSlotId,
+    }
+  }
+
+  function dirtyAuthorityIsCurrent(authority: DirtyAuthority): boolean {
+    const snapshot = currentSnapshot
+    if (
+      snapshot === null ||
+      destroyed ||
+      renderGeneration !== authority.renderGeneration ||
+      mountGeneration !== authority.mountGeneration ||
+      snapshot.installationId !== authority.installationId ||
+      snapshot.presetId !== authority.presetId ||
+      snapshot.selectedThreadId !== authority.threadId ||
+      snapshot.contextAuthorityGeneration !== authority.contextAuthorityGeneration ||
+      snapshot.readOnly ||
+      snapshot.mutationLocked === true ||
+      consentReviewPhaseOpen(snapshot) ||
+      mountedThreadId !== authority.threadId ||
+      mountedWorkspaceId !== buildThreadWorkspaceId(authority.installationId, authority.presetId, authority.threadId) ||
+      loomHandle === null ||
+      loomTarget === null
+    ) return false
+    const thread = snapshot.threads.find((candidate) => candidate.id === authority.threadId)
+    return thread?.workspaceSource === authority.workspaceSource &&
+      thread.connectionSlotId === authority.connectionSlotId
+  }
+
   function consentReviewPhaseOpen(snapshot: ThreadEditorSnapshot | null = currentSnapshot): boolean {
     return reviewOpen || snapshot?.consentReviewOpen === true
   }
@@ -723,13 +788,15 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     successMessage: string,
     matches: (snapshot: ThreadEditorSnapshot) => boolean,
   ): void {
+    const threadId = snapshot.selectedThreadId
+    if (threadId === null) return
     invalidateConsentReview()
     const token = ++contextMutationGeneration
     contextMutation = {
       token,
       renderFloor: renderGeneration,
       authorityFloor: snapshot.contextAuthorityGeneration,
-      threadId: snapshot.selectedThreadId,
+      threadId,
       settled: false,
       matches,
     }
@@ -768,6 +835,8 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
   }
 
   function reportDirty(threadId: string, value: SpindleLoomBlockEditorValue): void {
+    const authority = captureDirtyAuthority(threadId)
+    if (!authority) return
     const detached = cloneLoomValue(value)
     const previous = reportedValues.get(threadId)
     dirtyValues.set(threadId, detached)
@@ -778,7 +847,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const writeValue = cloneLoomValue(detached)
     pendingDirtyWrites = pendingDirtyWrites.then(async () => {
       if (consentReviewPhaseOpen()) await waitForConsentReviewClose()
-      if (destroyed) return
+      if (!dirtyAuthorityIsCurrent(authority)) return
       try {
         await options.onDirty?.(threadId, writeValue)
       } catch (error) {
@@ -816,7 +885,13 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
   }
 
   function destroyLoom(): void {
-    mountGeneration += 1
+    const hadLoomLifecycle =
+      loomHandle !== null ||
+      loomTarget !== null ||
+      loomWorkspace !== null ||
+      mountedWorkspaceId !== null ||
+      mountedThreadId !== null
+    if (hadLoomLifecycle) mountGeneration += 1
     loomHandle?.destroy()
     loomWorkspace?.remove()
     loomHandle = null
@@ -895,6 +970,51 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     parent: HTMLElement,
     locked: boolean,
   ): void {
+    const authoritySnapshot = currentSnapshot
+    const positionAuthority = authoritySnapshot === null
+      ? null
+      : {
+          renderGeneration,
+          mountGeneration,
+          installationId: authoritySnapshot.installationId,
+          presetId: authoritySnapshot.presetId,
+          threadId: thread.id,
+          runId: run.id,
+          contextAuthorityGeneration: authoritySnapshot.contextAuthorityGeneration,
+          consentAuthorityGeneration: authoritySnapshot.consentAuthorityGeneration,
+          workspaceSource: thread.workspaceSource,
+          connectionSlotId: thread.connectionSlotId,
+        }
+    const positionAuthorityIsCurrent = (
+      allowSynchronousRender = false,
+      target?: ThreadEditorRunPositionTarget,
+    ): boolean => {
+      const snapshot = currentSnapshot
+      const currentThread = snapshot?.threads.find((candidate) => candidate.id === thread.id)
+      if (
+        positionAuthority === null ||
+        locked ||
+        destroyed ||
+        snapshot === null ||
+        mountGeneration !== positionAuthority.mountGeneration ||
+        snapshot.installationId !== positionAuthority.installationId ||
+        snapshot.presetId !== positionAuthority.presetId ||
+        snapshot.selectedThreadId !== positionAuthority.threadId ||
+        snapshot.selectedRun?.id !== positionAuthority.runId ||
+        snapshot.contextAuthorityGeneration !== positionAuthority.contextAuthorityGeneration ||
+        snapshot.consentAuthorityGeneration !== positionAuthority.consentAuthorityGeneration ||
+        snapshot.readOnly ||
+        snapshot.mutationLocked === true ||
+        consentReviewPhaseOpen(snapshot) ||
+        currentThread?.workspaceSource !== positionAuthority.workspaceSource ||
+        currentThread.connectionSlotId !== positionAuthority.connectionSlotId
+      ) return false
+      if (renderGeneration === positionAuthority.renderGeneration) return true
+      return allowSynchronousRender &&
+        target !== undefined &&
+        snapshot.selectedRun?.stageOrdinal === target.stageOrdinal &&
+        snapshot.selectedRun.ordinal === target.runOrdinal
+    }
     const panel = document.createElement("section")
     panel.className = "apc-run-configuration"
     panel.dataset.apcRunConfiguration = "true"
@@ -941,7 +1061,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     }
     let positionRequestGeneration = 0
     listen(position, "change", () => {
-      if (locked || destroyed || !options.onRunChange) return
+      if (!positionAuthorityIsCurrent() || !options.onRunChange) return
       const index = Number(position.value.slice("run-position-".length)) - 1
       const target = run.positionTargets[index]
       if (!target) {
@@ -951,7 +1071,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       if (target.stageOrdinal === run.stageOrdinal && target.runOrdinal === run.ordinal) return
       const requestGeneration = ++positionRequestGeneration
       const restoreBlockedPosition = (): void => {
-        if (destroyed || requestGeneration !== positionRequestGeneration) return
+        if (!positionAuthorityIsCurrent() || requestGeneration !== positionRequestGeneration) return
         if (position.isConnected) {
           position.value = currentPositionToken
           position.disabled = positionUnavailable
@@ -960,8 +1080,11 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
           announce(options.t("a11y.graphReorderBlocked"))
         }
       }
-      const acceptPosition = (accepted: boolean | void): void => {
-        if (destroyed || requestGeneration !== positionRequestGeneration) return
+      const acceptPosition = (
+        accepted: boolean | void,
+        allowSynchronousRender = false,
+      ): void => {
+        if (!positionAuthorityIsCurrent(allowSynchronousRender, target) || requestGeneration !== positionRequestGeneration) return
         if (accepted === false) {
           restoreBlockedPosition()
           return
@@ -998,7 +1121,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
         void Promise.resolve(result).then(acceptPosition, restoreBlockedPosition)
         return
       }
-      acceptPosition(result === false ? false : undefined)
+      acceptPosition(result === false ? false : undefined, true)
     })
 
     const required = document.createElement("input")
@@ -1228,15 +1351,17 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       disclosure?.categories.join("\u0000"),
     ])
     if (currentConsentContextKey !== null && currentConsentContextKey !== consentContextKey) {
+      const pendingResolve = consentResolvePending
       const canAdoptResolvedContext =
-        consentResolvePending?.selectorKey === selectorKey &&
-        consentResolvePending.canAdoptResolvedContext &&
+        pendingResolve !== null &&
+        pendingResolve.selectorKey === selectorKey &&
+        pendingResolve.canAdoptResolvedContext &&
         bindingStatus === "bound" &&
         destination !== undefined &&
         disclosure !== undefined
       if (canAdoptResolvedContext) {
         consentResolvePending = {
-          ...consentResolvePending,
+          ...pendingResolve,
           contextKey: consentContextKey,
           canAdoptResolvedContext: false,
         }
@@ -1710,9 +1835,12 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
   function renderInternal(
     snapshot: ThreadEditorSnapshot,
     focusTarget?: "consent-heading" | "consent-trigger" | "consent-approve" | "thread-heading",
+    inheritedFocusBookmark?: ThreadEditorFocusBookmark | null,
   ): void {
     if (destroyed) return
-    const focusBookmark = focusTarget === undefined ? captureFocusBookmark() : null
+    const focusBookmark = focusTarget === undefined
+      ? inheritedFocusBookmark === undefined ? captureFocusBookmark() : inheritedFocusBookmark
+      : null
     const consentResolveAtRenderStart = consentResolvePending
     const approvalAtRenderStart = approvalPending
     const revokeAtRenderStart = revokePending
@@ -2068,7 +2196,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       approvalPending !== approvalAtRenderStart ||
       revokePending !== revokeAtRenderStart
     ) {
-      renderInternal(currentSnapshot ?? snapshot, focusTarget)
+      renderInternal(currentSnapshot ?? snapshot, focusTarget, focusBookmark)
       return
     }
     appendBeforeWorkspace(connection)
@@ -2087,7 +2215,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const navigationFallback =
       surface === "configuration"
         ? (openWorkspace !== null && !openWorkspace.disabled ? openWorkspace : heading)
-        : back
+        : back.disabled ? heading : back
     if (focusTarget === "consent-heading") {
       if (!focusElement(element.querySelector("[data-apc-consent-review-heading]"))) {
         focusElement(navigationFallback)

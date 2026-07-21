@@ -3,6 +3,8 @@ import { describe, expect, it } from "bun:test"
 import {
   AtomicJsonStore,
   AtomicJsonStoreError,
+  MAX_CLEANUP_ENUMERATION_ENTRIES,
+  MAX_RETAINED_QUARANTINE_ARTIFACTS,
   type StorageAdapter,
 } from "./atomic-json-store"
 import { MAX_CONFIG_BYTES, MAX_CONNECTION_SLOTS } from "../config/limits"
@@ -19,9 +21,10 @@ import {
   reduceBindingIntent,
   reduceConsentIntent,
 } from "./documents"
-
 const HOST_A = "11111111-1111-4111-8111-111111111111"
 const HOST_B = "22222222-2222-4222-8222-222222222222"
+const HOST_C = "88888888-8888-4888-8888-888888888888"
+const HOST_D = "99999999-9999-4999-8999-999999999999"
 const PRESET_ID = "33333333-3333-4333-8333-333333333333"
 const SLOT_ID = "44444444-4444-4444-8444-444444444444"
 const OTHER_PRESET_ID = "55555555-5555-4555-8555-555555555555"
@@ -35,10 +38,12 @@ class MemoryStorage implements StorageAdapter {
   readonly files = new Map<string, string>()
   failWrite = false
   failMove = false
+  failDelete = false
   readonly writes: string[] = []
   readonly moves: Array<readonly [string, string]> = []
   readonly lists: string[] = []
   readonly listGates: Array<() => Promise<void>> = []
+  listedEntries?: readonly string[]
   listFailures = 0
   failRepeatedList = false
   existsObserver?: (path: string) => void
@@ -72,6 +77,7 @@ class MemoryStorage implements StorageAdapter {
   }
 
   async delete(path: string): Promise<void> {
+    if (this.failDelete) throw new Error("delete failure")
     this.files.delete(path)
   }
 
@@ -94,7 +100,7 @@ class MemoryStorage implements StorageAdapter {
       this.failRepeatedList = false
       throw new Error("repeated list failure")
     }
-    return [...this.files.keys()].filter((path) => path.startsWith(prefix))
+    return this.listedEntries ?? [...this.files.keys()].filter((path) => path.startsWith(prefix))
   }
 }
 
@@ -169,11 +175,11 @@ function persistedConsentDocument(
   documentRevision = 0,
 ): Record<string, unknown> {
   const consents: Record<string, unknown> = {}
-  const sourceKeys = [
+  const sourceKeys: Array<"main" | `slot:${string}`> = [
     "main",
     ...Array.from(
       { length: MAX_CONNECTION_SLOTS },
-      (_, index) => `slot:${generatedUuid(0x400 + index)}`,
+      (_, index) => `slot:${generatedUuid(0x400 + index)}` as `slot:${string}`,
     ),
   ]
   for (let index = 0; index < count; index += 1) {
@@ -507,6 +513,183 @@ describe("AtomicJsonStore", () => {
     expect(quarantineMap(store).size).toBe(0)
     expect([...storage.files.keys()].some((path) => path.includes("rotated-absent-"))).toBe(false)
   })
+
+  it("fails closed after a rejected host replacement until explicit reinitialize", async () => {
+    const storage = new MemoryStorage()
+    const store = new AtomicJsonStore(storage, { nonceGenerator: nonceFactory("e", "a", "b", "c") })
+    await store.initialize(HOST_A)
+    await store.applyBindingIntent("failed-transition-user", PRESET_ID, bindingIntent())
+    const pairBeforeFailure = store.getInstallPair()
+
+    const listStarted = deferred()
+    const releaseList = deferred()
+    storage.listGates.push(async () => {
+      listStarted.resolve()
+      await releaseList.promise
+    })
+    storage.failMove = true
+    const failed = store.initialize(HOST_B)
+    await listStarted.promise
+
+    const queuedRead = store.readDocument("queued-after-failure", PRESET_ID)
+    const queuedWrite = store.writeDocument(
+      "queued-after-failure",
+      PRESET_ID,
+      { documentRevision: 0, ...pairBeforeFailure },
+      createEmptyBindingConsentDocument(),
+    )
+    releaseList.resolve()
+
+    let failedError: unknown
+    try {
+      await failed
+    } catch (error) {
+      failedError = error
+    }
+    expect(failedError).toMatchObject<Partial<AtomicJsonStoreError>>({ code: "STORAGE_FAILURE" })
+    await expect(queuedRead).rejects.toMatchObject<Partial<AtomicJsonStoreError>>({
+      code: "STORAGE_FAILURE",
+    })
+    await expect(queuedWrite).rejects.toMatchObject<Partial<AtomicJsonStoreError>>({
+      code: "STORAGE_FAILURE",
+    })
+    expect(() => store.getInstallRecord()).toThrow()
+    expect(() => store.getInstallPair()).toThrow()
+    await expect(store.readDocument("after-failure", PRESET_ID)).rejects.toMatchObject<
+      Partial<AtomicJsonStoreError>
+    >({ code: "STORAGE_FAILURE" })
+
+    const recovered = await store.initialize(HOST_B)
+    expect(recovered.extensionInstallationId).toBe(HOST_B)
+    expect(recovered.installNonce).toBe("c".repeat(32))
+    await expect(store.readDocument("after-failure", PRESET_ID)).resolves.toEqual(
+      createEmptyBindingConsentDocument(),
+    )
+  })
+
+  it("rejects cleanup enumeration beyond the exact direct-entry bound", async () => {
+    const exactStorage = new MemoryStorage()
+    exactStorage.listedEntries = Array.from(
+      { length: MAX_CLEANUP_ENUMERATION_ENTRIES },
+      (_, index) => `unrelated-${index}`,
+    )
+    const exactStore = new AtomicJsonStore(exactStorage, { nonceGenerator: nonceFactory("e", "a") })
+    await expect(exactStore.initialize(HOST_A)).resolves.toMatchObject({ extensionInstallationId: HOST_A })
+    expect(exactStorage.files.has(buildInstallRecordKey())).toBe(true)
+
+    const overflowStorage = new MemoryStorage()
+    overflowStorage.listedEntries = Array.from(
+      { length: MAX_CLEANUP_ENUMERATION_ENTRIES + 1 },
+      (_, index) => `unrelated-${index}`,
+    )
+    const overflowStore = new AtomicJsonStore(overflowStorage, { nonceGenerator: nonceFactory("e") })
+    await expect(overflowStore.initialize(HOST_A)).rejects.toMatchObject<
+      Partial<AtomicJsonStoreError>
+    >({ code: "STORAGE_FAILURE" })
+    expect(overflowStorage.writes).toHaveLength(0)
+    expect(overflowStorage.files.size).toBe(0)
+    expect(() => overflowStore.getInstallPair()).toThrow()
+  })
+
+  it("retains only the current and one prior validated quarantine sibling", async () => {
+    const storage = new MemoryStorage()
+    const store = new AtomicJsonStore(storage, { nonceGenerator: nonceFactory("e", "a", "b", "c", "d") })
+    const userId = "rotating-retention-user"
+    const canonical = buildBindingDocumentKey(userId, PRESET_ID)
+    await store.initialize(HOST_A)
+    await store.applyBindingIntent(userId, PRESET_ID, bindingIntent())
+
+    await store.initialize(HOST_B)
+    await store.readDocument(userId, PRESET_ID)
+    await store.writeDocument(
+      userId,
+      PRESET_ID,
+      expected(store, 0),
+      createEmptyBindingConsentDocument(),
+    )
+
+    await store.initialize(HOST_C)
+    await store.readDocument(userId, PRESET_ID)
+    await store.writeDocument(
+      userId,
+      PRESET_ID,
+      expected(store, 0),
+      createEmptyBindingConsentDocument(),
+    )
+
+    const malformedSibling = `${canonical}.quarantine.${INSTALL_NONCE_A}.extra`
+    const invalidSibling = `${canonical}.quarantine.not-a-token`
+    storage.files.set(malformedSibling, "preserve")
+    storage.files.set(invalidSibling, "preserve")
+
+    await store.initialize(HOST_D)
+    await store.readDocument(userId, PRESET_ID)
+
+    const validated = [...storage.files.keys()].filter((path) =>
+      /^.+\.quarantine\.[0-9a-f]{32}$/u.test(path) && path.startsWith(`${canonical}.quarantine.`),
+    )
+    expect(validated).toHaveLength(MAX_RETAINED_QUARANTINE_ARTIFACTS)
+    expect(validated).toContain(`${canonical}.quarantine.${"c".repeat(32)}`)
+    expect(validated).toContain(`${canonical}.quarantine.${"d".repeat(32)}`)
+    expect(validated).not.toContain(`${canonical}.quarantine.${"b".repeat(32)}`)
+    expect(storage.files.get(malformedSibling)).toBe("preserve")
+    expect(storage.files.get(invalidSibling)).toBe("preserve")
+
+    await store.writeDocument(
+      userId,
+      PRESET_ID,
+      expected(store, 0),
+      createEmptyBindingConsentDocument(),
+    )
+    expect(storage.files.has(canonical)).toBe(true)
+  })
+
+  it("keeps committed revisions authoritative while pending quarantine pruning retries", async () => {
+    const storage = new MemoryStorage()
+    const store = new AtomicJsonStore(storage, { nonceGenerator: nonceFactory("e", "a", "b") })
+    const userId = "pending-retention-user"
+    const canonical = buildBindingDocumentKey(userId, PRESET_ID)
+    await store.initialize(HOST_A)
+    await store.initialize(HOST_B)
+    storage.files.set(canonical, JSON.stringify(createEmptyBindingConsentDocument()))
+    for (const token of ["a", "b", "c"]) {
+      storage.files.set(`${canonical}.quarantine.${token.repeat(32)}`, "quarantine")
+    }
+
+    storage.failDelete = true
+    const committed = await store.writeDocument(
+      userId,
+      PRESET_ID,
+      expected(store, 0),
+      createEmptyBindingConsentDocument(),
+    )
+    expect(committed.documentRevision).toBe(1)
+    expect(JSON.parse(storage.files.get(canonical)!).documentRevision).toBe(1)
+
+    await expect(
+      store.writeDocument(
+        userId,
+        PRESET_ID,
+        expected(store, 1),
+        { ...createEmptyBindingConsentDocument(), documentRevision: 1 },
+      ),
+    ).rejects.toMatchObject<Partial<AtomicJsonStoreError>>({ code: "STORAGE_FAILURE" })
+    expect(JSON.parse(storage.files.get(canonical)!).documentRevision).toBe(1)
+
+    storage.failDelete = false
+    const recovered = await store.writeDocument(
+      userId,
+      PRESET_ID,
+      expected(store, 1),
+      { ...createEmptyBindingConsentDocument(), documentRevision: 1 },
+    )
+    expect(recovered.documentRevision).toBe(2)
+    const validated = [...storage.files.keys()].filter((path) =>
+      /^.+\.quarantine\.[0-9a-f]{32}$/u.test(path) && path.startsWith(`${canonical}.quarantine.`),
+    )
+    expect(validated).toHaveLength(MAX_RETAINED_QUARANTINE_ARTIFACTS)
+  })
+
 
   it("fails closed on a corrupt canonical install record", async () => {
     const storage = new MemoryStorage()

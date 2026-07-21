@@ -11,7 +11,7 @@ import { MIN_LUMIVERSE_VERSION, REQUIRED_HOST_CAPABILITIES, SpindleCompatibility
 import { MAX_ACTIVE_GLOBAL, MAX_RETAINED_TRACES_PER_USER_PRESET } from "../config/limits"
 import type { ApcPresetConfigV1 } from "../config/schema"
 import { acquireTrace, getTrace, releaseTrace } from "../runtime/trace-store"
-import { setup } from "./runtime"
+import { setup, type BackendRuntime } from "./runtime"
 import {
   MAX_ACTIVITY_BUDGET_MS,
   MAX_ACTIVITY_USAGE_TOKENS,
@@ -419,6 +419,14 @@ function activityMessages(outbound: readonly unknown[]): readonly BackendActivit
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   const { promise, resolve } = Promise.withResolvers<void>()
   return { promise, resolve }
+}
+function isAbortSignal(value: unknown): value is AbortSignal {
+  if (value === null || typeof value !== "object") return false
+  return (
+    typeof Reflect.get(value, "addEventListener") === "function" &&
+    typeof Reflect.get(value, "removeEventListener") === "function" &&
+    typeof Reflect.get(value, "aborted") === "boolean"
+  )
 }
 
 function runtimeContext(
@@ -1326,16 +1334,226 @@ describe("APC runtime activity projection", () => {
       expect(terminals[0]?.payload.cancellationSource).toBe("disposed")
       disposeRun.resolve()
       await disposePromise
+      const disposedTrace = getTrace(disposableRuntime.traces, "user-1", PRESET_ID, GENERATION_ID)
+      expect(disposedTrace?.status).toBe("cancelled")
+      const terminalEntry = disposedTrace?.entries[disposedTrace.entries.length - 1]
+      expect(terminalEntry?.metadata.status).toBe("cancelled")
+      expect(terminalEntry?.metadata.cancellationSource).toBe("disposed")
       await pending
       expect(disposable.outbound()).toHaveLength(outboundAfterDispose)
     } finally {
       disposeRun.resolve()
+
       await disposableRuntime.dispose()
     }
     } finally {
       vi.useRealTimers()
     }
   })
+  test("preserves the winning cancellation source when disposal finalizes an active trace", async () => {
+    const run = deferred()
+    const runStarted = deferred()
+    const captured = capturedRuntimeHost({ runGate: run.promise, onRunStarted: runStarted.resolve })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false)
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const pending = handler(messages, context)
+      await runStarted.promise
+      await frontend({
+        version: 1,
+        type: "cancel_execution",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID, reason: "user" },
+      }, "user-1")
+      await runtime.dispose()
+      const trace = getTrace(runtime.traces, "user-1", PRESET_ID, GENERATION_ID)
+      expect(trace?.status).toBe("cancelled")
+      const terminal = trace?.entries[trace.entries.length - 1]
+      expect(terminal?.metadata.cancellationSource).toBe("user")
+      expect(terminal?.metadata.outcomeCode).toBe("stop")
+      run.resolve()
+      await pending
+    } finally {
+      run.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  test("preserves a host-abort winner when disposal races a late provider", async () => {
+    const run = deferred()
+    const runStarted = deferred()
+    const controller = new AbortController()
+    const captured = capturedRuntimeHost({ runGate: run.promise, onRunStarted: runStarted.resolve })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false, { signal: controller.signal })
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const pending = handler(messages, context)
+      await runStarted.promise
+      controller.abort()
+      await runtime.dispose()
+      const trace = getTrace(runtime.traces, "user-1", PRESET_ID, GENERATION_ID)
+      expect(trace?.status).toBe("cancelled")
+      const terminal = trace?.entries[trace.entries.length - 1]
+      expect(terminal?.metadata.cancellationSource).toBe("stop")
+      expect(terminal?.metadata.outcomeCode).toBe("host-abort")
+      run.resolve()
+      await pending
+    } finally {
+      run.resolve()
+      await runtime.dispose()
+    }
+  })
+  test("preserves an integrity-fatal winner when disposal races a late provider", async () => {
+    const run = deferred()
+    const runStarted = deferred()
+    const controller = new AbortController()
+    const captured = capturedRuntimeHost({ runGate: run.promise, onRunStarted: runStarted.resolve })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false, { signal: controller.signal })
+      expect(await handler(messages, context)).toEqual(messages)
+      const activityStart = captured.outbound().length
+      await approveConsent(frontend)
+      const pending = handler(messages, context)
+      await runStarted.promise
+      controller.abort("integrity-fatal")
+      const disposal = runtime.dispose()
+      const terminals = activityMessages(captured.outbound().slice(activityStart)).filter(activity => activity.payload.terminal)
+      expect(terminals).toHaveLength(1)
+      expect(terminals[0]?.payload).toMatchObject({
+        phase: "failed",
+        outcome: "integrity-fatal",
+        errorCategory: "integrity",
+      })
+      expect(terminals[0]?.payload.cancellationSource).toBeUndefined()
+      const trace = getTrace(runtime.traces, "user-1", PRESET_ID, GENERATION_ID)
+      expect(trace?.status).toBe("completed")
+      const terminal = trace?.entries[trace.entries.length - 1]
+      expect(terminal?.metadata.outcome).toBe("integrity-fatal")
+      expect(terminal?.metadata.outcomeCode).toBe("integrity-fatal")
+      expect(terminal?.metadata.status).toBeUndefined()
+      expect(terminal?.metadata.cancellationSource).toBeUndefined()
+      run.resolve()
+      await disposal
+      await pending
+    } finally {
+      run.resolve()
+      await runtime.dispose()
+    }
+  })
+
+  for (const reason of ["deadline", "child-timeout", "required-failure"] as const) {
+    test(`preserves a ${reason} graph-fallback winner when disposal races a late provider`, async () => {
+      const run = deferred()
+      const runStarted = deferred()
+      const controller = new AbortController()
+      const captured = capturedRuntimeHost({ runGate: run.promise, onRunStarted: runStarted.resolve })
+      const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+      try {
+        await runtime.ready
+        const handler = captured.interceptor()
+        const frontend = captured.frontend()
+        if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+        const messages = runtimeMessages(false)
+        const context = runtimeContext(false, { signal: controller.signal })
+        expect(await handler(messages, context)).toEqual(messages)
+        const activityStart = captured.outbound().length
+        await approveConsent(frontend)
+        const pending = handler(messages, context)
+        await runStarted.promise
+        controller.abort(reason)
+        const disposal = runtime.dispose()
+        const terminals = activityMessages(captured.outbound().slice(activityStart))
+          .filter(activity => activity.payload.terminal)
+        expect(terminals).toHaveLength(1)
+        expect(terminals[0]?.payload).toMatchObject({
+          phase: "completed",
+          outcome: "graph-fallback",
+        })
+        expect(terminals[0]?.payload.cancellationSource).toBeUndefined()
+        const trace = getTrace(runtime.traces, "user-1", PRESET_ID, GENERATION_ID)
+        expect(trace?.status).toBe("completed")
+        const terminal = trace?.entries[trace.entries.length - 1]
+        expect(terminal?.metadata.outcome).toBe("graph-fallback")
+        expect(terminal?.metadata.outcomeCode).toBe(reason)
+        expect(terminal?.metadata.status).toBeUndefined()
+        expect(terminal?.metadata.cancellationSource).toBeUndefined()
+        run.resolve()
+        await disposal
+        await pending
+      } finally {
+        run.resolve()
+        await runtime.dispose()
+      }
+    })
+  }
+
+  test("reuses the exact disposal promise when a cancellation listener reenters teardown", async () => {
+    const run = deferred()
+    const runStarted = deferred()
+    let runtime: BackendRuntime | undefined
+    let reentrantDispose: Promise<void> | undefined
+    let listenerAttached = false
+    const captured = capturedRuntimeHost({
+      runGate: run.promise,
+      onRunStarted: runStarted.resolve,
+      onQuietTracked: request => {
+        if (
+          listenerAttached ||
+          request === null ||
+          typeof request !== "object" ||
+          !("signal" in request)
+        ) return
+        const signal = request.signal
+        if (!isAbortSignal(signal)) return
+        listenerAttached = true
+        signal.addEventListener("abort", () => {
+          reentrantDispose = runtime?.dispose()
+        }, { once: true })
+      },
+    })
+    runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false)
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const pending = handler(messages, context)
+      await runStarted.promise
+      const disposal = runtime.dispose()
+      expect(reentrantDispose).toBe(disposal)
+      run.resolve()
+      await disposal
+      await pending
+    } finally {
+      run.resolve()
+      if (runtime !== undefined) await runtime.dispose()
+    }
+  })
+
 })
 
 describe("APC backend runtime", () => {
