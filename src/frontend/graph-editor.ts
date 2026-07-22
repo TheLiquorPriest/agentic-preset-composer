@@ -1400,6 +1400,51 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       output: t("graph.defaultFinalResponseName"),
     })
   }
+  const bindingRoleLabel = (role: ApcInputBindingV1["role"]): string => {
+    if (role === "system") return t("binding.roleSystem")
+    if (role === "assistant") return t("binding.roleAssistant")
+    return t("binding.roleUser")
+  }
+  const bindingMissingPolicyLabel = (
+    policy: Extract<ApcInputBindingV1, { source: "output" }>["onMissing"],
+  ): string => {
+    if (policy === "fail-graph") return t("binding.missingFailGraph")
+    if (policy === "skip-run") return t("binding.missingSkipRun")
+    return t("binding.missingOmit")
+  }
+  const renderBindingSummary = (
+    config: ApcPresetConfigV1,
+    pipeline: ApcPipelineV1,
+    input: ApcInputBindingV1,
+  ): HTMLElement => {
+    const item = htmlElement(document, "li", "apc-binding")
+    item.dataset.apcBindingSummary = "true"
+    item.dataset.apcBindingKind = input.source
+    if (input.source === "literal") {
+      const kind = htmlElement(document, "span", "apc-binding-kind")
+      kind.textContent = t("binding.literal")
+      item.append(kind)
+      return item
+    }
+    item.dataset.apcEarlierOutputBinding = "true"
+    const kind = htmlElement(document, "span", "apc-binding-kind")
+    kind.textContent = t("binding.output")
+    const source = htmlElement(document, "span", "apc-binding-source")
+    source.dataset.apcBindingSource = "true"
+    source.dataset.apcBindingOutput = "true"
+    source.textContent = bindingLabel(config, pipeline, input)
+    const role = htmlElement(document, "span", "apc-binding-role")
+    role.dataset.apcBindingRole = "true"
+    role.dataset.role = input.role
+    role.textContent = `${t("binding.role")}: ${bindingRoleLabel(input.role)}`
+    const missing = htmlElement(document, "span", "apc-binding-policy")
+    missing.dataset.apcBindingMissing = "true"
+    missing.dataset.apcBindingPolicy = "true"
+    missing.dataset.policy = input.onMissing
+    missing.textContent = `${t("binding.missingPolicy")}: ${bindingMissingPolicyLabel(input.onMissing)}`
+    item.append(kind, source, role, missing)
+    return item
+  }
 
   const renderConfirmation = (parent: HTMLElement, kind: RemovalKind, id: string, label: string): void => {
     if (!pendingConfirmation || pendingConfirmation.kind !== kind || pendingConfirmation.id !== id) return
@@ -1526,9 +1571,10 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     const consent = htmlElement(document, "p", "apc-consent-note")
     consent.textContent = copy(t, "graph.emptyConsent", "Connections require review and approval before anything is dispatched.")
     const actions = htmlElement(document, "div", "apc-card-actions")
+    actions.dataset.apcFirstUseActions = "true"
     actions.append(
-      actionButton(document, copy(t, "action.createParallelGraph", "Create Parallel graph"), "create-graph", { mode: "parallel" }, true),
       actionButton(document, copy(t, "action.createSequentialGraph", "Create Sequential graph"), "create-graph", { mode: "sequential" }, true),
+      actionButton(document, copy(t, "action.createParallelGraph", "Create Parallel graph"), "create-graph", { mode: "parallel" }, true),
     )
     const unavailableActions = htmlElement(document, "div", "apc-card-actions")
     unavailableActions.dataset.apcUnavailableGraphActions = "true"
@@ -1784,12 +1830,9 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     if (run.inputs.length) {
       const inputs = document.createElement("ul")
       inputs.className = "apc-run-inputs"
+      inputs.dataset.apcRunInputs = "true"
       inputs.setAttribute("aria-label", t("graph.inputs"))
-      for (const input of run.inputs) {
-        const item = document.createElement("li")
-        item.textContent = bindingLabel(config, pipeline, input)
-        inputs.append(item)
-      }
+      for (const input of run.inputs) inputs.append(renderBindingSummary(config, pipeline, input))
       card.append(inputs)
     }
     const actions = htmlElement(document, "div", "apc-card-actions")
@@ -1905,6 +1948,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
   const renderFinalRoute = (parent: HTMLElement, config: ApcPresetConfigV1, pipeline: ApcPipelineV1): void => {
     const section = htmlElement(document, "section", "apc-final-response")
     section.dataset.apcFinalRoute = "true"
+    section.dataset.routeSource = pipeline.finalResponse.source
     const heading = htmlElement(document, "h3")
     heading.textContent = t("graph.finalResponse")
     const route = pipeline.finalResponse
@@ -1949,15 +1993,20 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       }
       section.append(status)
     }
-    if (route.source === "thread") {
-      const finalRun = pipeline.stages.flatMap((stage) => stage.runs).find((run) => run.id === route.runId)
-      const output = htmlElement(document, "p", "apc-final-output")
-      output.textContent = copy(t, "graph.outputLabel", "{{thread}} · {{output}}", {
-        thread: finalRun ? runLabel(config, finalRun) : t("graph.missingThread"),
-        output: t("graph.defaultFinalResponseName"),
-      })
-      section.append(output)
-    }
+    const finalRun = route.source === "thread"
+      ? pipeline.stages.flatMap((stage) => stage.runs).find((run) => run.id === route.runId)
+      : undefined
+    const output = htmlElement(document, "p", "apc-final-output")
+    output.dataset.apcFinalOutput = "true"
+    output.dataset.routeSource = route.source
+    output.dataset.apcFinalOutputSource = route.source
+    output.textContent = copy(t, "graph.outputLabel", "{{thread}} · {{output}}", {
+      thread: route.source === "main"
+        ? t("agentGraph.finalMain")
+        : finalRun ? runLabel(config, finalRun) : t("graph.missingThread"),
+      output: t("graph.defaultFinalResponseName"),
+    })
+    section.append(output)
     if (permissionBlocked || candidateBlocked || routeCandidate === undefined) {
       const reason = htmlElement(document, "p", "apc-disabled-reason")
       reason.setAttribute("role", "note")
@@ -2020,7 +2069,7 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
     parent.append(aside)
   }
   const renderMissingGraphActions = (parent: HTMLElement, config: ApcPresetConfigV1): void => {
-    const missing = (["parallel", "sequential"] as const).filter((mode) => config.pipelines[mode] === undefined)
+    const missing = (["sequential", "parallel"] as const).filter((mode) => config.pipelines[mode] === undefined)
     if (!missing.length) return
     const section = htmlElement(document, "section", "apc-missing-graph-actions")
     section.dataset.apcMissingGraphActions = "true"
@@ -2080,8 +2129,20 @@ export function createGraphEditor(options: GraphEditorOptions): GraphEditorHandl
       const reachableRunIds = mode === "parallel"
         ? validateConfigForMode(config, "parallel").reachableRunIds
         : new Set<string>()
-      pipeline.stages.forEach((stage, stageIndex) =>
-        renderStage(stages, config, pipeline, mode, stage, stageIndex, reachableRunIds))
+      pipeline.stages.forEach((stage, stageIndex) => {
+        if (mode === "sequential" && stageIndex > 0) {
+          const connector = htmlElement(document, "div", "apc-sequential-connector")
+          connector.dataset.apcSequentialConnector = "true"
+          connector.dataset.apcConnector = "sequential"
+          connector.dataset.fromStage = String(stageIndex)
+          connector.dataset.toStage = String(stageIndex + 1)
+          connector.setAttribute("role", "separator")
+          connector.setAttribute("aria-label", "THEN")
+          connector.textContent = "THEN"
+          stages.append(connector)
+        }
+        renderStage(stages, config, pipeline, mode, stage, stageIndex, reachableRunIds)
+      })
       topology.append(stages)
       const graphActions = htmlElement(document, "div", "apc-card-actions")
       const addStage = actionButton(document, t("action.addStage"), "add-stage", {}, true)

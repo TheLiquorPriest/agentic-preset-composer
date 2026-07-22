@@ -8,6 +8,8 @@ import {
   type BackendBindingService,
   type BackendConsentService,
   type BackendExecutionService,
+  type BackendViewResponseRequest,
+  type BackendViewResponseService,
 } from "./endpoints"
 import type {
   BackendActivityResponse,
@@ -182,6 +184,7 @@ function createFixture(options: {
   readonly resolveSlot?: BackendBindingService["resolveSlot"]
   readonly currentExecution?: BackendExecutionService["currentExecution"]
   readonly onAuthorizedMutation?: BackendEndpointDependencies["onAuthorizedMutation"]
+  readonly viewResponse?: BackendViewResponseService["viewDeliveredResponse"]
   readonly connectionProfiles?: readonly TestConnectionProfile[]
 } = {}): {
   readonly router: BackendEndpointRouter
@@ -287,6 +290,11 @@ function createFixture(options: {
       }),
       currentExecution: (userId, presetId) => options.currentExecution?.(userId, presetId),
     },
+    viewResponse: {
+      viewDeliveredResponse: async request => {
+        if (options.viewResponse !== undefined) await options.viewResponse(request)
+      },
+    },
     sendToFrontend: (response, userId) => {
       sent.push({ response, userId })
     },
@@ -346,6 +354,35 @@ describe("backend endpoint router", () => {
     expect(sent[0]?.response).toMatchObject({ type: "activity", payload })
     router.dispose()
     expect(router.emitActivity("user-a", input)).toBeUndefined()
+  })
+  test("routes the opaque delivered-response intent through the authenticated user scope", async () => {
+    const seen: BackendViewResponseRequest[] = []
+    const { router } = createFixture({
+      viewResponse: async request => {
+        seen.push(request)
+        if (request.userId !== "user-a") throw { code: "APC_VIEW_RESPONSE_UNAVAILABLE" }
+      },
+    })
+    const response = await router.handle(
+      { userId: "user-a" },
+      intent("view_response", { presetId: PRESET_ID, executionId: EXECUTION_ID }),
+    )
+    expect(response).toMatchObject({
+      type: "view_response",
+      payload: { presetId: PRESET_ID, executionId: EXECUTION_ID },
+    })
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({
+      userId: "user-a",
+      presetId: PRESET_ID,
+      executionId: EXECUTION_ID,
+      install: { extensionInstallationId: INSTALL_ID, installNonce: INSTALL_NONCE },
+    })
+    const forged = await router.handle(
+      { userId: "user-b" },
+      intent("view_response", { presetId: PRESET_ID, executionId: EXECUTION_ID }),
+    )
+    expect(errorCode(forged)).toBe("APC_VIEW_RESPONSE_UNAVAILABLE")
   })
   test("returns missing status after unbinding a slot", async () => {
     const { router } = createFixture()
@@ -491,8 +528,12 @@ describe("backend endpoint router", () => {
       "model",
       "input-bindings",
       "prior-stage-outputs",
+      "prompt-variable-values",
     ])
     expect(required.payload.disclosure).toBeDefined()
+    expect(() => decodeBackendResponse(required)).not.toThrow()
+    expect(JSON.stringify(required)).not.toContain(CONNECTION_ID)
+    expect(JSON.stringify(required)).not.toContain("promptVariableValues")
     const approved = await router.handle({ userId: "user-a" }, intent("approve_consent", selector))
     expect(approved.type).toBe("consent")
     if (approved.type === "consent") expect(approved.payload.status).toBe("approved")

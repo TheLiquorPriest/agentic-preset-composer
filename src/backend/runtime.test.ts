@@ -254,19 +254,26 @@ function capturedRuntimeHost(options: {
   runGate?: Promise<void>
   onRunStarted?: () => void
   onSlotResolve?: (connectionId: string) => void
+  slotResolveGate?: Promise<void>
+  slotResolveGateAfter?: number
   onAssemble?: () => void
   onQuietTracked?: (request: unknown) => void
   onConnectionList?: (userId: string | undefined) => void
   requiredConnectionListUserId?: string
   slotDescriptor?: typeof SLOT_DESCRIPTOR
   throwActivityDelivery?: boolean
+  dropDeliverySettlement?: boolean
   throwQuietTracked?: boolean
 } = {}): {
   spindle: SpindleAPI
   interceptor: () => InterceptorHandler | undefined
   frontend: () => ((payload: unknown, userId: string) => Promise<void>) | undefined
   outbound: () => readonly unknown[]
+  closeDrawerUsers: string[]
   revokeFinalResponse: () => void
+  emitGenerationEnded: (payload: unknown, userId?: string) => void
+  emitGenerationStopped: (payload: unknown, userId?: string) => void
+  eventListenerCount: (event: string) => number
 } {
   const granted: Record<string, true> = {
     interceptor: true,
@@ -278,8 +285,19 @@ function capturedRuntimeHost(options: {
   let frontendHandler: ((payload: unknown, userId: string) => Promise<void>) | undefined
   const permissionListeners = new Set<(payload: unknown) => void>()
   let runResponseIndex = 0
+  let slotResolveCallCount = 0
   const outbound: unknown[] = []
+  const closeDrawerUsers: string[] = []
+  const eventListeners = new Map<string, Set<(payload: unknown, userId?: string) => void>>()
+  const emitEvent = (event: string, payload: unknown, userId?: string): void => {
+    for (const listener of eventListeners.get(event) ?? []) listener(payload, userId)
+  }
   const spindle = host({
+    ui: {
+      closeDrawer: async ({ userId }: { userId?: string }) => {
+        if (typeof userId === "string") closeDrawerUsers.push(userId)
+      },
+    },
     permissions: {
       has: (permission: string) => options.permissionHas?.(permission, granted[permission] === true) ?? granted[permission] === true,
       onChanged: (listener: (payload: unknown) => void) => {
@@ -291,25 +309,31 @@ function capturedRuntimeHost(options: {
     },
     connections: {
       resolveDispatch: async (connectionId: string) => {
+        slotResolveCallCount += 1
         options.onSlotResolve?.(connectionId)
+        if (
+          options.slotResolveGate !== undefined &&
+          (options.slotResolveGateAfter === undefined || slotResolveCallCount > options.slotResolveGateAfter)
+        ) await options.slotResolveGate
         return options.slotDescriptor ?? null
       },
-      get: async (connectionId: string) => options.slotDescriptor === undefined
-        ? null
-        : {
-            id: connectionId,
-            name: options.slotDescriptor.connectionName,
-            provider: options.slotDescriptor.provider,
-            api_url: "https://provider.invalid/v1",
-            model: options.slotDescriptor.model,
-            preset_id: null,
-            is_default: false,
-            has_api_key: true,
-            metadata: { ownerUserId: "user-1" },
-            reasoning_bindings: null,
-            created_at: 1,
-            updated_at: 1,
-          },
+      get: async (connectionId: string) => {
+        if (options.slotDescriptor === undefined) return null
+        return {
+          id: connectionId,
+          name: options.slotDescriptor.connectionName,
+          provider: options.slotDescriptor.provider,
+          api_url: "https://provider.invalid/v1",
+          model: options.slotDescriptor.model,
+          preset_id: null,
+          is_default: false,
+          has_api_key: true,
+          metadata: { ownerUserId: "user-1" },
+          reasoning_bindings: null,
+          created_at: 1,
+          updated_at: 1,
+        }
+      },
       list: async (userId?: string) => {
         options.onConnectionList?.(userId)
         if (options.requiredConnectionListUserId !== undefined && userId !== options.requiredConnectionListUserId) {
@@ -386,22 +410,34 @@ function capturedRuntimeHost(options: {
       frontendHandler = handler as unknown as (payload: unknown, userId: string) => Promise<void>
       return () => undefined
     },
+    on: (event: string, listener: (payload: unknown, userId?: string) => void) => {
+      const listeners = eventListeners.get(event) ?? new Set<(payload: unknown, userId?: string) => void>()
+      listeners.add(listener)
+      eventListeners.set(event, listeners)
+      return () => {
+        listeners.delete(listener)
+        if (listeners.size === 0) eventListeners.delete(event)
+      }
+    },
     sendToFrontend: (payload: unknown) => {
-      if (
-        options.throwActivityDelivery &&
-        payload !== null &&
-        typeof payload === "object" &&
-        "type" in payload &&
-        payload.type === "activity"
-      ) throw new Error("activity delivery unavailable")
+      const candidate = payload !== null && typeof payload === "object" ? payload as Record<string, unknown> : undefined
+      const activityPayload = candidate?.type === "activity" && candidate.payload !== null && typeof candidate.payload === "object"
+        ? candidate.payload as Record<string, unknown>
+        : undefined
+      if (options.dropDeliverySettlement && activityPayload?.kind === "delivery-settled") return
+      if (options.throwActivityDelivery && candidate?.type === "activity") throw new Error("activity delivery unavailable")
       outbound.push(payload)
     },
   })
   return {
+    emitGenerationEnded: (payload, userId = "user-1") => { emitEvent("GENERATION_ENDED", payload, userId) },
+    emitGenerationStopped: (payload, userId = "user-1") => { emitEvent("GENERATION_STOPPED", payload, userId) },
+    eventListenerCount: (event) => eventListeners.get(event)?.size ?? 0,
     spindle,
     interceptor: () => registered,
     frontend: () => frontendHandler,
     outbound: () => outbound,
+    closeDrawerUsers,
     revokeFinalResponse: () => {
       Reflect.deleteProperty(granted, "final_response")
       for (const listener of permissionListeners) listener({})
@@ -642,6 +678,226 @@ describe("APC runtime activity projection", () => {
         expect(activities[index]?.sequence).toBeGreaterThan(activities[index - 1]?.sequence ?? 0)
       }
 
+    } finally {
+      await runtime.dispose()
+    }
+  })
+  test("projects typed run failures and settles native Main delivery exactly once", async () => {
+    const captured = capturedRuntimeHost({ runSucceeds: false })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false)
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const activityStart = captured.outbound().length
+      expect(await handler(messages, context)).toEqual(messages)
+      const initial = activityMessages(captured.outbound().slice(activityStart))
+      const settled = initial.find(activity => activity.payload.kind === "run-settled")
+      expect(settled?.payload.runStatus).toBe("failed")
+      expect(settled?.payload.runErrorCategory).toBe("provider")
+      const terminal = initial.find(activity => activity.payload.terminal)
+      expect(terminal?.payload.kind).toBe("execution-terminal")
+      expect(terminal?.payload.outcome).toBe("graph-fallback")
+      expect(terminal?.payload.fallbackCauseCategory).toBe("required-typed-run")
+      expect(terminal?.payload.fallbackCauseCode).toBe("REQUIRED-FAILURE")
+      expect(terminal?.payload.finalDelivery).toBe("pending")
+      expect(terminal?.payload).not.toHaveProperty("mainResponded")
+      const beforeUnrelated = captured.outbound().length
+      captured.emitGenerationEnded({ generationId: REPLACEMENT_GENERATION_ID, content: "unrelated" })
+      expect(captured.outbound()).toHaveLength(beforeUnrelated)
+      captured.emitGenerationEnded({ generationId: GENERATION_ID, content: "native response" })
+      const updates = activityMessages(captured.outbound().slice(activityStart))
+        .filter(activity => activity.payload.kind === "delivery-settled")
+      expect(updates).toHaveLength(1)
+      expect(updates[0]?.payload).toMatchObject({
+        executionId: GENERATION_ID,
+        presetId: PRESET_ID,
+        kind: "delivery-settled",
+        terminal: true,
+        outcome: "graph-fallback",
+        fallbackCauseCategory: "required-typed-run",
+        fallbackCauseCode: "REQUIRED-FAILURE",
+        finalDelivery: "delivered",
+        mainResponded: true,
+      })
+      const frontendResponseStart = captured.outbound().length
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      }, "user-1")
+      const viewResponse = captured.outbound()[frontendResponseStart]
+      expect(viewResponse).toMatchObject({
+        type: "view_response",
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      })
+      expect(captured.closeDrawerUsers).toEqual(["user-1"])
+
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      }, "user-2")
+      expect(captured.closeDrawerUsers).toEqual(["user-1"])
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: REPLACEMENT_GENERATION_ID },
+      }, "user-1")
+      expect(captured.closeDrawerUsers).toEqual(["user-1"])
+      expect(JSON.stringify(updates[0])).not.toContain("native response")
+      captured.emitGenerationEnded({ generationId: GENERATION_ID, content: "duplicate" })
+      expect(activityMessages(captured.outbound().slice(activityStart))
+        .filter(activity => activity.payload.kind === "delivery-settled")).toHaveLength(1)
+    } finally {
+      await runtime.dispose()
+    }
+  })
+  test("replays a bounded settled delivery when only settlement activity was dropped", async () => {
+    const captured = capturedRuntimeHost({ runSucceeds: false, dropDeliverySettlement: true })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false)
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const activityStart = captured.outbound().length
+      expect(await handler(messages, context)).toEqual(messages)
+      const initial = activityMessages(captured.outbound().slice(activityStart))
+      expect(initial.find(activity => activity.payload.kind === "execution-terminal")?.payload.finalDelivery).toBe("pending")
+      const pendingHydrationStart = captured.outbound().length
+      await frontend({
+        version: 1,
+        type: "hydrate_preset",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID },
+      }, "user-1")
+      const pendingHydration = captured.outbound().slice(pendingHydrationStart).find((payload): payload is BackendHydrationResponse => {
+        if (payload === null || typeof payload !== "object" || !("type" in payload)) return false
+        return payload.type === "hydration"
+      })
+      expect(pendingHydration?.payload.settledDelivery?.finalDelivery).toBe("pending")
+      expect(pendingHydration?.payload.settledDelivery?.mainResponded).toBe(false)
+
+      captured.emitGenerationEnded({ generationId: GENERATION_ID, content: "native response" })
+      expect(activityMessages(captured.outbound().slice(activityStart))
+        .filter(activity => activity.payload.kind === "delivery-settled")).toHaveLength(0)
+
+      const hydrationStart = captured.outbound().length
+      await frontend({
+        version: 1,
+        type: "hydrate_preset",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID },
+      }, "user-1")
+      const hydration = captured.outbound().slice(hydrationStart).find((payload): payload is BackendHydrationResponse => {
+        if (payload === null || typeof payload !== "object" || !("type" in payload)) return false
+        return payload.type === "hydration"
+      })
+      expect(hydration?.payload.execution).toBeUndefined()
+      expect(hydration?.payload.settledDelivery).toMatchObject({
+        executionId: GENERATION_ID,
+        presetId: PRESET_ID,
+        outcome: "graph-fallback",
+        finalDelivery: "delivered",
+        mainResponded: true,
+      })
+      expect(JSON.stringify(hydration?.payload.settledDelivery)).not.toContain("native response")
+      expect(JSON.stringify(hydration?.payload.settledDelivery)).not.toContain("error")
+
+      const viewResponseStart = captured.outbound().length
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      }, "user-1")
+      expect(captured.outbound()[viewResponseStart]).toMatchObject({
+        type: "view_response",
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      })
+      expect(captured.closeDrawerUsers).toEqual(["user-1"])
+    } finally {
+      await runtime.dispose()
+    }
+  })
+
+  test("projects Main errors and stops as not-delivered, then tears down generation listeners", async () => {
+    const captured = capturedRuntimeHost({ runSucceeds: false })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      expect(captured.eventListenerCount("GENERATION_ENDED")).toBe(1)
+      expect(captured.eventListenerCount("GENERATION_STOPPED")).toBe(1)
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const firstContext = runtimeContext(false)
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      await approveConsent(frontend)
+      const firstStart = captured.outbound().length
+      expect(await handler(messages, firstContext)).toEqual(messages)
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      }, "user-1")
+      expect(captured.closeDrawerUsers).toEqual([])
+      captured.emitGenerationEnded({ generationId: GENERATION_ID, error: "native provider failed" })
+      const errorUpdate = activityMessages(captured.outbound().slice(firstStart))
+        .find(activity => activity.payload.kind === "delivery-settled")
+      expect(errorUpdate?.payload.finalDelivery).toBe("not-delivered")
+      expect(errorUpdate?.payload.mainResponded).toBe(false)
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: GENERATION_ID },
+      }, "user-1")
+      expect(captured.closeDrawerUsers).toEqual([])
+
+      const secondContext = { ...firstContext, generationId: REPLACEMENT_GENERATION_ID }
+      const secondStart = captured.outbound().length
+      expect(await handler(messages, secondContext)).toEqual(messages)
+      captured.emitGenerationStopped({ generationId: REPLACEMENT_GENERATION_ID })
+      const stopUpdate = activityMessages(captured.outbound().slice(secondStart))
+        .find(activity => activity.payload.kind === "delivery-settled")
+      expect(stopUpdate?.payload.finalDelivery).toBe("not-delivered")
+      expect(stopUpdate?.payload.mainResponded).toBe(false)
+
+      const thirdGenerationId = fixtureGenerationId(3)
+      const thirdContext = { ...firstContext, generationId: thirdGenerationId }
+      const thirdStart = captured.outbound().length
+      expect(await handler(messages, thirdContext)).toEqual(messages)
+      const beforeDispose = captured.outbound().length
+      await runtime.dispose()
+      expect(captured.eventListenerCount("GENERATION_ENDED")).toBe(0)
+      expect(captured.eventListenerCount("GENERATION_STOPPED")).toBe(0)
+      captured.emitGenerationEnded({ generationId: thirdGenerationId, content: "late native response" })
+      expect(captured.outbound()).toHaveLength(beforeDispose)
+      expect(activityMessages(captured.outbound().slice(thirdStart))
+        .filter(activity => activity.payload.kind === "delivery-settled")).toHaveLength(0)
+      await frontend({
+        version: 1,
+        type: "view_response",
+        correlationId: CORRELATION_ID,
+        payload: { presetId: PRESET_ID, executionId: thirdGenerationId },
+      }, "user-1")
+      expect(captured.closeDrawerUsers).toEqual([])
     } finally {
       await runtime.dispose()
     }
@@ -1005,6 +1261,140 @@ describe("APC runtime activity projection", () => {
       await runtime.dispose()
     }
   })
+  test("times out never-settling slot descriptor preparation before provider work", async () => {
+    vi.useFakeTimers()
+    const gate = deferred()
+    const preparationStarted = deferred()
+    let slotResolutions = 0
+    let assembleCalls = 0
+    let quietCalls = 0
+    const captured = capturedRuntimeHost({
+      slotDescriptor: SLOT_DESCRIPTOR,
+      slotResolveGate: gate.promise,
+      slotResolveGateAfter: 2,
+      onSlotResolve: () => {
+        slotResolutions += 1
+        if (slotResolutions === 3) preparationStarted.resolve()
+      },
+      onAssemble: () => { assembleCalls += 1 },
+      onQuietTracked: () => { quietCalls += 1 },
+    })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      await frontend({
+        version: 1,
+        type: "bind_slot",
+        correlationId: CORRELATION_ID,
+        payload: {
+          presetId: PRESET_ID,
+          slotId: SLOT_ID,
+          patch: { connectionId: SLOT_DESCRIPTOR.connectionId },
+        },
+      }, "user-1")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false, { presetMetadata: parallelSlotConfig() })
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsentFor(frontend, `slot:${SLOT_ID}`)
+      const activityStart = captured.outbound().length
+      const pending = handler(messages, context)
+      await preparationStarted.promise
+      vi.advanceTimersByTime(1_000)
+      await pending
+      const activities = activityMessages(captured.outbound().slice(activityStart))
+      const runSettled = activities.filter(activity => activity.payload.kind === "run-settled")
+      const terminals = activities.filter(activity => activity.payload.terminal)
+      expect(slotResolutions).toBe(3)
+      expect(runSettled).toHaveLength(1)
+      expect(runSettled[0]?.payload.runStatus).toBe("timed-out")
+      expect(terminals).toHaveLength(1)
+      expect(terminals[0]?.payload).toMatchObject({
+        phase: "completed",
+        outcome: "graph-fallback",
+      })
+      expect(assembleCalls).toBe(0)
+      expect(quietCalls).toBe(0)
+      const outboundAtTimeout = captured.outbound().length
+      gate.resolve()
+      for (let index = 0; index < 8; index += 1) await Promise.resolve()
+      expect(captured.outbound()).toHaveLength(outboundAtTimeout)
+      expect(activityMessages(captured.outbound().slice(activityStart)).filter(activity => activity.payload.terminal)).toHaveLength(1)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  test("times out never-settling consent authorization before provider work", async () => {
+    vi.useFakeTimers()
+    const gate = deferred()
+    let quietCalls = 0
+    const authorizationStarted = deferred()
+    const captured = capturedRuntimeHost({ onQuietTracked: () => { quietCalls += 1 } })
+    const runtime = setup({ spindle: captured.spindle, now: () => 0 })
+    try {
+      await runtime.ready
+      const handler = captured.interceptor()
+      const frontend = captured.frontend()
+      if (handler === undefined || frontend === undefined) throw new Error("runtime handlers are unavailable")
+      const messages = runtimeMessages(false)
+      const context = runtimeContext(false)
+      expect(await handler(messages, context)).toEqual(messages)
+      await approveConsent(frontend)
+      const storage = captured.spindle.storage as unknown as {
+        readonly exists: (path: string) => Promise<boolean>
+      }
+      const userStorage = captured.spindle.userStorage as unknown as {
+        readonly exists: (path: string, userId?: string) => Promise<boolean>
+      }
+      const canonicalExists = storage.exists.bind(captured.spindle.storage)
+      const userExists = userStorage.exists.bind(captured.spindle.userStorage)
+      Object.assign(captured.spindle.storage, {
+        exists: async (path: string) => {
+          authorizationStarted.resolve()
+          await gate.promise
+          return canonicalExists(path)
+        },
+      })
+      Object.assign(captured.spindle.userStorage, {
+        exists: async (path: string, userId?: string) => {
+          authorizationStarted.resolve()
+          await gate.promise
+          return userExists(path, userId)
+        },
+      })
+      const activityStart = captured.outbound().length
+      const pending = handler(messages, context)
+      await authorizationStarted.promise
+      vi.advanceTimersByTime(1_000)
+      await pending
+      const activities = activityMessages(captured.outbound().slice(activityStart))
+      const runSettled = activities.filter(activity => activity.payload.kind === "run-settled")
+      const terminals = activities.filter(activity => activity.payload.terminal)
+      expect(runSettled).toHaveLength(1)
+      expect(runSettled[0]?.payload.runStatus).toBe("timed-out")
+      expect(terminals).toHaveLength(1)
+      expect(terminals[0]?.payload).toMatchObject({
+        phase: "completed",
+        outcome: "graph-fallback",
+      })
+      expect(quietCalls).toBe(0)
+      const outboundAtTimeout = captured.outbound().length
+      gate.resolve()
+      for (let index = 0; index < 8; index += 1) await Promise.resolve()
+      expect(captured.outbound()).toHaveLength(outboundAtTimeout)
+      expect(activityMessages(captured.outbound().slice(activityStart)).filter(activity => activity.payload.terminal)).toHaveLength(1)
+    } finally {
+      gate.resolve()
+      await runtime.dispose()
+      vi.useRealTimers()
+    }
+  })
+
   test("cancels a thread-final execution when final-response permission is revoked during provider work", async () => {
     const run = deferred()
     const started = deferred()

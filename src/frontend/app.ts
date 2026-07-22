@@ -29,6 +29,7 @@ import {
 import {
   decodeBackendResponse,
   type ActivityErrorCategory,
+  type ActivityFallbackCauseCategory,
   type ActivityOutcome,
   type BackendResponse,
   type ConsentSelector,
@@ -79,15 +80,15 @@ import { createDomScope, type DomScope } from "./dom"
 import {
   installScopedStyles,
   APC_EDITOR_REDUCED_MOTION_STYLE,
+  APC_EDITOR_STACK_MAX_INLINE_REM,
   APC_EDITOR_STYLE,
   type ScopedStylesheet,
 } from "./styles"
 
 const APC_TOOLBAR_STYLE = `
 :scope {
-  container-name: apc-toolbar;
-  container-type: inline-size;
   min-inline-size: 0;
+  max-inline-size: 100%;
 }
 :scope .apc-mode-toolbar-shell {
   display: flex;
@@ -95,6 +96,7 @@ const APC_TOOLBAR_STYLE = `
   gap: 0.5rem;
   align-items: center;
   min-inline-size: 0;
+  max-inline-size: 100%;
 }
 :scope .apc-mode-toolbar {
   display: inline-flex;
@@ -102,6 +104,7 @@ const APC_TOOLBAR_STYLE = `
   gap: 0.25rem;
   align-items: center;
   min-inline-size: 0;
+  max-inline-size: 100%;
 }
 :scope .apc-mode-toolbar button {
   min-inline-size: 0;
@@ -133,25 +136,6 @@ const APC_TOOLBAR_STYLE = `
   outline: 0.1875rem solid var(--lumiverse-accent, var(--lumiverse-primary, Highlight));
   outline-offset: 0.125rem;
   box-shadow: 0 0 0 0.125rem var(--lumiverse-fill, Canvas);
-}
-@container apc-toolbar (max-width: 48rem) {
-  :scope .apc-mode-toolbar-shell {
-    align-items: stretch;
-    inline-size: 100%;
-  }
-  :scope .apc-mode-toolbar {
-    align-items: stretch;
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    inline-size: 100%;
-  }
-  :scope .apc-mode-toolbar button {
-    inline-size: 100%;
-    text-align: center;
-  }
-  :scope .apc-mode-toolbar .apc-disabled-reason {
-    grid-column: 1 / -1;
-  }
 }
 @media (forced-colors: active) {
   :scope,
@@ -671,6 +655,16 @@ function threadSnapshot(
     : (() => {
         const earlier = earlierRunLocations(config, selectedLocation)
         const earlierIds = new Set(earlier.map((location) => location.run.id))
+        const stageThreadIds = new Set(
+          selectedLocation.pipeline.stages[selectedLocation.stageIndex]?.runs
+            .filter((candidate) => candidate.id !== selectedLocation.run.id)
+            .map((candidate) => candidate.threadId),
+        )
+        const threadTargets = config.threads.map((candidate) => ({
+          id: candidate.id,
+          name: candidate.name,
+          available: !stageThreadIds.has(candidate.id),
+        }))
         const position = runPositionProjection(config, selectedLocation)
         return {
           id: selectedLocation.run.id,
@@ -678,6 +672,7 @@ function threadSnapshot(
           stageName: selectedLocation.pipeline.stages[selectedLocation.stageIndex]?.name ?? "",
           stageOrdinal: selectedLocation.stageIndex + 1,
           ordinal: selectedLocation.runIndex + 1,
+          threadTargets,
           positionTargets: position.targets,
           ...(position.restricted ? { positionRestricted: true } : {}),
           required: selectedLocation.run.required,
@@ -798,13 +793,30 @@ function inspectorErrorCategory(category: ActivityErrorCategory | undefined): In
   return "unknown"
 }
 
+function inspectorFallbackErrorCategory(category: ActivityFallbackCauseCategory | undefined): InspectorErrorCategory {
+  switch (category) {
+    case "retrieval-dispatch-consent": return "consent"
+    case "timeout-deadline": return "timeout"
+    case "host-gate": return "connection"
+    case "capacity-config-graph-prefill":
+    case "assembly-setup-storage-worker-transport-receipt":
+    case "required-typed-run":
+    case "guidance-workspace-fallback-validation":
+    case undefined: return "graph"
+  }
+  return "unknown"
+}
+
 function inspectorOutcome(
   outcome: ActivityOutcome,
   category: ActivityErrorCategory | undefined,
+  fallbackCauseCategory?: ActivityFallbackCauseCategory,
 ): InspectorOutcomeInput {
   return {
     class: outcome,
-    ...(category === undefined ? {} : { category: inspectorErrorCategory(category) }),
+    category: outcome === "graph-fallback"
+      ? inspectorFallbackErrorCategory(fallbackCauseCategory)
+      : inspectorErrorCategory(category),
   }
 }
 
@@ -858,13 +870,14 @@ function inspectorActivity(
   const stage = pipeline?.stages[activity.stageIndex ?? -1]
   const run = stage?.runs[activity.runIndex ?? -1]
   const thread = config?.threads.find((candidate) => candidate.id === run?.threadId)
+  const errorCategory = activity.errorCategory ?? activity.runErrorCategory
   return {
     status: activity.status,
     ...(thread === undefined ? {} : { threadLabel: thread.name, runLabel: thread.name }),
     ...(stage === undefined ? {} : { stageLabel: stage.name }),
-    ...(activity.errorCategory === undefined
+    ...(errorCategory === undefined
       ? {}
-      : { error: { category: inspectorErrorCategory(activity.errorCategory) } }),
+      : { error: { category: inspectorErrorCategory(errorCategory) } }),
   }
 }
 
@@ -914,16 +927,47 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
     ? undefined
     : config.threads.find((thread) => thread.id === selection.threadId)
   const topologyIdentityApplicable = execution.executionKey === null || execution.topologyApplicable
+  const fallbackCategory = inspectorFallbackErrorCategory(execution.fallbackCauseCategory)
+  const fallbackSnapshot: ExecutionInspectorSnapshot["fallback"] =
+    execution.outcome === "graph-fallback"
+      ? {
+          category: fallbackCategory,
+          ...(execution.fallbackCauseCategory === undefined
+            ? {}
+            : { causeCategory: execution.fallbackCauseCategory }),
+          ...(execution.fallbackCauseCode === undefined
+            ? {}
+            : { causeCode: execution.fallbackCauseCode }),
+          ...(execution.finalDelivery === undefined
+            ? {}
+            : { finalDelivery: execution.finalDelivery }),
+          ...(execution.mainResponded === undefined
+            ? {}
+            : { mainResponded: execution.mainResponded }),
+        }
+      : undefined
+  const routeDelivery = execution.finalDelivery
+  const routeDelivered = routeDelivery === "delivered"
+    ? true
+    : routeDelivery === "not-delivered"
+      ? false
+      : undefined
   let finalRoute: ExecutionInspectorSnapshot["finalRoute"]
   if (topologyIdentityApplicable && pipeline !== undefined) {
     const response = pipeline.finalResponse
     if (response.source === "main") {
-      finalRoute = { target: "main" }
+      finalRoute = {
+        target: "main",
+        ...(routeDelivery === undefined ? {} : { delivery: routeDelivery }),
+        ...(routeDelivered === undefined ? {} : { delivered: routeDelivered }),
+      }
     } else {
       const finalRun = config === null ? undefined : findRun(config, response.runId, pipeline)
       finalRoute = {
         target: "thread",
         ...(finalRun === undefined ? {} : { targetLabel: finalRun.thread.name }),
+        ...(routeDelivery === undefined ? {} : { delivery: routeDelivery }),
+        ...(routeDelivered === undefined ? {} : { delivered: routeDelivered }),
       }
     }
   }
@@ -1006,8 +1050,9 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
         (item) => item.stageIndex === execution.stageIndex && item.runIndex === execution.runIndex,
       )
     : undefined
-  const currentActivityOwnsError = currentActivity?.status === "failed" &&
-    currentActivity.errorCategory !== undefined
+  const currentActivityErrorCategory = currentActivity?.errorCategory ?? currentActivity?.runErrorCategory
+  const currentActivityOwnsError = (currentActivity?.status === "failed" || currentActivity?.status === "timed-out") &&
+    currentActivityErrorCategory !== undefined
   const inspectedRun = currentLocation === undefined || config === null
     ? undefined
     : {
@@ -1015,7 +1060,7 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
         status: currentActivity?.status ?? "pending",
         ...(currentDispatch === undefined ? {} : { dispatch: currentDispatch }),
         ...(currentActivityOwnsError
-          ? { error: { category: inspectorErrorCategory(currentActivity?.errorCategory) } }
+          ? { error: { category: inspectorErrorCategory(currentActivityErrorCategory) } }
           : {}),
       }
   const cancellationReason = execution.cancellationSource === "user" ||
@@ -1024,13 +1069,20 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
       execution.cancellationSource === "timeout"
     ? execution.cancellationSource
     : undefined
-  const canUseMainFallback = execution.topologyApplicable &&
+  const canUseMainFallback = !snapshot.executionMutationLocked &&
+    execution.topologyApplicable &&
     execution.terminal &&
     execution.outcome === "graph-fallback" &&
     pipeline?.finalResponse.source === "thread"
   const executionStageCount = execution.topologyApplicable
     ? execution.stageCount ?? pipeline?.stages.length
     : undefined
+  const canViewResponse = !snapshot.executionMutationLocked &&
+    execution.topologyApplicable &&
+    execution.terminal &&
+    execution.outcome === "graph-fallback" &&
+    execution.finalDelivery === "delivered" &&
+    execution.mainResponded === true
   const progressStageIndex = execution.topologyApplicable ? execution.stageIndex : undefined
 
   return {
@@ -1041,7 +1093,8 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
     ...(execution.usage === undefined ? {} : { usage: execution.usage }),
     ...(execution.outcome === undefined
       ? {}
-      : { outcome: inspectorOutcome(execution.outcome, execution.errorCategory) }),
+      : { outcome: inspectorOutcome(execution.outcome, execution.errorCategory, execution.fallbackCauseCategory) }),
+    ...(fallbackSnapshot === undefined ? {} : { fallback: fallbackSnapshot }),
     ...(execution.errorCategory === undefined
       ? {}
       : { error: { category: inspectorErrorCategory(execution.errorCategory) } }),
@@ -1085,6 +1138,7 @@ export function inspectorStatus(snapshot: ApcFrontendSnapshot, t: ApcTranslate):
     ...traceView,
     ...(finalRoute === undefined ? {} : { finalRoute }),
     ...(canUseMainFallback ? { canUseMainFallback: true } : {}),
+    ...(canViewResponse ? { canViewResponse: true } : {}),
   }
 }
 
@@ -1337,11 +1391,33 @@ function changeRun(
 ): ApcPresetConfigV1 {
   const positioned = change.position === undefined ? config as ApcPresetConfigV1 : moveRun(config, runId, change.position)
   if (change.position !== undefined && positioned === config) return config as ApcPresetConfigV1
-  return updateRun(positioned, runId, (run) => ({
+  if (
+    change.threadId !== undefined &&
+    !config.threads.some((thread) => thread.id === change.threadId)
+  ) return config as ApcPresetConfigV1
+  const candidate = updateRun(positioned, runId, (run) => ({
     ...run,
+    ...(change.threadId === undefined ? {} : { threadId: change.threadId }),
     ...(change.required === undefined ? {} : { required: change.required }),
     ...(change.timeoutMs === undefined ? {} : { timeoutMs: change.timeoutMs }),
   }))
+  if (change.threadId === undefined) return candidate
+  if (candidate === config) return config as ApcPresetConfigV1
+  const location = findRun(candidate, runId, activePipeline(candidate))
+  if (
+    location === undefined ||
+    location.run.threadId !== change.threadId ||
+    location.pipeline.stages[location.stageIndex]?.runs.some((run) =>
+      run.id !== runId && run.threadId === change.threadId
+    )
+  ) return config as ApcPresetConfigV1
+  try {
+    return validateConfigForMode(candidate, candidate.activeMode).valid
+      ? candidate
+      : config as ApcPresetConfigV1
+  } catch {
+    return config as ApcPresetConfigV1
+  }
 }
 
 function routeActivePipelineToMain(config: Readonly<ApcPresetConfigV1>): ApcPresetConfigV1 {
@@ -1369,6 +1445,8 @@ function routeActivePipelineToMain(config: Readonly<ApcPresetConfigV1>): ApcPres
   }
 }
 
+type ApcMobilePane = "navigation" | "workspace" | "configuration"
+
 class ApcAppImpl implements ApcAppHandle {
   readonly #ctx: SpindleFrontendContext
   readonly #host: SpindleHostDescriptorV1
@@ -1383,6 +1461,13 @@ class ApcAppImpl implements ApcAppHandle {
   readonly #scope: DomScope
   readonly #styles: ScopedStylesheet
   readonly #toolbarStyles: ScopedStylesheet
+  readonly #layout: HTMLElement
+  readonly #mobileNavigation: HTMLElement
+  readonly #mobileCloseControls: Readonly<Record<Exclude<ApcMobilePane, "workspace">, HTMLButtonElement>>
+  readonly #mobilePaneControls: Readonly<Record<ApcMobilePane, HTMLButtonElement>>
+  readonly #mobileRuntimeBar: HTMLElement
+  readonly #mobileRuntimeStatus: HTMLElement
+  readonly #mobileStop: HTMLButtonElement
   readonly #navigationPanel: HTMLElement
   readonly #workspacePanel: HTMLElement
   readonly #inspectorPanel: HTMLElement
@@ -1409,6 +1494,12 @@ class ApcAppImpl implements ApcAppHandle {
   #focusConfigurationAfterInspector = false
   #consentReviewOpen = false
   #consentReviewSelectionKey: string | null = null
+  #mobilePane: ApcMobilePane = "workspace"
+  #mobilePaneTrigger: HTMLElement | null = null
+  #mobileResizeObserver: ResizeObserver | null = null
+  #consentReviewPortal: Readonly<{ review: HTMLElement; parent: HTMLElement }> | null = null
+  #consentPortalObserver: MutationObserver | null = null
+  #mobileStopPendingExecutionKey: string | null = null
   #unsubscribeState: (() => void) | null = null
   #unsubscribeLocale: (() => void) | null = null
   #unsubscribeEvents: Array<() => void> = []
@@ -1462,30 +1553,116 @@ class ApcAppImpl implements ApcAppHandle {
     }
     this.#toolbarStyles = toolbarStyles
     this.#finalResponseAvailable = finalResponseAvailable
+    const scopeKey = scope.element.getAttribute("data-apc-scope") ?? "workspace"
+    this.#layout = scope.createElement("div", {
+      "data-apc-layout": "true",
+    })
+    this.#mobileNavigation = scope.createElement("nav", {
+      "data-apc-mobile-navigation": "true",
+      "aria-label": t("agentGraph.title"),
+    })
+    const mobileControl = (
+      pane: ApcMobilePane,
+      label: string,
+      controls: string,
+    ): HTMLButtonElement => {
+      const control = scope.createElement("button", {
+        type: "button",
+        "data-apc-mobile-pane-control": pane,
+        "aria-controls": controls,
+        "aria-expanded": "false",
+        "aria-pressed": "false",
+      })
+      control.textContent = label
+      return control
+    }
+    this.#mobilePaneControls = {
+      navigation: mobileControl("navigation", t("graph.threadNavigation"), `apc-${scopeKey}-navigation`),
+      workspace: mobileControl("workspace", t("graph.stages"), `apc-${scopeKey}-workspace`),
+      configuration: mobileControl("configuration", t("threadEditor.ariaLabel"), `apc-${scopeKey}-configuration`),
+    }
+    this.#mobileNavigation.append(
+      this.#mobilePaneControls.navigation,
+      this.#mobilePaneControls.workspace,
+      this.#mobilePaneControls.configuration,
+    )
+
+    const mobileClose = (
+      pane: Exclude<ApcMobilePane, "workspace">,
+      label: string,
+      controls: string,
+    ): HTMLButtonElement => {
+      const close = scope.createElement("button", {
+        type: "button",
+        "data-apc-mobile-close": pane,
+        "aria-controls": controls,
+        "aria-label": `${t("action.cancel")}: ${label}`,
+      })
+      close.textContent = "×"
+      close.hidden = true
+      return close
+    }
+    this.#mobileCloseControls = {
+      navigation: mobileClose("navigation", t("graph.threadNavigation"), `apc-${scopeKey}-navigation`),
+      configuration: mobileClose(
+        "configuration",
+        t("threadEditor.ariaLabel"),
+        `apc-${scopeKey}-configuration`,
+      ),
+    }
+    this.#mobileRuntimeBar = scope.createElement("div", {
+      "data-apc-mobile-runtime-bar": "true",
+      role: "region",
+      "aria-label": t("inspector.title"),
+    })
+    this.#mobileRuntimeBar.hidden = true
+    this.#mobileRuntimeStatus = scope.createElement("span", {
+      "data-apc-mobile-runtime-status": "true",
+    })
+    this.#mobileStop = scope.createElement("button", {
+      type: "button",
+      "data-apc-mobile-stop": "true",
+      "aria-label": `${t("action.stop")}. ${t("council.effects")}`,
+    })
+    this.#mobileStop.textContent = t("action.stop")
+    this.#mobileRuntimeBar.append(this.#mobileRuntimeStatus, this.#mobileStop)
+
     this.#navigationPanel = scope.createElement("div", {
+      id: `apc-${scopeKey}-navigation`,
       "data-apc-panel": "threads",
       "data-apc-pane": "navigation",
+      "data-apc-mobile-layer": "drawer",
       role: "region",
       "aria-label": t("graph.threadNavigation"),
     })
     this.#workspacePanel = scope.createElement("div", {
+      id: `apc-${scopeKey}-workspace`,
       "data-apc-panel": "graph",
       "data-apc-pane": "workspace",
       role: "region",
       "aria-label": t("graph.stages"),
+      tabindex: "-1",
     })
     this.#inspectorPanel = scope.createElement("div", {
+      id: `apc-${scopeKey}-configuration`,
       "data-apc-panel": "inspector",
       "data-apc-pane": "configuration",
+      "data-apc-mobile-layer": "sheet",
       role: "region",
       "aria-label": t("threadEditor.ariaLabel"),
     })
     toolbar.root.replaceChildren()
     toolbar.root.setAttribute("data-apc-toolbar", "true")
     toolbar.root.setAttribute("aria-label", t("agentGraph.title"))
-    scope.append(this.#navigationPanel)
-    scope.append(this.#workspacePanel)
-    scope.append(this.#inspectorPanel)
+    this.#layout.append(
+      this.#mobileNavigation,
+      this.#navigationPanel,
+      this.#workspacePanel,
+      this.#inspectorPanel,
+      this.#mobileRuntimeBar,
+    )
+    scope.append(this.#layout)
+    this.syncMobilePaneSemantics()
     tab.root.append(scope.element)
   }
 
@@ -1634,6 +1811,9 @@ class ApcAppImpl implements ApcAppHandle {
       if (!activity.active || createdApp.#disposed) {
         throw new Error("APC frontend setup was cancelled while reading the initial preset")
       }
+      readyCalled = true
+      ctx.ready()
+      if (!activity.active) throw new Error("APC frontend setup was cancelled during readiness")
       if (initial.presetId !== null) {
         try {
           await appState.hydrate(initial.presetId)
@@ -1644,9 +1824,6 @@ class ApcAppImpl implements ApcAppHandle {
       if (!activity.active) throw new Error("APC frontend setup was cancelled before readiness")
       createdApp.render(appState.getSnapshot())
       if (!activity.active) throw new Error("APC frontend setup was cancelled while rendering")
-      readyCalled = true
-      ctx.ready()
-      if (!activity.active) throw new Error("APC frontend setup was cancelled during readiness")
       return createdApp
     } catch (error) {
       activity.active = false
@@ -1801,7 +1978,7 @@ class ApcAppImpl implements ApcAppHandle {
       const mode = control.dataset.mode
       if (mode !== "single" && mode !== "sequential" && mode !== "parallel") continue
       const availability = snapshot.modeAvailability[mode]
-      if (!availability.supported || !availability.valid) continue
+      if (!availability.valid) continue
       control.disabled = false
       control.removeAttribute("aria-disabled")
     }
@@ -1974,6 +2151,148 @@ class ApcAppImpl implements ApcAppHandle {
     this.render(this.#state.getSnapshot())
   }
 
+  private syncMobilePaneSemantics(): void {
+    this.#scope.element.dataset.apcMobilePane = this.#mobilePane
+    this.#layout.dataset.apcMobilePane = this.#mobilePane
+    for (const [pane, control] of Object.entries(this.#mobilePaneControls) as Array<
+      [ApcMobilePane, HTMLButtonElement]
+    >) {
+      const active = pane === this.#mobilePane
+      control.setAttribute("aria-expanded", String(active))
+      control.setAttribute("aria-pressed", String(active))
+      if (active) control.setAttribute("aria-current", "page")
+      else control.removeAttribute("aria-current")
+    }
+    for (const [pane, panel] of [
+      ["navigation", this.#navigationPanel],
+      ["configuration", this.#inspectorPanel],
+    ] as const) {
+      const open = pane === this.#mobilePane
+      const close = this.#mobileCloseControls[pane]
+      if (!panel.contains(close)) panel.prepend(close)
+      close.hidden = !open
+      panel.setAttribute("role", open ? "dialog" : "region")
+      if (open) {
+        panel.setAttribute("aria-modal", "false")
+        panel.tabIndex = -1
+      } else {
+        panel.removeAttribute("aria-modal")
+        panel.removeAttribute("tabindex")
+      }
+    }
+  }
+
+  private openMobilePane(pane: Exclude<ApcMobilePane, "workspace">, trigger: HTMLElement): void {
+    if (this.#disposed || this.#consentReviewOpen) return
+    this.#mobilePane = pane
+    this.#mobilePaneTrigger = trigger
+    this.syncMobilePaneSemantics()
+    focusElement(this.#mobileCloseControls[pane])
+  }
+
+  private closeMobilePane(restoreFocus: boolean): void {
+    if (this.#mobilePane === "workspace") return
+    const trigger = this.#mobilePaneTrigger
+    this.#mobilePane = "workspace"
+    this.#mobilePaneTrigger = null
+    this.syncMobilePaneSemantics()
+    if (restoreFocus && trigger?.isConnected) focusElement(trigger)
+  }
+
+  private observeMobileBoundary(): void {
+    const ResizeObserverConstructor = this.#document.defaultView?.ResizeObserver
+    if (typeof ResizeObserverConstructor !== "function") return
+    const rootFontSize = Number.parseFloat(
+      this.#document.defaultView?.getComputedStyle(this.#document.documentElement).fontSize ?? "",
+    )
+    const breakpoint = APC_EDITOR_STACK_MAX_INLINE_REM * (Number.isFinite(rootFontSize) ? rootFontSize : 16)
+    this.#mobileResizeObserver = new ResizeObserverConstructor((entries) => {
+      if (this.#disposed) return
+      const width = entries.find((entry) => entry.target === this.#scope.element)?.contentRect.width
+      if (width === undefined) return
+      const ElementConstructor = this.#document.defaultView?.HTMLElement
+      const active = ElementConstructor !== undefined &&
+          this.#document.activeElement instanceof ElementConstructor
+        ? this.#document.activeElement
+        : null
+      if (width >= breakpoint && this.#mobilePane !== "workspace") {
+        const focusNeedsFallback =
+          active === null ||
+          active === this.#document.body ||
+          this.#mobileNavigation.contains(active) ||
+          Object.values(this.#mobileCloseControls).some((control) => control === active)
+        this.closeMobilePane(false)
+        if (focusNeedsFallback) focusElement(this.#workspacePanel)
+      } else if (
+        width < breakpoint &&
+        this.#mobilePane === "workspace" &&
+        active !== null &&
+        (this.#navigationPanel.contains(active) || this.#inspectorPanel.contains(active))
+      ) {
+        focusElement(this.#workspacePanel)
+      }
+    })
+    this.#mobileResizeObserver.observe(this.#scope.element)
+  }
+
+  private observeConsentPortal(): void {
+    const MutationObserverConstructor = this.#document.defaultView?.MutationObserver
+    if (typeof MutationObserverConstructor !== "function") return
+    this.#consentPortalObserver = new MutationObserverConstructor(() => {
+      if (this.#disposed || !this.#consentReviewOpen) return
+      this.portalConsentReview()
+      this.applyConsentReviewLock()
+    })
+    this.#consentPortalObserver.observe(this.#scope.element, { childList: true, subtree: true })
+  }
+
+  private updateMobileStop(snapshot: ApcFrontendSnapshot): void {
+    const execution = snapshot.execution
+    const stoppable = execution.executionKey !== null &&
+      execution.status === "running" &&
+      !execution.terminal
+    if (!stoppable) this.#mobileStopPendingExecutionKey = null
+    const stagePosition = execution.stageIndex === undefined
+      ? null
+      : this.#t("inspector.stageTitle", { index: execution.stageIndex + 1 })
+    const runPosition = execution.runIndex === undefined
+      ? null
+      : this.#t("inspector.runTitle", { index: execution.runIndex + 1 })
+    this.#mobileRuntimeStatus.textContent = [
+      this.#t("inspector.statusRunning"),
+      stagePosition,
+      runPosition,
+    ].filter((value): value is string => value !== null).join(" · ")
+    this.#mobileRuntimeBar.hidden = !stoppable
+    this.#mobileStop.disabled =
+      !stoppable ||
+      this.#consentReviewOpen ||
+      this.#mobileStopPendingExecutionKey === execution.executionKey
+  }
+
+  private async requestExecutionStop(): Promise<void> {
+    const snapshot = this.#state.getSnapshot()
+    const executionKey = snapshot.execution.executionKey
+    if (
+      this.#disposed ||
+      executionKey === null ||
+      snapshot.execution.status !== "running" ||
+      snapshot.execution.terminal ||
+      this.#consentReviewOpen ||
+      this.#mobileStopPendingExecutionKey === executionKey
+    ) return
+    this.#mobileStopPendingExecutionKey = executionKey
+    this.updateMobileStop(snapshot)
+    try {
+      await this.#state.cancelExecution(executionKey, "stop")
+    } finally {
+      if (this.#mobileStopPendingExecutionKey === executionKey) {
+        this.#mobileStopPendingExecutionKey = null
+        this.updateMobileStop(this.#state.getSnapshot())
+      }
+    }
+  }
+
   mount(): void {
     let tabActivationUnsubscribe: (() => void) | null = null
     let liveRegion: LiveRegion | null = null
@@ -1996,6 +2315,27 @@ class ApcAppImpl implements ApcAppHandle {
       }
       this.#unsubscribeEvents.push(tabActivationUnsubscribe)
       tabActivationUnsubscribe = null
+    for (const pane of ["navigation", "configuration"] as const) {
+      const control = this.#mobilePaneControls[pane]
+      this.#scope.listen(control, "click", () => this.openMobilePane(pane, control))
+      this.#scope.listen(this.#mobileCloseControls[pane], "click", () => this.closeMobilePane(true))
+    }
+    this.#scope.listen(this.#mobilePaneControls.workspace, "click", () => {
+      this.closeMobilePane(false)
+      focusElement(this.#workspacePanel)
+    })
+    this.#scope.listen(this.#mobileStop, "click", () => {
+      void this.requestExecutionStop().catch(() => {})
+    })
+    this.observeMobileBoundary()
+    this.observeConsentPortal()
+    this.#scope.listen<KeyboardEvent>(this.#scope.element, "keydown", (event) => {
+      if (event.key !== "Escape" || this.#mobilePane === "workspace" || this.#consentReviewOpen) return
+      event.preventDefault()
+      event.stopPropagation()
+      this.closeMobilePane(true)
+    })
+
     const interceptModeClick = (event: Event): void => {
       const elementConstructor = this.#document.defaultView?.Element
       const target = event.target
@@ -2080,7 +2420,12 @@ class ApcAppImpl implements ApcAppHandle {
     this.#toolbar.root.addEventListener("click", interceptModeClick, true)
     this.#unsubscribeEvents.push(() => this.#toolbar.root.removeEventListener("click", interceptModeClick, true))
 
-    liveRegion = createLiveRegion(this.#navigationPanel, { label: this.#t("graph.editorAria") })
+    liveRegion = createLiveRegion(this.#layout, { label: this.#t("graph.editorAria") })
+    const graphLiveRegion = {
+      announce: liveRegion.announce,
+      clear: liveRegion.clear,
+      cleanup: liveRegion.cleanup,
+    }
     if (this.#disposed || !this.#activity.active) {
       throw new Error("APC frontend setup was cancelled while creating accessibility resources")
     }
@@ -2168,26 +2513,46 @@ class ApcAppImpl implements ApcAppHandle {
           }
         })
       },
-      onSelectionChange: (selection: ApcFrontendSnapshot["selection"]) => {
-        if (this.#disposed || this.#consentReviewOpen || selection === undefined) return
-        const snapshot = this.#state.getSnapshot()
-        if (snapshot.execution.executionKey !== null && snapshot.execution.terminal) {
-          this.#dismissedTerminalExecutionKey = snapshot.execution.executionKey
-        }
-        this.#threadContextAuthorityGeneration += 1
-        this.#threadConsentAuthorityGeneration += 1
-        this.#state.setSelection(selection)
-        void this.resolveSelectedConsent()
-      },
+    }
+    const onSelectionChange = (
+      selection: ApcFrontendSnapshot["selection"],
+      closeNavigationDrawer: boolean,
+    ): void => {
+      if (this.#disposed || this.#consentReviewOpen || selection === undefined) return
+      const snapshot = this.#state.getSnapshot()
+      if (snapshot.execution.executionKey !== null && snapshot.execution.terminal) {
+        this.#dismissedTerminalExecutionKey = snapshot.execution.executionKey
+      }
+      const selectedThread = selection?.kind === "thread"
+        ? snapshot.config?.threads.find((thread) => thread.id === selection.threadId)
+        : undefined
+      this.#workspaceThreadId = selectedThread?.workspaceSource === "native-blocks"
+        ? selectedThread.id
+        : null
+      if (closeNavigationDrawer) this.closeMobilePane(false)
+      this.#threadContextAuthorityGeneration += 1
+      this.#threadConsentAuthorityGeneration += 1
+      this.#state.setSelection(selection)
+      if (closeNavigationDrawer) {
+        this.#document.defaultView?.queueMicrotask(() => {
+          if (this.#disposed || this.#mobilePane !== "workspace") return
+          const destination = this.#workspacePanel.querySelector<HTMLElement>(
+            "[data-apc-back-to-graph], [data-selected=true][data-action]",
+          )
+          focusElement(destination ?? this.#workspacePanel)
+        })
+      }
+      void this.resolveSelectedConsent()
     }
     localNavigation = createGraphEditor({
       t: this.#t,
       document: this.#document,
       toolbarHost: this.#toolbar.root,
       state: graphState,
-      liveRegion: liveRegion ?? undefined,
+      liveRegion: graphLiveRegion,
       surface: "navigation",
       ...graphCallbacks,
+      onSelectionChange: (selection) => onSelectionChange(selection, true),
     })
     if (this.#disposed || !this.#activity.active) {
       throw new Error("APC frontend setup was cancelled while mounting navigation")
@@ -2196,9 +2561,10 @@ class ApcAppImpl implements ApcAppHandle {
       t: this.#t,
       document: this.#document,
       state: graphState,
-      liveRegion: liveRegion ?? undefined,
+      liveRegion: graphLiveRegion,
       surface: "topology",
       ...graphCallbacks,
+      onSelectionChange: (selection) => onSelectionChange(selection, false),
     })
     if (this.#disposed || !this.#activity.active) {
       throw new Error("APC frontend setup was cancelled while mounting topology")
@@ -2310,6 +2676,7 @@ class ApcAppImpl implements ApcAppHandle {
     if (this.#disposed || !this.#activity.active || this.#consentReviewOpen || !this.#state.getSnapshot().hydrated) return
     try {
       if (mode !== undefined) {
+        if (this.#mobilePane !== "workspace") this.closeMobilePane(false)
         const operation = this.beginModeTransition(mode)
         const snapshot = this.#state.getSnapshot()
         if (snapshot.activeMode === mode && !snapshot.dirty) {
@@ -2373,6 +2740,8 @@ class ApcAppImpl implements ApcAppHandle {
     this.releaseModeToolbarSaveLock(snapshot)
     this.renderThread(snapshot)
     this.renderInspector(snapshot)
+    this.portalConsentReview()
+    this.updateMobileStop(snapshot)
     this.updatePaneLandmarks(snapshot)
   }
 
@@ -2408,13 +2777,55 @@ class ApcAppImpl implements ApcAppHandle {
           surface.querySelector("[data-apc-consent-review=true]") !== null
         ) ?? null
       : null
-    for (const surface of [this.#navigationPanel, this.#workspacePanel, this.#inspectorPanel, ownedToolbar]) {
+    for (const surface of [
+      this.#navigationPanel,
+      this.#workspacePanel,
+      this.#inspectorPanel,
+      this.#mobileNavigation,
+      this.#mobileRuntimeBar,
+      ownedToolbar,
+    ]) {
       if (surface === null) continue
       const surfaceLocked = locked && surface !== reviewOwner
       surface.toggleAttribute("inert", surfaceLocked)
       if (surfaceLocked) surface.setAttribute("aria-hidden", "true")
       else surface.removeAttribute("aria-hidden")
     }
+  }
+
+  private restoreConsentReviewPortal(): void {
+    const portal = this.#consentReviewPortal
+    if (portal === null) return
+    this.#consentReviewPortal = null
+    if (portal.review.isConnected && portal.parent.isConnected) portal.parent.append(portal.review)
+    else portal.review.remove()
+  }
+
+  private portalConsentReview(): void {
+    if (!this.#consentReviewOpen || this.#mobilePane !== "configuration") return
+    const review = this.#threadConfiguration?.element.querySelector<HTMLElement>(
+      "[data-apc-consent-review=true]",
+    )
+    if (review === undefined || review === null) return
+    const existingPortal = this.#consentReviewPortal
+    if (existingPortal !== null) {
+      if (existingPortal.review === review) return
+      existingPortal.review.remove()
+      this.#consentReviewPortal = null
+    }
+    const parent = review.parentElement
+    if (parent === null || parent === this.#scope.element) return
+    this.#consentReviewPortal = { review, parent }
+    this.#scope.element.append(review)
+  }
+
+  private queueConsentReviewPortal(): void {
+    this.portalConsentReview()
+    queueMicrotask(() => {
+      if (this.#disposed || !this.#activity.active) return
+      this.portalConsentReview()
+      this.applyConsentReviewLock()
+    })
   }
 
   private consentReviewSelectionKey(snapshot: ApcFrontendSnapshot): string | null {
@@ -2454,6 +2865,29 @@ class ApcAppImpl implements ApcAppHandle {
     )
     this.#workspacePanel.dataset.apcCenterSurface = centerSurface
     this.#inspectorPanel.dataset.apcRightSurface = rightSurface
+    this.#mobileNavigation.setAttribute("aria-label", this.#t("agentGraph.title"))
+    this.#mobilePaneControls.navigation.textContent = this.#t("graph.threadNavigation")
+    this.#mobilePaneControls.workspace.textContent = centerLabel
+    this.#mobilePaneControls.configuration.textContent = this.#t(
+      rightSurface === "execution" ? "inspector.title" : "threadEditor.ariaLabel",
+    )
+    const navigationLabel = this.#t("graph.threadNavigation")
+    const configurationLabel = this.#t(rightSurface === "execution" ? "inspector.title" : "threadEditor.ariaLabel")
+    this.#mobileCloseControls.navigation.setAttribute(
+      "aria-label",
+      `${this.#t("action.cancel")}: ${navigationLabel}`,
+    )
+    this.#mobileCloseControls.configuration.setAttribute(
+      "aria-label",
+      `${this.#t("action.cancel")}: ${configurationLabel}`,
+    )
+    this.#mobileRuntimeBar.setAttribute("aria-label", this.#t("inspector.title"))
+    this.#mobileStop.textContent = this.#t("action.stop")
+    this.#mobileStop.setAttribute(
+      "aria-label",
+      `${this.#t("action.stop")}. ${this.#t("council.effects")}`,
+    )
+    this.syncMobilePaneSemantics()
     this.applyConsentReviewLock()
   }
 
@@ -2527,7 +2961,10 @@ class ApcAppImpl implements ApcAppHandle {
         this.advanceThreadContextAuthority(rebound)
       },
       onRunChange: (runId, change) => {
-        if (this.#consentReviewOpen) return change.position === undefined ? undefined : false
+        if (this.#consentReviewOpen) {
+          return change.threadId === undefined && change.position === undefined ? undefined : false
+        }
+        let threadChanged = false
         let positionChanged = false
         this.#state.updateConfig((config) => {
           const pipeline = activePipeline(config)
@@ -2537,9 +2974,11 @@ class ApcAppImpl implements ApcAppHandle {
             requiredLockedRunIds(pipeline).has(runId)
           ) return config
           const changed = changeRun(config, runId, change)
+          if (change.threadId !== undefined) threadChanged = changed !== config
           if (change.position !== undefined) positionChanged = changed !== config
           return changed
         })
+        if (change.threadId !== undefined) return threadChanged
         return change.position === undefined ? undefined : positionChanged
       },
       onRunBindingChange: (runId, bindingId, change) => {
@@ -2632,6 +3071,7 @@ class ApcAppImpl implements ApcAppHandle {
 
   renderThread(snapshot: ApcFrontendSnapshot): void {
     if (this.#disposed || !this.#activity.active) return
+    this.restoreConsentReviewPortal()
     if (
       this.#consentReviewOpen &&
       (
@@ -2700,6 +3140,7 @@ class ApcAppImpl implements ApcAppHandle {
     const configuration = this.#threadConfiguration
     if (configuration === null) return
     configuration.render(view)
+    this.queueConsentReviewPortal()
     if (this.#disposed || !this.#activity.active) return
     if (this.#workspaceThreadId === null) {
       const workspace = this.#threadWorkspace
@@ -2771,10 +3212,7 @@ class ApcAppImpl implements ApcAppHandle {
           await this.#state.loadTrace(key, { executionKey: token.executionKey })
           if (this.isInspectorContinuationActive(token)) this.renderInspector(this.#state.getSnapshot())
         },
-        onStop: () => {
-          const executionKey = this.#state.getSnapshot().execution.executionKey
-          if (executionKey !== null) return this.#state.cancelExecution(executionKey, "stop")
-        },
+        onStop: () => this.requestExecutionStop(),
         onUseMainFallback: () => {
           this.#focusConfigurationAfterInspector = true
           try {
@@ -2783,6 +3221,12 @@ class ApcAppImpl implements ApcAppHandle {
             this.#focusConfigurationAfterInspector = false
             throw error
           }
+        },
+        onViewResponse: async () => {
+          const token = this.captureInspectorContinuation()
+          if (token === null) return
+          await this.#state.viewResponse(token.executionKey)
+          if (this.isInspectorContinuationActive(token)) this.renderInspector(this.#state.getSnapshot())
         },
         onBackToConfiguration: () => {
           const current = this.#state.getSnapshot()
@@ -2845,6 +3289,7 @@ class ApcAppImpl implements ApcAppHandle {
     this.#dismissedTerminalExecutionKey = null
     this.#consentReviewOpen = false
     this.#consentReviewSelectionKey = null
+    this.#mobileStopPendingExecutionKey = null
     this.#activity.active = false
     let failure: unknown
     const runCleanup = (cleanup: () => void): void => {
@@ -2862,6 +3307,13 @@ class ApcAppImpl implements ApcAppHandle {
     const unsubscribeState = this.#unsubscribeState
     this.#unsubscribeState = null
     runCleanup(() => unsubscribeState?.())
+    const consentPortalObserver = this.#consentPortalObserver
+    this.#consentPortalObserver = null
+    runCleanup(() => consentPortalObserver?.disconnect())
+    const mobileResizeObserver = this.#mobileResizeObserver
+    this.#mobileResizeObserver = null
+    runCleanup(() => mobileResizeObserver?.disconnect())
+    runCleanup(() => this.restoreConsentReviewPortal())
     const graphNavigation = this.#graphNavigation
     this.#graphNavigation = null
     runCleanup(() => graphNavigation?.destroy())

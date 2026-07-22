@@ -277,36 +277,42 @@ export function createExecutionCancellation(options: ExecutionCancellationOption
     children.clear()
   }
 
-  const rootIsActive = (): boolean => !rootAborted && !rootDisposed
 
   const rootReasonOrDisposed = (): CancellationReason => rootReason ?? "disposed"
 
-  const abortRoot = (reason: CancellationReason): boolean => {
+  const abortRoot = (requestedReason: CancellationReason): boolean => {
     if (rootAborted || rootDisposed) return false
+    const reason = deadlineAt <= clock.now() ? "deadline" : requestedReason
     rootAborted = true
     rootReason = reason
     const controller = rootController
-    if (controller !== undefined) controller.abort(reason)
     rootController = undefined
-    // Child parent listeners run synchronously from rootController.abort().
-    // The explicit pass handles fake/non-DOM signals and keeps teardown
-    // deterministic if a child listener was concurrently removed.
+    // Establish the parent reason on every child before public root observers
+    // can run reentrant cleanup.
     for (const child of [...children]) child.abortFromParent(reason)
+    if (controller !== undefined) controller.abort(reason)
     detachRootResources()
     return true
   }
+
+  const rootIsActiveAt = (now: number): boolean => {
+    if (rootAborted || rootDisposed) return false
+    if (deadlineAt <= now) {
+      abortRoot("deadline")
+      return false
+    }
+    return true
+  }
+
+  const rootIsActive = (): boolean => rootIsActiveAt(clock.now())
+
 
   const onRootHostAbort = (): void => {
     abortRoot(reasonOrDefault(options.hostSignal.reason, "host-abort"))
   }
 
   if (options.hostSignal.aborted) {
-    rootAborted = true
-    rootReason = reasonOrDefault(options.hostSignal.reason, "host-abort")
-    const controller = rootController
-    if (controller !== undefined) controller.abort(rootReason)
-    rootController = undefined
-    detachRootResources()
+    abortRoot(reasonOrDefault(options.hostSignal.reason, "host-abort"))
   } else if (deadlineAt <= clock.now()) {
     abortRoot("deadline")
   } else {
@@ -364,12 +370,13 @@ export function createExecutionCancellation(options: ExecutionCancellationOption
       rootSignal.addEventListener("abort", this.#parentListener, { once: true })
       resources.listeners += 1
 
-      if (rootSignal.aborted) {
+      const now = clock.now()
+      if (!rootIsActiveAt(now)) {
         this.abortFromParent(rootReasonOrDisposed())
-      } else if (runDeadlineAt <= clock.now()) {
+      } else if (runDeadlineAt <= now) {
         this.abortFromParent("child-timeout")
       } else if (timed) {
-        const delayMs = Math.max(0, runDeadlineAt - clock.now())
+        const delayMs = Math.max(0, runDeadlineAt - now)
         const record: TimerRecord = { handle: undefined, active: true }
         this.#timer = record
         resources.timers += 1
@@ -389,7 +396,16 @@ export function createExecutionCancellation(options: ExecutionCancellationOption
       return this.#reason
     }
 
-    isActive = (): boolean => !this.#aborted && !this.#disposed && rootIsActive()
+    isActive = (): boolean => {
+      if (this.#aborted || this.#disposed) return false
+      const now = clock.now()
+      if (!rootIsActiveAt(now)) return false
+      if (this.deadlineAt <= now) {
+        this.#abortInternal("child-timeout")
+        return false
+      }
+      return true
+    }
 
     resourceSnapshot = (): CancellationResourceSnapshot =>
       freezeSnapshot(
@@ -542,15 +558,8 @@ export function createExecutionCancellation(options: ExecutionCancellationOption
 
   const dispose = (): void => {
     if (rootDisposed) return
+    if (!rootAborted) abortRoot("disposed")
     rootDisposed = true
-    if (!rootAborted) {
-      rootAborted = true
-      rootReason = "disposed"
-      const controller = rootController
-      if (controller !== undefined) controller.abort("disposed")
-      rootController = undefined
-      for (const child of [...children]) child.abortFromParent("disposed")
-    }
     detachRootResources()
   }
 

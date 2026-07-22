@@ -296,7 +296,7 @@ export function freezeResolvedDispatchBinding(value: ResolvedDispatchBinding): R
   const dispatchRevision = assertRevision(value.dispatchRevision)
   const descriptor = cloneDispatchDescriptor(value.descriptor)
   if (descriptor.connectionId !== connectionId || descriptor.connectionDispatchRevision !== dispatchRevision) {
-    return fail("STALE_BINDING", "Resolved descriptor does not match the binding revision")
+    return fail("STALE_BINDING", "Resolved descriptor does not match the binding")
   }
   const installId = assertUuid(value.installId, "resolved.installId")
   if (typeof value.installNonce !== "string" || !/^[0-9a-f]{32}$/u.test(value.installNonce)) {

@@ -97,7 +97,17 @@ const consentView = {
   disclosure: {
     version: 1,
     summary: "This thread's workspace content is sent to the selected destination.",
-    categories: ["thread", "workspace", "source", "destination", "provider", "model", "input-bindings", "prior-stage-outputs"],
+    categories: [
+      "thread",
+      "workspace",
+      "source",
+      "destination",
+      "provider",
+      "model",
+      "input-bindings",
+      "prior-stage-outputs",
+      "prompt-variable-values",
+    ],
   },
 }
 
@@ -119,6 +129,30 @@ const hydrationExecution = {
   completedRuns: 1,
   totalRuns: 4,
   remainingBudgetMs: 10_000,
+}
+const settledDeliveryProjection = {
+  executionId: EXECUTION_ID,
+  presetId: PRESET_ID,
+  traceId: TRACE_ID,
+  completedRuns: 2,
+  totalRuns: 4,
+  outcome: "graph-fallback",
+  fallbackCauseCategory: "required-typed-run",
+  fallbackCauseCode: "REQUIRED-FAILURE",
+  finalDelivery: "delivered",
+  mainResponded: true,
+  topology: [{
+    executionId: EXECUTION_ID,
+    presetId: PRESET_ID,
+    kind: "run-settled",
+    phase: "progress",
+    terminal: false,
+    stageIndex: 1,
+    stageCount: 2,
+    runIndex: 1,
+    runCount: 2,
+    runStatus: "failed",
+  }],
 }
 
 
@@ -157,6 +191,7 @@ const frontendMessages: readonly Record<string, unknown>[] = [
   }),
   frontendEnvelope("get_trace", { presetId: PRESET_ID, executionId: EXECUTION_ID, traceId: TRACE_ID }),
   frontendEnvelope("cancel_execution", { presetId: PRESET_ID, executionId: EXECUTION_ID, reason: "replacement" }),
+  frontendEnvelope("view_response", { presetId: PRESET_ID, executionId: EXECUTION_ID }),
 ]
 
 const backendMessages: readonly Record<string, unknown>[] = [
@@ -201,6 +236,7 @@ const backendMessages: readonly Record<string, unknown>[] = [
     }],
     consents: [consentView],
     execution: hydrationExecution,
+    settledDelivery: settledDeliveryProjection,
   }),
   backendEnvelope("cancellation", {
     executionId: EXECUTION_ID,
@@ -209,6 +245,7 @@ const backendMessages: readonly Record<string, unknown>[] = [
     status: "accepted",
     cancellationSource: "stop",
   }),
+  backendEnvelope("view_response", { presetId: PRESET_ID, executionId: EXECUTION_ID }),
   backendEnvelope("trace", {
     traces: [traceSummary()],
     nextCursor: "2",
@@ -270,6 +307,7 @@ describe("APC protocol messages", () => {
       "list_traces",
       "get_trace",
       "cancel_execution",
+      "view_response",
     ]))
   })
 
@@ -290,7 +328,60 @@ describe("APC protocol messages", () => {
       "cancellation",
       "trace",
       "activity",
+      "view_response",
     ]))
+  })
+
+  test("decodes and bounds content-free settled delivery projections", () => {
+    const decoded = decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: settledDeliveryProjection,
+    }))
+    expect(decoded.type).toBe("hydration")
+    if (decoded.type === "hydration") {
+      expect(decoded.payload.settledDelivery).toEqual(settledDeliveryProjection)
+      expectDeepFrozen(decoded.payload.settledDelivery)
+    }
+    const pending = decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: { ...settledDeliveryProjection, finalDelivery: "pending" },
+    }))
+    expect(pending.type).toBe("hydration")
+    if (pending.type === "hydration") expect(pending.payload.settledDelivery?.finalDelivery).toBe("pending")
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: { ...settledDeliveryProjection, presetId: TRACE_ID },
+    })))
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: { ...settledDeliveryProjection, content: "private response" },
+    })))
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: {
+        ...settledDeliveryProjection,
+        topology: [{ ...settledDeliveryProjection.topology[0], errorCategory: "provider" }],
+      },
+    })))
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("hydration", {
+      presetId: PRESET_ID,
+      bindings: [],
+      consents: [],
+      settledDelivery: {
+        ...settledDeliveryProjection,
+        topology: [{ ...settledDeliveryProjection.topology[0], kind: "delivery-settled", phase: "completed", terminal: true }],
+      },
+    })))
   })
 
   test("rejects malformed or private hydration execution snapshots", () => {
@@ -362,6 +453,14 @@ describe("APC protocol messages", () => {
       disclosure: {
         ...consentView.disclosure,
         categories: ["thread", "workspace", "source", "destination", "provider", "model", "main-context"],
+      },
+    })))
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("consent", {
+      presetId: PRESET_ID,
+      ...consentView,
+      disclosure: {
+        ...consentView.disclosure,
+        categories: ["thread", "workspace", "source", "destination", "provider", "model", "input-bindings", "prior-stage-outputs"],
       },
     })))
     const mainContext = {
@@ -615,6 +714,111 @@ describe("APC protocol messages", () => {
     }
     expect(() => createBackendActivityResponse({ ...base, runStatus: "provider" as never })).toThrow(RangeError)
     expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", { ...base, runStatus: "provider" })))
+  })
+  test("round trips bounded run failures, fallback causes, and Main delivery state", () => {
+    const runBase = {
+      correlationId: CORRELATION_ID,
+      sequence: 1,
+      executionId: EXECUTION_ID,
+      presetId: PRESET_ID,
+      kind: "run-settled",
+      phase: "progress" as const,
+      terminal: false,
+      runStatus: "failed" as const,
+      runErrorCategory: "provider" as const,
+    }
+    const run = createBackendActivityResponse(runBase)
+    expect(run.payload.runErrorCategory).toBe("provider")
+    expect(decodeBackendResponse(run)).toEqual(run)
+
+    const deliveryBase = {
+      correlationId: CORRELATION_ID,
+      sequence: 2,
+      executionId: EXECUTION_ID,
+      presetId: PRESET_ID,
+      kind: "execution-terminal",
+      phase: "completed" as const,
+      terminal: true,
+      outcome: "graph-fallback" as const,
+      fallbackCauseCategory: "required-typed-run" as const,
+      fallbackCauseCode: "REQUIRED-FAILURE",
+    }
+    const pending = createBackendActivityResponse({ ...deliveryBase, finalDelivery: "pending" })
+    expect(pending.payload.mainResponded).toBeUndefined()
+    expect(decodeBackendResponse(pending)).toEqual(pending)
+    const delivered = createBackendActivityResponse({
+      ...deliveryBase,
+      finalDelivery: "delivered",
+      mainResponded: true,
+    })
+    expect(decodeBackendResponse(delivered)).toEqual(delivered)
+    const notDelivered = createBackendActivityResponse({
+      ...deliveryBase,
+      finalDelivery: "not-delivered",
+      mainResponded: false,
+    })
+    expect(decodeBackendResponse(notDelivered)).toEqual(notDelivered)
+
+    expect(() => createBackendActivityResponse({
+      ...runBase,
+      runStatus: "completed",
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...runBase,
+      runStatus: "completed",
+    })))
+    expect(() => createBackendActivityResponse({
+      ...runBase,
+      kind: "execution",
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...runBase,
+      kind: "execution",
+    })))
+    expect(() => createBackendActivityResponse({
+      ...deliveryBase,
+      fallbackCauseCode: undefined,
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...deliveryBase,
+      fallbackCauseCode: undefined,
+    })))
+    expect(() => createBackendActivityResponse({
+      ...deliveryBase,
+      outcome: "success",
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...deliveryBase,
+      outcome: "success",
+    })))
+    expect(() => createBackendActivityResponse({
+      ...deliveryBase,
+      finalDelivery: "pending",
+      mainResponded: false,
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...deliveryBase,
+      finalDelivery: "pending",
+      mainResponded: false,
+    })))
+    expect(() => createBackendActivityResponse({
+      ...deliveryBase,
+      finalDelivery: "delivered",
+      mainResponded: false,
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...deliveryBase,
+      finalDelivery: "delivered",
+      mainResponded: false,
+    })))
+    expect(() => createBackendActivityResponse({
+      ...deliveryBase,
+      fallbackCauseCode: "raw error" as never,
+    })).toThrow(RangeError)
+    expectProtocolFailure(() => decodeBackendResponse(backendEnvelope("activity", {
+      ...deliveryBase,
+      fallbackCauseCode: "raw error",
+    })))
   })
 
   test("accepts only increasing backend sequence values", () => {

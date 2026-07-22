@@ -8,6 +8,7 @@ import type {
   BackendMessage,
   BackendTraceDetailResponse,
   BackendTraceListResponse,
+  BackendViewResponseResponse,
   ConsentSelector,
   FrontendApproveConsentIntent,
   FrontendBindSlotIntent,
@@ -17,6 +18,7 @@ import type {
   FrontendListConnectionsIntent,
   FrontendListTracesIntent,
   FrontendRevokeConsentIntent,
+  FrontendViewResponseIntent,
   FrontendResolveConsentIntent,
   FrontendUnbindSlotIntent,
 } from "../protocol/messages"
@@ -50,10 +52,11 @@ export type ApcDomainIntent =
   | FrontendListTracesIntent
   | FrontendGetTraceIntent
   | FrontendCancelExecutionIntent
+  | FrontendViewResponseIntent
 
 export type ApcDomainResponse = Extract<
   BackendMessage,
-  { type: "error" | "connections" | "hydration" | "binding" | "consent" | "trace" | "cancellation" | "activity" }
+  { type: "error" | "connections" | "hydration" | "binding" | "consent" | "trace" | "cancellation" | "activity" | "view_response" }
 >
 
 /** Backend authority for connection discovery, binding, consent, traces, and cancellation only. */
@@ -123,6 +126,7 @@ export interface ApcPersistence {
   }>): Promise<BackendTraceListResponse["payload"]>
   getTrace(presetId: string, executionId: string, traceId: string): Promise<BackendTraceDetailResponse["payload"]>
   cancelExecution(presetId: string, executionId: string, reason?: "user" | "stop" | "replacement"): Promise<BackendCancellationResponse["payload"]>
+  viewResponse(presetId: string, executionId: string): Promise<BackendViewResponseResponse["payload"]>
   /**
    * Rejects one pending correlated request after transport decoding fails.
    * Implementations must inspect only a bounded correlationId/requestId string.
@@ -556,6 +560,20 @@ export class ApcPersistenceImpl implements ApcPersistence {
         message.payload.presetId === presetId &&
         message.payload.executionId === executionId,
     ).then((message) => (message as BackendCancellationResponse).payload)
+  }
+  viewResponse(presetId: string, executionId: string): Promise<BackendViewResponseResponse["payload"]> {
+    return this.#request(
+      {
+        version: PROTOCOL_VERSION,
+        type: "view_response",
+        correlationId: this.#correlationId(),
+        payload: { presetId, executionId },
+      },
+      (message): message is BackendViewResponseResponse =>
+        message.type === "view_response" &&
+        message.payload.presetId === presetId &&
+        message.payload.executionId === executionId,
+    ).then((message) => (message as BackendViewResponseResponse).payload)
   }
 
   subscribe(listener: (message: ApcDomainResponse) => void): () => void {

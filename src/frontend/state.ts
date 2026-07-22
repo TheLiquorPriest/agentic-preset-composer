@@ -12,18 +12,22 @@ import {
   MAX_ACTIVITY_BUDGET_MS,
   MAX_ACTIVITY_RUN_COUNT,
   MAX_ACTIVITY_STAGE_COUNT,
+  MAX_ACTIVITY_TOPOLOGY_COUNT,
   MAX_ACTIVITY_USAGE_TOKENS,
   MAX_SAFE_LABEL_BYTES,
 } from "../protocol/messages"
 import type {
   ActivityCancellationSource,
   ActivityErrorCategory,
+  ActivityFallbackCauseCategory,
+  ActivityFinalDelivery,
   ActivityOutcome,
   ActivityRunStatus,
   BackendActivityResponse,
   BackendActivityUsage,
   BackendConsentResponse,
   BackendHydrationResponse,
+  BackendSettlementProjection,
   ConnectionSummary,
   ConsentSelector,
   SafeBindingView,
@@ -98,6 +102,11 @@ export type ApcExecutionActivity = Readonly<{
   remainingBudgetMs?: number
   usage?: ApcExecutionUsage
   outcome?: ActivityOutcome
+  runErrorCategory?: ActivityErrorCategory
+  fallbackCauseCategory?: ActivityFallbackCauseCategory
+  fallbackCauseCode?: string
+  finalDelivery?: ActivityFinalDelivery
+  mainResponded?: boolean
   errorCategory?: ActivityErrorCategory
   errorMessageKey?: string
   cancellationSource?: ActivityCancellationSource
@@ -118,6 +127,11 @@ export type ApcExecutionState = Readonly<{
   totalRuns?: number
   remainingBudgetMs?: number
   outcome?: ActivityOutcome
+  runErrorCategory?: ActivityErrorCategory
+  fallbackCauseCategory?: ActivityFallbackCauseCategory
+  fallbackCauseCode?: string
+  finalDelivery?: ActivityFinalDelivery
+  mainResponded?: boolean
   errorCategory?: ActivityErrorCategory
   usage?: ApcExecutionUsage
   errorMessageKey?: string
@@ -194,6 +208,7 @@ export interface ApcFrontendStore {
   }>): Promise<ApcTraceState>
   loadTrace(traceKey: string, options?: Readonly<{ executionKey?: string }>): Promise<ApcTraceDetailSurface>
   cancelExecution(executionKey: string, reason?: "user" | "stop" | "replacement"): Promise<void>
+  viewResponse(executionKey: string): Promise<void>
   flush(): Promise<void>
   dispose(): void
 }
@@ -217,6 +232,8 @@ const ACTIVITY_RUN_STATUSES: readonly ApcRunActivityStatus[] = ["pending", "runn
 const TERMINAL_ACTIVITY_STATUSES: readonly ApcRunActivityStatus[] = ["completed", "failed", "cancelled", "timed-out", "skipped"]
 const ACTIVITY_OUTCOMES = ["integrity-fatal", "parent-cancel", "selected-final-failure", "graph-fallback", "optional-local", "success"] as const
 const ACTIVITY_ERROR_CATEGORIES = ["integrity", "dispatch", "consent", "capacity", "config", "assembly", "provider", "tool", "timeout", "unknown"] as const
+const ACTIVITY_FALLBACK_CAUSE_CATEGORIES = ["host-gate", "retrieval-dispatch-consent", "capacity-config-graph-prefill", "assembly-setup-storage-worker-transport-receipt", "timeout-deadline", "required-typed-run", "guidance-workspace-fallback-validation"] as const
+const ACTIVITY_FINAL_DELIVERIES = ["pending", "delivered", "not-delivered"] as const
 const ACTIVITY_CANCELLATION_SOURCES = ["user", "stop", "replacement", "permission-revoked", "disable", "update", "disposed", "timeout"] as const
 
 function boundedActivityLabel(value: unknown, maxBytes: number = MAX_SAFE_LABEL_BYTES): string | undefined {
@@ -264,23 +281,59 @@ function executionStatusFromPhase(phase: BackendActivityResponse["payload"]["pha
 }
 
 function executionActivityFromPayload(activity: BackendActivityResponse["payload"]): ApcExecutionActivity {
-  const runStatus = boundedActivityEnum(activity.runStatus, ACTIVITY_RUN_STATUSES)
-  const status: ApcRunActivityStatus = runStatus ?? executionStatusFromPhase(activity.phase)
   const kind = boundedActivityLabel(activity.kind, 128)
-  const provider = boundedActivityLabel(activity.provider)
-  const model = boundedActivityLabel(activity.model)
-  const stageIndex = boundedActivityCount(activity.stageIndex, MAX_ACTIVITY_STAGE_COUNT - 1)
-  const stageCount = boundedActivityCount(activity.stageCount, MAX_ACTIVITY_STAGE_COUNT)
-  const runIndex = boundedActivityCount(activity.runIndex, MAX_ACTIVITY_RUN_COUNT - 1)
-  const runCount = boundedActivityCount(activity.runCount, MAX_ACTIVITY_RUN_COUNT)
+  const runStatus = kind === "delivery-settled" ? undefined : boundedActivityEnum(activity.runStatus, ACTIVITY_RUN_STATUSES)
+  const status: ApcRunActivityStatus = runStatus ?? executionStatusFromPhase(activity.phase)
+  const provider = kind === "delivery-settled" ? undefined : boundedActivityLabel(activity.provider)
+  const model = kind === "delivery-settled" ? undefined : boundedActivityLabel(activity.model)
+  const stageIndex = kind === "delivery-settled" ? undefined : boundedActivityCount(activity.stageIndex, MAX_ACTIVITY_STAGE_COUNT - 1)
+  const stageCount = kind === "delivery-settled" ? undefined : boundedActivityCount(activity.stageCount, MAX_ACTIVITY_STAGE_COUNT)
+  const runIndex = kind === "delivery-settled" ? undefined : boundedActivityCount(activity.runIndex, MAX_ACTIVITY_RUN_COUNT - 1)
+  const runCount = kind === "delivery-settled" ? undefined : boundedActivityCount(activity.runCount, MAX_ACTIVITY_RUN_COUNT)
   const completedRuns = boundedActivityCount(activity.completedRuns, MAX_ACTIVITY_RUN_COUNT)
   const totalRuns = boundedActivityCount(activity.totalRuns, MAX_ACTIVITY_RUN_COUNT)
-  const remainingBudgetMs = boundedActivityCount(activity.remainingBudgetMs, MAX_ACTIVITY_BUDGET_MS)
+  const remainingBudgetMs = kind === "delivery-settled" ? undefined : boundedActivityCount(activity.remainingBudgetMs, MAX_ACTIVITY_BUDGET_MS)
   const outcome = boundedActivityEnum(activity.outcome, ACTIVITY_OUTCOMES)
-  const errorCategory = boundedActivityEnum(activity.errorCategory, ACTIVITY_ERROR_CATEGORIES)
-  const usage = boundedActivityUsage(activity.usage)
-  const errorMessageKey = boundedActivityLabel(activity.errorMessageKey, 128)
-  const cancellationSource = boundedActivityEnum(activity.cancellationSource, ACTIVITY_CANCELLATION_SOURCES)
+  const rawRunErrorCategory = boundedActivityEnum(activity.runErrorCategory, ACTIVITY_ERROR_CATEGORIES)
+  const runErrorCategory = rawRunErrorCategory !== undefined &&
+    kind === "run-settled" &&
+    activity.phase === "progress" &&
+    !activity.terminal &&
+    (status === "failed" || status === "timed-out")
+    ? rawRunErrorCategory
+    : undefined
+  const errorCategory = kind === "delivery-settled" ? undefined : boundedActivityEnum(activity.errorCategory, ACTIVITY_ERROR_CATEGORIES)
+  const rawFallbackCauseCategory = boundedActivityEnum(activity.fallbackCauseCategory, ACTIVITY_FALLBACK_CAUSE_CATEGORIES)
+  const rawFallbackCauseCode = boundedActivityLabel(activity.fallbackCauseCode, 128)
+  const fallbackCauseCategory = activity.terminal &&
+    outcome === "graph-fallback" &&
+    rawFallbackCauseCategory !== undefined &&
+    rawFallbackCauseCode !== undefined &&
+    SAFE_ACTIVITY_CODE.test(rawFallbackCauseCode)
+    ? rawFallbackCauseCategory
+    : undefined
+  const fallbackCauseCode = fallbackCauseCategory === undefined ? undefined : rawFallbackCauseCode
+  const candidateFinalDelivery = boundedActivityEnum(activity.finalDelivery, ACTIVITY_FINAL_DELIVERIES)
+  const candidateMainResponded = typeof activity.mainResponded === "boolean" ? activity.mainResponded : undefined
+  const deliveryConsistent = candidateFinalDelivery === undefined ||
+    (candidateFinalDelivery === "pending" && (candidateMainResponded === undefined || candidateMainResponded === false)) ||
+    (candidateFinalDelivery === "delivered" && candidateMainResponded === true) ||
+    (candidateFinalDelivery === "not-delivered" && candidateMainResponded === false)
+  const deliveryKindAllowed = candidateFinalDelivery === "pending" || kind === "delivery-settled"
+  const finalDelivery = fallbackCauseCategory !== undefined && deliveryKindAllowed && deliveryConsistent
+    ? candidateFinalDelivery
+    : undefined
+  const mainResponded = finalDelivery === "delivered"
+    ? true
+    : finalDelivery === "not-delivered"
+      ? false
+      : finalDelivery === "pending" && candidateMainResponded === false
+        ? false
+        : undefined
+  const projectedErrorCategory = errorCategory ?? runErrorCategory
+  const usage = kind === "delivery-settled" ? undefined : boundedActivityUsage(activity.usage)
+  const errorMessageKey = kind === "delivery-settled" ? undefined : boundedActivityLabel(activity.errorMessageKey, 128)
+  const cancellationSource = kind === "delivery-settled" ? undefined : boundedActivityEnum(activity.cancellationSource, ACTIVITY_CANCELLATION_SOURCES)
   return deepFreeze({
     ...(kind === undefined ? {} : { kind }),
     phase: activity.phase,
@@ -297,7 +350,12 @@ function executionActivityFromPayload(activity: BackendActivityResponse["payload
     ...(totalRuns === undefined ? {} : { totalRuns }),
     ...(remainingBudgetMs === undefined ? {} : { remainingBudgetMs }),
     ...(outcome === undefined ? {} : { outcome }),
-    ...(errorCategory === undefined ? {} : { errorCategory }),
+    ...(runErrorCategory === undefined ? {} : { runErrorCategory }),
+    ...(fallbackCauseCategory === undefined ? {} : { fallbackCauseCategory }),
+    ...(fallbackCauseCode === undefined ? {} : { fallbackCauseCode }),
+    ...(finalDelivery === undefined ? {} : { finalDelivery }),
+    ...(mainResponded === undefined ? {} : { mainResponded }),
+    ...(projectedErrorCategory === undefined ? {} : { errorCategory: projectedErrorCategory }),
     ...(errorMessageKey === undefined || !SAFE_ACTIVITY_CODE.test(errorMessageKey) ? {} : { errorMessageKey }),
     ...(cancellationSource === undefined ? {} : { cancellationSource }),
   })
@@ -422,6 +480,7 @@ function topologyActivityFromEvent(
   event: ApcExecutionActivity,
   previousActivity: readonly ApcExecutionActivity[] = [],
 ): readonly ApcExecutionActivity[] {
+  if (event.kind === "delivery-settled") return previousActivity
   if (event.stageIndex === undefined || event.runIndex === undefined) return previousActivity
   const existingIndex = previousActivity.findIndex((entry) => entry.stageIndex === event.stageIndex && entry.runIndex === event.runIndex)
   if (existingIndex >= 0) {
@@ -440,10 +499,11 @@ function terminalActivityWithContext(
   event: ApcExecutionActivity,
   previousActivity: readonly ApcExecutionActivity[],
 ): ApcExecutionActivity {
-  if (!event.terminal) return event
   const latest = <K extends keyof ApcExecutionActivity>(key: K): ApcExecutionActivity[K] | undefined => {
-    const current = event[key]
-    if (current !== undefined) return current
+    if (event.kind !== "delivery-settled") {
+      const current = event[key]
+      if (current !== undefined) return current
+    }
     for (let index = previousActivity.length - 1; index >= 0; index -= 1) {
       const value = previousActivity[index]?.[key]
       if (value !== undefined) return value
@@ -498,6 +558,65 @@ function executionFromActivity(
     topologyApplicable: true,
   })
 }
+function settlementActivityFromProjection(projection: BackendSettlementProjection): {
+  readonly activity: BackendActivityResponse["payload"]
+  readonly topology: readonly BackendActivityResponse["payload"][]
+} {
+  const topology = projection.topology.map((entry) => deepFreeze({
+    executionId: entry.executionId,
+    presetId: entry.presetId,
+    kind: entry.kind,
+    phase: entry.phase,
+    terminal: entry.terminal,
+    ...(entry.traceId === undefined ? {} : { traceId: entry.traceId }),
+    ...(entry.provider === undefined ? {} : { provider: entry.provider }),
+    ...(entry.model === undefined ? {} : { model: entry.model }),
+    ...(entry.runStatus === undefined ? {} : { runStatus: entry.runStatus }),
+    ...(entry.stageIndex === undefined ? {} : { stageIndex: entry.stageIndex }),
+    ...(entry.stageCount === undefined ? {} : { stageCount: entry.stageCount }),
+    ...(entry.runIndex === undefined ? {} : { runIndex: entry.runIndex }),
+    ...(entry.runCount === undefined ? {} : { runCount: entry.runCount }),
+    ...(entry.completedRuns === undefined ? {} : { completedRuns: entry.completedRuns }),
+    ...(entry.totalRuns === undefined ? {} : { totalRuns: entry.totalRuns }),
+    ...(entry.remainingBudgetMs === undefined ? {} : { remainingBudgetMs: entry.remainingBudgetMs }),
+    ...(entry.outcome === undefined ? {} : { outcome: entry.outcome }),
+    ...(entry.fallbackCauseCategory === undefined ? {} : { fallbackCauseCategory: entry.fallbackCauseCategory }),
+    ...(entry.fallbackCauseCode === undefined ? {} : { fallbackCauseCode: entry.fallbackCauseCode }),
+  })) as readonly BackendActivityResponse["payload"][]
+  const activity = deepFreeze({
+    executionId: projection.executionId,
+    presetId: projection.presetId,
+    kind: "delivery-settled",
+    phase: "completed" as const,
+    terminal: true as const,
+    ...(projection.traceId === undefined ? {} : { traceId: projection.traceId }),
+    ...(projection.completedRuns === undefined ? {} : { completedRuns: projection.completedRuns }),
+    ...(projection.totalRuns === undefined ? {} : { totalRuns: projection.totalRuns }),
+    outcome: projection.outcome,
+    fallbackCauseCategory: projection.fallbackCauseCategory,
+    fallbackCauseCode: projection.fallbackCauseCode,
+    finalDelivery: projection.finalDelivery,
+    ...(projection.mainResponded === undefined ? {} : { mainResponded: projection.mainResponded }),
+  })
+  return { activity, topology }
+}
+
+
+function duplicateDeliverySettlement(
+  execution: ApcExecutionState,
+  event: ApcExecutionActivity,
+): boolean {
+  const previous = execution.activity.at(-1)
+  return execution.kind === "delivery-settled" &&
+    previous?.kind === "delivery-settled" &&
+    previous.phase === event.phase &&
+    previous.status === event.status &&
+    previous.outcome === event.outcome &&
+    previous.fallbackCauseCategory === event.fallbackCauseCategory &&
+    previous.fallbackCauseCode === event.fallbackCauseCode &&
+    previous.finalDelivery === event.finalDelivery &&
+    previous.mainResponded === event.mainResponded
+}
 type ApcOperationToken = Readonly<{
   operation: string
   presetId: string | null
@@ -535,6 +654,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
   #presetGeneration = 0
   #disposed = false
   #executionActivityGeneration = 0
+  #executionSequence = 0
   #executionLockEpoch = 0
   #busyReason: ApcBusyReason | null = null
   #executionBusy = false
@@ -593,7 +713,9 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       const hydration = await this.#persistence.hydratePreset(presetId)
       this.#assertCurrent(token)
       this.#applyHydratedConfig(payload)
+      this.#assertHydrationContinuation(token)
       this.#applyHydratedDomainState(hydration, hydrationActivityGeneration)
+      this.#assertHydrationContinuation(token)
       if (decoded.status === "valid" && decoded.config?.supportedModes.some((mode) => mode !== "single") === true) {
         this.#startConnectionDiscovery(this.#nextOperation("connections", presetId), presetId)
       }
@@ -902,6 +1024,27 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       if (this.#isRequestCurrent(token)) this.#setBusy(null)
     }
   }
+  async viewResponse(executionKey: string): Promise<void> {
+    this.#assertUsable()
+    const presetId = this.#requirePreset()
+    if (
+      this.#execution.executionKey !== executionKey ||
+      this.#executionId === null ||
+      this.#executionPresetId !== presetId ||
+      !this.#execution.terminal ||
+      this.#execution.outcome !== "graph-fallback" ||
+      this.#execution.finalDelivery !== "delivered" ||
+      this.#execution.mainResponded !== true
+    ) throw staleOperationError("view response")
+    const executionId = this.#executionId
+    const token = this.#nextOperation("view-response", presetId, executionId)
+    this.#assertCurrent(token)
+    const response = await this.#persistence.viewResponse(presetId, executionId)
+    this.#assertCurrent(token)
+    if (response.presetId !== presetId || response.executionId !== executionId) {
+      throw staleOperationError("view response")
+    }
+  }
 
   async flush(): Promise<void> {
     this.#assertUsable()
@@ -991,7 +1134,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     const decoded = decodedSource === null ? null : sanitizeDecoded(decodedSource)
     const config = values.config === null ? null : cloneValue(values.config)
     const execution = cloneValue(values.execution ?? this.#execution)
-    const executionMutationLocked = execution.phase !== "idle" && !execution.terminal
+    const executionMutationLocked = execution.phase !== "idle" && (!execution.terminal || execution.finalDelivery === "pending")
     const modeIssues = modeIssueMap(decodedSource, config)
     const modeAvailability = modeAvailabilitySurface(config, decodedSource)
     const blockedReasons = [...(values.blockedReasons ?? [])]
@@ -1053,6 +1196,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#executionTopologyInvalidated = false
     this.#executionBusy = false
     this.#executionActivityGeneration = 0
+    this.#executionSequence = 0
     this.#busyReason = null
     this.#executionId = null
     this.#executionPresetId = presetId
@@ -1122,7 +1266,11 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     }
     return { key, name: connection.name, provider: connection.provider, model: connection.model }
   }
-  #applyHydratedDomainState(payload: BackendHydrationResponse["payload"], activityGenerationAtHydrationStart: number): void {
+  #applyHydratedDomainState(
+    payload: BackendHydrationResponse["payload"],
+    activityGenerationAtHydrationStart: number,
+    hydrationSequence?: number,
+  ): void {
     if (payload.presetId !== this.#snapshot.presetId) return
     const seenBindings = new Set<string>()
     for (const binding of payload.bindings) {
@@ -1155,8 +1303,51 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         ...(consent.destination === undefined ? {} : { destination: cloneValue(consent.destination) }),
         ...(consent.disclosure === undefined ? {} : { disclosure: cloneValue(consent.disclosure) }),
       })
+      this.#assertUsable()
     }
     const hydratedExecution = payload.execution
+    const settledDelivery = payload.settledDelivery
+    if (hydratedExecution !== undefined && settledDelivery !== undefined) {
+      throw new ApcFrontendStateError("INVALID_HYDRATION", "APC hydration cannot contain active and settled execution state")
+    }
+    let settledProjection: ReturnType<typeof settlementActivityFromProjection> | undefined
+    if (settledDelivery !== undefined) {
+      const unsafeProjection = settledDelivery as unknown as Record<string, unknown>
+      if (
+        settledDelivery.presetId !== payload.presetId ||
+        boundedActivityLabel(settledDelivery.executionId, 128) === undefined ||
+        (settledDelivery.finalDelivery === "pending"
+          ? settledDelivery.mainResponded !== undefined && settledDelivery.mainResponded !== false
+          : settledDelivery.mainResponded !== (settledDelivery.finalDelivery === "delivered")) ||
+        settledDelivery.topology.length > MAX_ACTIVITY_TOPOLOGY_COUNT ||
+        "userId" in unsafeProjection ||
+        "content" in unsafeProjection ||
+        "error" in unsafeProjection
+      ) {
+        throw new ApcFrontendStateError("INVALID_HYDRATION", "APC hydration contained invalid settled delivery")
+      }
+      for (const entry of settledDelivery.topology) {
+        const terminalPhase = entry.phase === "completed" || entry.phase === "failed" || entry.phase === "cancelled"
+        const unsafeEntry = entry as unknown as Record<string, unknown>
+        if (
+          entry.presetId !== payload.presetId ||
+          entry.executionId !== settledDelivery.executionId ||
+          boundedActivityLabel(entry.kind, 128) === undefined ||
+          entry.terminal !== terminalPhase ||
+          entry.kind === "delivery-settled" ||
+          "content" in unsafeEntry ||
+          "error" in unsafeEntry ||
+          "errorCategory" in unsafeEntry ||
+          "errorMessageKey" in unsafeEntry ||
+          "runErrorCategory" in unsafeEntry ||
+          "finalDelivery" in unsafeEntry ||
+          "mainResponded" in unsafeEntry
+        ) {
+          throw new ApcFrontendStateError("INVALID_HYDRATION", "APC hydration contained invalid settlement topology")
+        }
+      }
+      settledProjection = settlementActivityFromProjection(settledDelivery)
+    }
     if (hydratedExecution !== undefined) {
       const terminalPhase = hydratedExecution.phase === "completed" || hydratedExecution.phase === "failed" || hydratedExecution.phase === "cancelled"
       if (
@@ -1175,8 +1366,35 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#executionPresetId = hydratedExecution.presetId
         this.#executionTraceId = hydratedExecution.traceId ?? null
         this.#execution = executionFromActivity(hydratedExecution, `execution-${this.#executionSerial}`)
+        this.#executionSequence = hydrationSequence ?? 0
         this.#executionTopologyInvalidated = false
         this.#executionBusy = !this.#execution.terminal
+      }
+    } else {
+      const settledProjectionMatchesCurrentExecution = settledProjection !== undefined &&
+        this.#executionId === settledProjection.activity.executionId &&
+        this.#executionPresetId === settledProjection.activity.presetId
+      if (
+        settledProjection !== undefined &&
+        (this.#executionActivityGeneration === activityGenerationAtHydrationStart || settledProjectionMatchesCurrentExecution)
+      ) {
+        const topology = settledProjection.topology.map(executionActivityFromPayload)
+        this.#clearTraceState()
+        this.#advanceExecutionLockEpoch()
+        this.#executionSerial += 1
+        this.#executionId = settledProjection.activity.executionId
+        this.#executionPresetId = settledProjection.activity.presetId
+        this.#executionTraceId = settledProjection.activity.traceId ?? null
+        this.#executionSequence = hydrationSequence ?? 0
+        this.#execution = executionFromActivity(
+          settledProjection.activity,
+          `execution-${this.#executionSerial}`,
+          topology,
+          undefined,
+          topology,
+        )
+        this.#executionTopologyInvalidated = false
+        this.#executionBusy = false
       }
     }
     this.#snapshot = this.#makeSnapshot({
@@ -1405,7 +1623,6 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     this.#notify()
     if (activeGraph) this.#startConnectionDiscovery(this.#nextOperation("connections", state.presetId), state.presetId)
   }
-
   #handleDomainMessage(message: ApcDomainResponse): void {
     if (this.#disposed || message.type !== "activity") return
     if (message.payload.presetId !== this.#snapshot.presetId) return
@@ -1413,7 +1630,11 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
     const phase = message.payload.phase
     const expectedTerminal = phase === "completed" || phase === "failed" || phase === "cancelled"
     if (message.payload.terminal !== expectedTerminal) return
+    const deliverySettlement = message.payload.kind === "delivery-settled"
+    if (!deliverySettlement && message.payload.finalDelivery !== undefined && message.payload.finalDelivery !== "pending") return
     const currentId = this.#executionId
+    if (deliverySettlement && currentId !== message.payload.executionId) return
+    if (message.sequence <= this.#executionSequence) return
     if (currentId === null) {
       if (phase !== "started" || this.#retiredExecutionIds.has(message.payload.executionId)) return
       this.#clearTraceState()
@@ -1424,9 +1645,14 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#executionTraceId = message.payload.traceId ?? null
       const executionKey = `execution-${this.#executionSerial}`
       this.#execution = executionFromActivity(message.payload, executionKey)
+      this.#executionSequence = message.sequence
       this.#executionTopologyInvalidated = false
     } else if (currentId !== message.payload.executionId) {
-      if (!this.#execution.terminal || phase !== "started" || this.#retiredExecutionIds.has(message.payload.executionId)) return
+      if (
+        phase !== "started" ||
+        this.#retiredExecutionIds.has(message.payload.executionId) ||
+        message.sequence <= this.#executionSequence
+      ) return
       this.#retiredExecutionIds.add(currentId)
       while (this.#retiredExecutionIds.size > 128) {
         const oldest = this.#retiredExecutionIds.values().next().value
@@ -1440,12 +1666,34 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       this.#executionPresetId = message.payload.presetId
       this.#executionTraceId = message.payload.traceId ?? null
       this.#execution = executionFromActivity(message.payload, `execution-${this.#executionSerial}`)
+      this.#executionSequence = message.sequence
       this.#executionTopologyInvalidated = false
     } else {
-      if (this.#execution.terminal || phase === "started") return
+      const deliveryEvent = deliverySettlement
+        ? executionActivityFromPayload(message.payload)
+        : undefined
+      const deliveryIsAuthoritative = deliveryEvent?.finalDelivery === "delivered" ||
+        deliveryEvent?.finalDelivery === "not-delivered"
+      const pendingFinalDelivery = this.#execution.finalDelivery === "pending"
+      const sameFallbackCause = deliveryEvent?.fallbackCauseCategory === this.#execution.fallbackCauseCategory &&
+        deliveryEvent?.fallbackCauseCode === this.#execution.fallbackCauseCode
+      const duplicateSettlement = deliveryEvent !== undefined &&
+        duplicateDeliverySettlement(this.#execution, deliveryEvent)
+      const acceptsDeliverySettlement = deliveryEvent !== undefined &&
+        deliveryIsAuthoritative &&
+        phase === "completed" &&
+        message.payload.terminal === true &&
+        pendingFinalDelivery &&
+        this.#execution.terminal &&
+        this.#execution.outcome === "graph-fallback" &&
+        deliveryEvent.outcome === "graph-fallback" &&
+        sameFallbackCause
+      if (duplicateSettlement) return
+      if (deliverySettlement && !acceptsDeliverySettlement) return
+      if ((this.#execution.terminal || phase === "started") && !acceptsDeliverySettlement) return
       if (phase !== "progress" && !expectedTerminal) return
       const wasTerminal = this.#execution.terminal
-      this.#executionTraceId = message.payload.traceId ?? this.#executionTraceId
+      if (!acceptsDeliverySettlement) this.#executionTraceId = message.payload.traceId ?? this.#executionTraceId
       this.#execution = executionFromActivity(
         message.payload,
         this.#execution.executionKey as string,
@@ -1453,6 +1701,7 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
         this.#execution.usage,
         this.#execution.topologyActivity,
       )
+      this.#executionSequence = message.sequence
       if (wasTerminal !== this.#execution.terminal) this.#advanceExecutionLockEpoch()
     }
     if (this.#executionTopologyInvalidated) this.#invalidateExecutionTopology()
@@ -1505,6 +1754,10 @@ class ApcFrontendStoreImpl implements ApcFrontendStore {
       (token.traceGeneration === undefined || token.traceGeneration === this.#traceGeneration)
   }
 
+  #assertHydrationContinuation(token: ApcOperationToken): void {
+    if (this.#disposed) throw new ApcFrontendStateError("DISPOSED", "APC frontend state has been disposed")
+    if (!this.#isRequestCurrent(token)) throw staleOperationError(token.operation)
+  }
   #assertCurrent(token: ApcOperationToken): void {
     if (this.#disposed) throw new ApcFrontendStateError("DISPOSED", "APC frontend state has been disposed")
     if (!this.#isCurrent(token)) throw staleOperationError(token.operation)

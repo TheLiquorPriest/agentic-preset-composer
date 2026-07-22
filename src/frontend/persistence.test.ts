@@ -7,13 +7,14 @@ import type {
   ApcPresetEditorDraftState,
 } from "./persistence"
 import { ApcPersistenceError, createApcPersistence } from "./persistence"
-import type { BackendHydrationResponse } from "../protocol/messages"
+import type { BackendHydrationResponse, BackendViewResponseResponse } from "../protocol/messages"
 import { PROTOCOL_VERSION } from "../protocol/messages"
 
 const PRESET_ID = "550e8400-e29b-41d4-a716-446655440000"
 const SECOND_PRESET_ID = "550e8400-e29b-41d4-a716-446655440010"
 const CORRELATION_ID = "550e8400-e29b-41d4-a716-446655440001"
 
+const EXECUTION_ID = "550e8400-e29b-41d4-a716-446655440002"
 class FakeEditor implements ApcPresetEditorDraftAdapter {
   state: ApcPresetEditorDraftState = {
     presetId: PRESET_ID,
@@ -171,6 +172,28 @@ describe("APC frontend persistence", () => {
     persistence.dispose()
   })
 
+  test("requests only the opaque delivered-response identity and resolves the backend acknowledgement", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const persistence = createApcPersistence({ editor, transport, correlationId: () => CORRELATION_ID })
+    const pending = persistence.viewResponse(PRESET_ID, EXECUTION_ID)
+    const request = transport.sent[0]
+    expect(request).toMatchObject({
+      type: "view_response",
+      payload: { presetId: PRESET_ID, executionId: EXECUTION_ID },
+    })
+    expect(JSON.stringify(request)).not.toContain("content")
+    const response: BackendViewResponseResponse = {
+      version: PROTOCOL_VERSION,
+      type: "view_response",
+      correlationId: request?.correlationId ?? CORRELATION_ID,
+      sequence: 1,
+      payload: { presetId: PRESET_ID, executionId: EXECUTION_ID },
+    }
+    transport.respond(response)
+    await expect(pending).resolves.toEqual(response.payload)
+    persistence.dispose()
+  })
   test("coalesces same-preset saves and resolves only after the flush barrier", async () => {
     const editor = new FakeEditor()
     const persistence = createApcPersistence({ editor })

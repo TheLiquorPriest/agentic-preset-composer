@@ -8,7 +8,7 @@
 
 APC should feel like a native extension of Lumiverse's Loom editor: the user remains inside the preset they already understand, but gains a clear way to divide work among reusable thread workspaces, arrange bounded execution, inspect what happened, and control the final response.
 
-The mockups in [`docs/ui-targets/`](./docs/ui-targets/) are visual direction, not pixel specifications. Reuse host components, tokens, layout conventions, and controlled editor surfaces wherever they exist. Do not reproduce screenshot pixels with hard-coded values or invent product behavior to make a mockup literal.
+The mockups in [`docs/ui-targets/`](./docs/ui-targets/) and [`docs/ui-targets/mobile/`](./docs/ui-targets/mobile/) are final composition and visual-state targets. Match their information hierarchy, views, controls, navigation, and status presentation while reusing host components, tokens, responsive breakpoints, and controlled editor surfaces rather than hard-coding screenshot pixels. `DESIGN.md`, this document, and `UI-Mobile.md` govern behavior and the explicit exceptions they name; do not silently omit or reinterpret an observable target.
 
 The example preset name (`ThreadBare`), thread names (`Researcher`, `Critic`, `Synthesizer`), providers, models, timings, token counts, and prompt content are illustrative only. They are not defaults or fixtures required by the product.
 
@@ -75,7 +75,7 @@ Do not send users to a separate diagnostics application during execution. Preser
 
 ## Visual language
 
-Use Lumiverse theme tokens and existing host primitives. The mockups communicate hierarchy, not literal CSS values.
+Use Lumiverse theme tokens and existing host primitives. The mockups define required hierarchy, composition, and visible state; exact CSS values remain responsive and host-token-driven.
 
 - **Violet:** selection, configured flow, primary actions, and currently active work.
 - **Green:** completed, approved, ready, or valid.

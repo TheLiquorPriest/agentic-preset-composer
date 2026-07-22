@@ -3,8 +3,10 @@ import { describe, expect, test } from "bun:test"
 import { createDefaultApcConfig, type ApcPresetConfigV1 } from "../config/schema"
 import type {
   BackendConnectionListResponse,
+  BackendActivityResponse,
   BackendHydrationResponse,
   ConnectionSummary,
+  BackendViewResponseResponse,
 } from "../protocol/messages"
 import type {
   ApcDomainIntent,
@@ -162,13 +164,20 @@ class FakeTransport implements ApcDomainTransport {
     bindings: BackendHydrationResponse["payload"]["bindings"] = [],
     consents: BackendHydrationResponse["payload"]["consents"] = [],
     execution?: BackendHydrationResponse["payload"]["execution"],
+    settledDelivery?: BackendHydrationResponse["payload"]["settledDelivery"],
   ): void {
     const response: BackendHydrationResponse = {
       version: PROTOCOL_VERSION,
       type: "hydration",
       correlationId,
       sequence: ++this.#sequence,
-      payload: { presetId, bindings, consents, ...(execution === undefined ? {} : { execution }) },
+      payload: {
+        presetId,
+        bindings,
+        consents,
+        ...(execution === undefined ? {} : { execution }),
+        ...(settledDelivery === undefined ? {} : { settledDelivery }),
+      },
     }
     this.respond(response)
   }
@@ -282,6 +291,116 @@ describe("APC frontend application state", () => {
     expect(snapshot.execution.topologyApplicable).toBe(true)
     expect(snapshot.busyReason).toBe("execution")
     expect(JSON.stringify(snapshot)).not.toContain("execution-hydrated")
+    store.dispose()
+  })
+  test("hydrates a settled delivery projection as authoritative delivered and unlocked state", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    const pending = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const request = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(request?.type).toBe("hydrate_preset")
+    transport.respondHydration(request?.correlationId ?? "missing", PRESET_A, [], [], undefined, {
+      executionId: "execution-settled",
+      presetId: PRESET_A,
+      traceId: "trace-settled",
+      completedRuns: 1,
+      totalRuns: 1,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "delivered",
+      mainResponded: true,
+      topology: [{
+        executionId: "execution-settled",
+        presetId: PRESET_A,
+        kind: "run-settled",
+        phase: "progress",
+        terminal: false,
+        stageIndex: 0,
+        stageCount: 1,
+        runIndex: 0,
+        runCount: 1,
+        runStatus: "failed",
+      }],
+    })
+    const snapshot = await pending
+    expect(snapshot.execution.executionKey).toMatch(/^execution-/)
+    expect(snapshot.execution.terminal).toBe(true)
+    expect(snapshot.execution.status).toBe("completed")
+    expect(snapshot.execution.outcome).toBe("graph-fallback")
+    expect(snapshot.execution.finalDelivery).toBe("delivered")
+    expect(snapshot.execution.mainResponded).toBe(true)
+    expect(snapshot.execution.topologyActivity).toHaveLength(1)
+    expect(snapshot.execution.completedRuns).toBe(1)
+    expect(snapshot.execution.totalRuns).toBe(1)
+    expect(snapshot.execution.topologyActivity[0]?.status).toBe("failed")
+    expect(snapshot.executionMutationLocked).toBe(false)
+    expect(snapshot.busyReason).toBeNull()
+    expect(JSON.stringify(snapshot)).not.toContain("native response")
+    store.dispose()
+  })
+  test("aborts hydration continuation when a synchronous listener disposes the store", async () => {
+    const editor = new FakeEditor()
+    const store = storeFor(editor)
+    store.subscribe(snapshot => {
+      if (snapshot.presetId === PRESET_A && snapshot.hydrating && !snapshot.hydrated) store.dispose()
+    })
+    await expect(store.hydrate(PRESET_A)).rejects.toMatchObject({ code: "DISPOSED" })
+  })
+  test("aborts hydration when a consent notification listener disposes the store", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport({ autoRespondHydration: false })
+    const store = storeFor(editor, transport)
+    store.subscribe(snapshot => {
+      if (Object.keys(snapshot.consent).length > 0) store.dispose()
+    })
+    const pending = store.hydrate(PRESET_A)
+    await settleMicrotasks()
+    const request = transport.sent.find((message) => message.type === "hydrate_preset")
+    expect(request?.type).toBe("hydrate_preset")
+    transport.respondHydration(request?.correlationId ?? "missing", PRESET_A, [], [{
+      threadId: "thread-consent-dispose",
+      workspaceSource: "native-blocks",
+      connectionSourceKey: "main",
+      status: "approved",
+    }])
+    await expect(pending).rejects.toMatchObject({ code: "DISPOSED" })
+    expect(store.getSnapshot().presetId).toBeNull()
+    expect(store.getSnapshot().consent).toEqual({})
+  })
+  test("supersedes an older pending execution when a newer started activity arrives", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+    const send = (executionId: string, phase: "started" | "progress" | "completed", sequence: number, provider: string, extra: Record<string, unknown> = {}): void => {
+      transport.respond({
+        version: PROTOCOL_VERSION,
+        type: "activity",
+        correlationId: `activity-${sequence}`,
+        sequence,
+        payload: {
+          executionId,
+          presetId: PRESET_A,
+          kind: "execution",
+          phase,
+          terminal: phase === "completed",
+          provider,
+          ...(phase === "completed" ? { outcome: "graph-fallback", fallbackCauseCategory: "required-typed-run", fallbackCauseCode: "REQUIRED-FAILURE" } : {}),
+          ...extra,
+        },
+      } as BackendActivityResponse)
+    }
+    send("execution-overlap-a", "started", transport.nextSequence(), "old")
+    send("execution-overlap-a", "completed", transport.nextSequence(), "old", { finalDelivery: "pending" })
+    send("execution-overlap-b", "started", transport.nextSequence(), "new")
+    expect(store.getSnapshot().execution.provider).toBe("new")
+    expect(store.getSnapshot().execution.finalDelivery).toBeUndefined()
+    expect(store.getSnapshot().executionMutationLocked).toBe(true)
+    send("execution-overlap-a", "started", transport.nextSequence(), "stale")
+    expect(store.getSnapshot().execution.provider).toBe("new")
     store.dispose()
   })
   test("rejects malformed hydrated execution identities before creating a mutation lock", async () => {
@@ -543,6 +662,205 @@ describe("APC frontend application state", () => {
       provider: "safe-provider",
       model: "safe-model",
     })
+    store.dispose()
+  })
+  test("retains bounded settlement fields across pending and authoritative delivery updates", async () => {
+    const editor = new FakeEditor()
+    const transport = new FakeTransport()
+    const store = storeFor(editor, transport)
+    await store.hydrate(PRESET_A)
+
+    const send = (
+      executionId: string,
+      payload: Omit<BackendActivityResponse["payload"], "executionId" | "presetId">,
+    ): void => {
+      const sequence = transport.nextSequence()
+      transport.respond(createBackendActivityResponse({
+        correlationId: "550e8400-e29b-41d4-a716-446655440099",
+        sequence,
+        executionId,
+        presetId: PRESET_A,
+        ...payload,
+      }))
+    }
+    const pendingFallback = {
+      outcome: "graph-fallback" as const,
+      fallbackCauseCategory: "required-typed-run" as const,
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "pending" as const,
+    }
+    const deliveredExecutionId = "550e8400-e29b-41d4-a716-446655440011"
+    const notDeliveredExecutionId = "550e8400-e29b-41d4-a716-446655440012"
+
+    send(deliveredExecutionId, {
+      kind: "graph",
+      phase: "started",
+      terminal: false,
+      provider: "safe-provider",
+      model: "safe-model",
+      stageIndex: 1,
+      stageCount: 2,
+      runIndex: 0,
+      runCount: 1,
+      completedRuns: 0,
+      totalRuns: 1,
+      runStatus: "running",
+    })
+    send(deliveredExecutionId, {
+      kind: "run-settled",
+      phase: "progress",
+      terminal: false,
+      stageIndex: 1,
+      stageCount: 2,
+      runIndex: 0,
+      runCount: 1,
+      runStatus: "failed",
+      runErrorCategory: "provider",
+    })
+    send(deliveredExecutionId, {
+      kind: "execution-terminal",
+      phase: "completed",
+      terminal: true,
+      ...pendingFallback,
+    })
+    const pending = store.getSnapshot()
+    const failedRun = pending.execution.activity.find((activity) => activity.kind === "run-settled")
+    expect(failedRun).toMatchObject({
+      status: "failed",
+      runErrorCategory: "provider",
+      errorCategory: "provider",
+      stageIndex: 1,
+      runIndex: 0,
+    })
+    expect(pending.execution).toMatchObject({
+      kind: "execution-terminal",
+      stageIndex: 1,
+      stageCount: 2,
+      runIndex: 0,
+      runCount: 1,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "pending",
+    })
+    expect(pending.execution.mainResponded).toBeUndefined()
+    const pendingExecutionKey = pending.execution.executionKey
+    if (pendingExecutionKey === null) throw new Error("pending execution key missing")
+    await expect(store.viewResponse(pendingExecutionKey)).rejects.toThrow()
+    expect(pending.execution.topologyActivity.find((activity) => activity.runIndex === 0)?.status).toBe("failed")
+
+    send(deliveredExecutionId, {
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      ...pendingFallback,
+      finalDelivery: "delivered",
+      mainResponded: true,
+    })
+    const delivered = store.getSnapshot()
+    const deliveredActivityLength = delivered.execution.activity.length
+    expect(delivered.execution).toMatchObject({
+      kind: "delivery-settled",
+      stageIndex: 1,
+      runIndex: 0,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "delivered",
+      mainResponded: true,
+    })
+    expect(delivered.execution.topologyActivity.find((activity) => activity.runIndex === 0)?.status).toBe("failed")
+    const deliveredExecutionKey = delivered.execution.executionKey
+    if (deliveredExecutionKey === null) throw new Error("delivered execution key missing")
+    const viewRequest = store.viewResponse(deliveredExecutionKey)
+    const sentView = transport.sent.at(-1)
+    expect(sentView).toMatchObject({
+      type: "view_response",
+      payload: { presetId: PRESET_A, executionId: deliveredExecutionId },
+    })
+    const viewResponse: BackendViewResponseResponse = {
+      version: PROTOCOL_VERSION,
+      type: "view_response",
+      correlationId: sentView?.correlationId ?? "view-response",
+      sequence: transport.nextSequence(),
+      payload: { presetId: PRESET_A, executionId: deliveredExecutionId },
+    }
+    transport.respond(viewResponse)
+    await expect(viewRequest).resolves.toBeUndefined()
+    send(deliveredExecutionId, {
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "delivered",
+      mainResponded: true,
+    })
+    expect(store.getSnapshot().execution.activity).toHaveLength(deliveredActivityLength)
+    send(deliveredExecutionId, {
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "pending",
+    })
+    send(deliveredExecutionId, {
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "not-delivered",
+      mainResponded: false,
+    })
+    expect(store.getSnapshot().execution.activity).toHaveLength(deliveredActivityLength)
+    expect(store.getSnapshot().execution.finalDelivery).toBe("delivered")
+
+    send(notDeliveredExecutionId, {
+      kind: "graph",
+      phase: "started",
+      terminal: false,
+      stageIndex: 0,
+      stageCount: 1,
+      runIndex: 0,
+      runCount: 1,
+      runStatus: "running",
+    })
+    send(notDeliveredExecutionId, {
+      kind: "run-settled",
+      phase: "progress",
+      terminal: false,
+      stageIndex: 0,
+      stageCount: 1,
+      runIndex: 0,
+      runCount: 1,
+      runStatus: "failed",
+      runErrorCategory: "timeout",
+    })
+    send(notDeliveredExecutionId, {
+      kind: "execution-terminal",
+      phase: "completed",
+      terminal: true,
+      ...pendingFallback,
+    })
+    send(notDeliveredExecutionId, {
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: "required-typed-run",
+      fallbackCauseCode: "REQUIRED-FAILURE",
+      finalDelivery: "not-delivered",
+      mainResponded: false,
+    })
+    const notDelivered = store.getSnapshot()
+    expect(notDelivered.execution.finalDelivery).toBe("not-delivered")
+    expect(notDelivered.execution.mainResponded).toBe(false)
+    expect(notDelivered.execution.topologyActivity.find((activity) => activity.runIndex === 0)?.status).toBe("failed")
     store.dispose()
   })
   test("invalidates topology after local terminal edits and clean external active-run changes", async () => {

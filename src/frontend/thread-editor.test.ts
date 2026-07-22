@@ -1086,6 +1086,70 @@ describe("APC thread center workspace", () => {
     editor.destroy()
   })
 
+  test("publishes a queued workspace edit through an equivalent rerender", async () => {
+    const { bridge, calls } = createBridge()
+    const dirty: Array<[string, SpindleLoomBlockEditorValue]> = []
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onDirty: (threadId, value) => {
+        dirty.push([threadId, value])
+      },
+    })
+    const view = snapshot()
+    editor.render(view)
+    calls[0]!.options.onChange?.({
+      blocks: [],
+      promptVariableValues: { draft: { value: "current" } },
+    })
+    editor.render(view)
+
+    await settleUntil(() => dirty.length === 1)
+    expect(dirty).toEqual([[
+      THREAD_A,
+      { blocks: [], promptVariableValues: { draft: { value: "current" } } },
+    ]])
+    editor.destroy()
+  })
+
+  test("preserves rapid workspace edits across ordinary revision renders", async () => {
+    const { bridge, calls } = createBridge()
+    const dirty: Array<[string, SpindleLoomBlockEditorValue]> = []
+    let editor: ThreadEditorController
+    editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onDirty: (threadId, value) => {
+        dirty.push([threadId, value])
+        if (dirty.length === 1) {
+          editor.render(snapshot({ contextAuthorityGeneration: 2 }))
+        }
+      },
+    })
+    editor.render(snapshot())
+    calls[0]!.options.onChange?.({
+      blocks: [],
+      promptVariableValues: { draft: { value: "first" } },
+    })
+    calls[0]!.options.onChange?.({
+      blocks: [],
+      promptVariableValues: { draft: { value: "second" } },
+    })
+
+    await settleUntil(() => dirty.length === 2)
+    expect(dirty.map(([, value]) => value.promptVariableValues)).toEqual([
+      { draft: { value: "first" } },
+      { draft: { value: "second" } },
+    ])
+    editor.destroy()
+  })
+
   test("drops a queued dirty write after the rendered thread context changes", async () => {
     const { bridge, calls } = createBridge()
     const dirty: Array<[string, SpindleLoomBlockEditorValue]> = []
@@ -1202,6 +1266,92 @@ describe("APC thread center workspace", () => {
     editor.element.querySelector<HTMLButtonElement>("[data-apc-remove-run-binding]")!.click()
     expect(added).toEqual([RUN_SELECTED])
     expect(removed).toEqual([[RUN_SELECTED, BINDING_A]])
+    editor.destroy()
+  })
+
+  test("reassigns a scheduled run through reusable thread targets and rolls back rejected callbacks", async () => {
+    const { bridge } = createBridge()
+    const changes: ThreadEditorRunChange[] = []
+    let response: boolean | Promise<boolean> = true
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onRunChange: (_runId, change) => {
+        changes.push(change)
+        return response
+      },
+    })
+    const run = {
+      ...selectedRun(),
+      threadTargets: [
+        { id: THREAD_A, name: "Researcher", available: true },
+        { id: THREAD_B, name: "Synthesizer", available: true },
+      ],
+    }
+    editor.render(snapshot({ selectedRun: run }))
+    const threadSelect = editor.element.querySelector<HTMLSelectElement>("[data-apc-run-thread]")!
+    expect(threadSelect.getAttribute("aria-label")).toContain("en:graph.selectThread")
+    expect([...threadSelect.querySelectorAll<HTMLOptionElement>("option")].map((option) => option.value)).toEqual([
+      "run-thread-1",
+      "run-thread-2",
+    ])
+    expect(threadSelect.value).toBe("run-thread-1")
+
+    threadSelect.value = "run-thread-2"
+    threadSelect.dispatchEvent(new Event("change"))
+    expect(changes).toEqual([{ threadId: THREAD_B }])
+    expect(threadSelect.value).toBe("run-thread-2")
+
+    response = false
+    threadSelect.value = "run-thread-2"
+    threadSelect.dispatchEvent(new Event("change"))
+    expect(threadSelect.value).toBe("run-thread-1")
+    expect(changes).toEqual([{ threadId: THREAD_B }, { threadId: THREAD_B }])
+
+    response = Promise.reject(new Error("private rejected thread reassignment"))
+    threadSelect.value = "run-thread-2"
+    threadSelect.dispatchEvent(new Event("change"))
+    expect(threadSelect.disabled).toBe(true)
+    await settleUntil(() => threadSelect.disabled === false)
+    expect(threadSelect.value).toBe("run-thread-1")
+    expect(changes).toHaveLength(3)
+    expect(editor.element.querySelector("[data-apc-thread-live-region]")?.textContent)
+      .toBe("en:a11y.graphReorderBlocked")
+    editor.destroy()
+  })
+
+  test("disables duplicate-thread Parallel reassignment candidates", () => {
+    const { bridge } = createBridge()
+    const changes: ThreadEditorRunChange[] = []
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onRunChange: (_runId, change) => {
+        changes.push(change)
+      },
+    })
+    editor.render(snapshot({
+      selectedRun: {
+        ...selectedRun(),
+        threadTargets: [
+          { id: THREAD_A, name: "Researcher", available: true },
+          { id: THREAD_B, name: "Synthesizer", available: false },
+        ],
+      },
+    }))
+    const threadSelect = editor.element.querySelector<HTMLSelectElement>("[data-apc-run-thread]")!
+    expect(threadSelect.disabled).toBe(true)
+    expect(threadSelect.querySelectorAll<HTMLOptionElement>("option")[1]?.disabled).toBe(true)
+    threadSelect.value = "run-thread-2"
+    threadSelect.dispatchEvent(new Event("change"))
+    expect(changes).toEqual([])
+    expect(threadSelect.value).toBe("run-thread-1")
     editor.destroy()
   })
 
@@ -3494,6 +3644,51 @@ describe("APC thread center workspace", () => {
     expect(flushes).toBe(0)
   })
 
+  test("removes undefined optional Loom fields before publishing dirty state", async () => {
+    const { bridge, calls, handles } = createBridge()
+    let received: SpindleLoomBlockEditorValue | undefined
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onDirty: (_threadId, value) => {
+        received = value
+      },
+      onFlush: () => {},
+    })
+    editor.render(snapshot())
+    const block: PromptBlockDTO = {
+      id: "block-safe",
+      name: "Block",
+      content: "Prompt",
+      role: "system",
+      enabled: true,
+      position: "pre_history",
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      group: null,
+      variables: undefined,
+    }
+    const localValue: SpindleLoomBlockEditorValue = {
+      blocks: [block],
+      promptVariableValues: {},
+    }
+    handles[0]!.value = structuredClone(localValue)
+    calls[0]!.options.onChange?.(localValue)
+
+    await editor.flush()
+
+    expect(Object.prototype.hasOwnProperty.call(block, "variables")).toBe(true)
+    expect(received?.blocks).toHaveLength(1)
+    expect(Object.prototype.hasOwnProperty.call(received?.blocks[0], "variables")).toBe(false)
+    editor.destroy()
+  })
+
   test("awaits serialized dirty writes before flush and reconciles authoritative state after success", async () => {
     const { bridge, handles } = createBridge()
     const order: string[] = []
@@ -4124,6 +4319,53 @@ describe("APC thread center workspace", () => {
       expect(fakeElement(editor.element).dataset.apcConsentContextMutation).toBe("idle")
       editor.destroy()
     }
+  })
+  test("renders the final consent hierarchy and restores configuration focus from Back and Change", async () => {
+    const { bridge } = createBridge()
+    const editor = createThreadEditor({
+      host,
+      presetId: PRESET_ID,
+      loom: bridge,
+      t: translator("en"),
+      parent: fakeParent,
+      onResolveConsent: () => {},
+      onConsentReviewChange: () => undefined,
+      onConnectionSlotChange: () => {},
+    })
+    const view = snapshot({
+      threads: [thread(THREAD_A, { connectionSlotId: SLOT_A })],
+      consents: [consent()],
+    })
+    editor.render(view)
+    editor.element.querySelector<HTMLButtonElement>("[data-apc-open-consent-review]")!.click()
+    editor.render({ ...view, consentAuthorityGeneration: 2 })
+    await settleUntil(() =>
+      editor.element.querySelector<HTMLInputElement>("[data-apc-consent-acknowledge]")?.disabled === false
+    )
+    const review = editor.element.querySelector<HTMLElement>("[data-apc-consent-review]")!
+    expect(review.querySelector("[data-apc-consent-review-header]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-review-progress]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-review-body]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-review-footer]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-source]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-destination-state=\"available\"]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-purpose]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-scope]")).not.toBe(null)
+    expect(review.querySelector("[data-apc-consent-local-approval]")).not.toBe(null)
+
+    review.querySelector<HTMLButtonElement>("[data-apc-consent-back]")!.click()
+    expect(editor.element.querySelector("[data-apc-consent-review]")).toBe(null)
+    expect(fakeDocument.activeElement!.dataset.apcConnectionSlot).toBe("true")
+
+    editor.element.querySelector<HTMLButtonElement>("[data-apc-open-consent-review]")!.click()
+    editor.render({ ...view, consentAuthorityGeneration: 3 })
+    await settleUntil(() =>
+      editor.element.querySelector<HTMLInputElement>("[data-apc-consent-acknowledge]")?.disabled === false
+    )
+    editor.element.querySelector<HTMLButtonElement>("[data-apc-consent-change-destination]")!.click()
+    expect(editor.element.querySelector("[data-apc-consent-review]")).toBe(null)
+    expect(fakeDocument.activeElement!.dataset.apcHostConnection).toBe("true")
+    editor.destroy()
   })
 })
 

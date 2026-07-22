@@ -24,9 +24,11 @@ import {
   type BackendConnectionListResponse,
   type BackendErrorResponse,
   type BackendHydrationResponse,
+  type BackendSettlementProjection,
   type BackendResponse,
   type BackendTraceDetailResponse,
   type BackendTraceListResponse,
+  type BackendViewResponseResponse,
   type ConnectionSummary,
   type ConsentSelector as ProtocolConsentSelector,
   type ConsentDisclosureCategory,
@@ -108,11 +110,22 @@ export interface BackendCancellationResult {
   readonly preview?: string
   readonly reason?: string
 }
-
 export interface BackendExecutionService {
   cancel(request: BackendCancellationRequest): Promise<BackendCancellationResult>
   currentExecution(userId: string, presetId: string): BackendActivityResponse["payload"] | undefined
+  settledDelivery?(userId: string, presetId: string): BackendSettlementProjection | undefined
 }
+export interface BackendViewResponseRequest {
+  readonly userId: string
+  readonly presetId: string
+  readonly executionId: string
+  readonly install: BackendInstallPair
+}
+
+export interface BackendViewResponseService {
+  viewDeliveredResponse(request: BackendViewResponseRequest): Promise<void>
+}
+
 
 export interface BackendEndpointDependencies {
   readonly state: BackendInstallState
@@ -121,6 +134,7 @@ export interface BackendEndpointDependencies {
   readonly traces: TraceStore
   readonly admission: AdmissionRegistry
   readonly execution: BackendExecutionService
+  readonly viewResponse: BackendViewResponseService
   readonly sendToFrontend?: (response: BackendResponse, userId: string) => void
   readonly onAuthorizedMutation?: (userId: string, presetId: string) => void
 }
@@ -257,6 +271,12 @@ function normalizeFailure(error: unknown, fallbackCode: string, fallbackMessage 
     }
     if (code === "NOT_FOUND" || code.includes("TRACE_NOT_FOUND")) {
       return new EndpointFailure("APC_TRACE_NOT_FOUND", "The requested APC trace was not found")
+    }
+    if (code === "APC_VIEW_RESPONSE_UNAVAILABLE") {
+      return new EndpointFailure("APC_VIEW_RESPONSE_UNAVAILABLE", "The delivered response is unavailable")
+    }
+    if (code === "APC_VIEW_RESPONSE_FAILED") {
+      return new EndpointFailure("APC_VIEW_RESPONSE_FAILED", "The host could not open the delivered response", true)
     }
     if (code.includes("INSTALL") || code.includes("SCOPE") || code === "NOT_INITIALIZED") {
       return new EndpointFailure("APC_INSTALL_SCOPE", "The APC installation scope is unavailable")
@@ -745,7 +765,7 @@ function disclosureProjection(
 ): SafeConsentDisclosure {
   const extraCategories: readonly ConsentDisclosureCategory[] = workspaceSource === "main-context"
     ? ["main-context", "input-bindings", "prior-stage-outputs"]
-    : ["input-bindings", "prior-stage-outputs"]
+    : ["input-bindings", "prior-stage-outputs", "prompt-variable-values"]
   const categories: ConsentDisclosureCategory[] = [
     "thread",
     "workspace",
@@ -1184,18 +1204,32 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
         ensureSameIdentity(userId, consentSnapshot.userId, "consent user")
         validateConsentSnapshot(consentSnapshot, install, intent.payload.presetId)
         const connections = connectionSummaries(profiles)
+        const normalizedBindings = await normalizeBindingViews(
+          bindingSnapshot,
+          userId,
+          intent.payload.presetId,
+          install,
+          deps.bindings,
+          connections,
+        )
+        const normalizedConsents = normalizeConsentViews(
+          consentSnapshot,
+          intent.payload.presetId,
+          install,
+          selector => deps.consent.resolveDisclosure(userId, selector),
+        )
         const execution = deps.execution.currentExecution(userId, intent.payload.presetId)
+        const settledDelivery = execution === undefined
+          ? deps.execution.settledDelivery?.(userId, intent.payload.presetId)
+          : undefined
+        if (settledDelivery !== undefined) ensureSameIdentity(intent.payload.presetId, settledDelivery.presetId, "settled delivery preset")
         if (execution !== undefined) ensureSameIdentity(intent.payload.presetId, execution.presetId, "execution preset")
         const payload: BackendHydrationResponse["payload"] = Object.freeze({
           presetId: intent.payload.presetId,
-          bindings: await normalizeBindingViews(bindingSnapshot, userId, intent.payload.presetId, install, deps.bindings, connections),
-          consents: normalizeConsentViews(
-            consentSnapshot,
-            intent.payload.presetId,
-            install,
-            selector => deps.consent.resolveDisclosure(userId, selector),
-          ),
+          bindings: normalizedBindings,
+          consents: normalizedConsents,
           ...(execution === undefined ? {} : { execution }),
+          ...(settledDelivery === undefined ? {} : { settledDelivery }),
         })
         return Object.freeze({
           version: 1 as const,
@@ -1384,6 +1418,26 @@ export function createBackendEndpointRouter(deps: BackendEndpointDependencies): 
         return Object.freeze({
           version: 1 as const,
           type: "cancellation" as const,
+          correlationId: intent.correlationId,
+          sequence: sequence(),
+          payload,
+        })
+      }
+      case "view_response": {
+        const install = ensureInstallScope(deps.state)
+        await deps.viewResponse.viewDeliveredResponse({
+          userId,
+          presetId: intent.payload.presetId,
+          executionId: intent.payload.executionId,
+          install,
+        })
+        const payload: BackendViewResponseResponse["payload"] = Object.freeze({
+          presetId: intent.payload.presetId,
+          executionId: intent.payload.executionId,
+        })
+        return Object.freeze({
+          version: 1 as const,
+          type: "view_response" as const,
           correlationId: intent.correlationId,
           sequence: sequence(),
           payload,

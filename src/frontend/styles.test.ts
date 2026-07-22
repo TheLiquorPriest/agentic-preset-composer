@@ -156,62 +156,160 @@ describe("APC scoped styles", () => {
     expect(root.getAttribute("data-apc-scope")).toBeNull()
   })
 
-  test("lays out navigation, workspace, and configuration in exact semantic order", () => {
-    const rootRule = rule(APC_EDITOR_STYLE, [":scope"])
-    expectDeclarations(rootRule, {
-      display: "grid",
-      "grid-template-areas": '"threads graph inspector"',
-    })
-    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-panel="threads"]']), {
-      "grid-area": "threads",
-    })
-    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-panel="graph"]']), {
-      "grid-area": "graph",
-    })
-    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-panel="inspector"]']), {
-      "grid-area": "inspector",
-    })
-
-    const intermediate = cssBlock(APC_EDITOR_STYLE, "@media (max-width: 72rem)")
-    expect(rule(intermediate, [":scope"]).replace(/\s+/g, " ")).toContain(
-      "grid-template-columns: minmax(0, 12rem) minmax(0, 1fr) minmax(0, 16rem);",
-    )
-
-    const mobile = cssBlock(APC_EDITOR_STYLE, "@media (max-width: 48rem)")
-    const mobileRoot = rule(mobile, [":scope"]).replace(/\s+/g, " ")
-    expect(mobileRoot).toContain("grid-template-columns: minmax(0, 1fr);")
-    expect(mobileRoot).toContain('grid-template-areas: "threads" "graph" "inspector";')
-    expectDeclarations(rule(mobile, [":scope > [data-apc-panel]"]), {
-      "inline-size": "100%",
-      "max-block-size": "none",
-      overflow: "visible",
-    })
-  })
-
-  test("uses its host container to stack panes without fixed minimum track overflow", () => {
+  test("keeps desktop semantic pane order and presents one bounded mobile workspace", () => {
     const rootRule = rule(APC_EDITOR_STYLE, [":scope"])
     expectDeclarations(rootRule, {
       "container-name": "apc-editor",
       "container-type": "inline-size",
-      "min-inline-size": "0",
     })
-    const normalizedRoot = rootRule.replace(/\s+/g, " ")
-    expect(normalizedRoot).toContain(
-      "grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) minmax(0, 21rem);",
+    expectDeclarations(rule(APC_EDITOR_STYLE, [":scope > [data-apc-layout]"]), {
+      display: "grid",
+      "grid-template-areas": '"threads graph inspector"',
+    })
+    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-layout] > [data-apc-panel="threads"]']), {
+      "grid-area": "threads",
+    })
+    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-layout] > [data-apc-panel="graph"]']), {
+      "grid-area": "graph",
+    })
+    expectDeclarations(rule(APC_EDITOR_STYLE, [':scope > [data-apc-layout] > [data-apc-panel="inspector"]']), {
+      "grid-area": "inspector",
+    })
+
+    const intermediate = cssBlock(APC_EDITOR_STYLE, "@media (width <= 72rem)")
+    expect(rule(intermediate, [":scope > [data-apc-layout]"]).replace(/\s+/g, " ")).toContain(
+      "grid-template-columns: minmax(0, 12rem) minmax(0, 1fr) minmax(0, 16rem);",
     )
-    expect(normalizedRoot).not.toMatch(/minmax\((?:11rem|24rem|16rem),/)
+
+    const mobile = cssBlock(APC_EDITOR_STYLE, "@media (width < 48rem)")
+    const mobileRoot = rule(mobile, [":scope > [data-apc-layout]"]).replace(/\s+/g, " ")
+    expect(mobileRoot).toContain("grid-template-columns: minmax(0, 1fr);")
+    expect(mobileRoot).toContain('grid-template-areas: "mobile-navigation" "workspace";')
+    expectDeclarations(rule(mobile, [":scope > [data-apc-layout] > [data-apc-mobile-navigation]"]), {
+      display: "grid",
+      "grid-template-columns": "repeat(3, minmax(0, 1fr))",
+      position: "sticky",
+    })
+    expectDeclarations(rule(mobile, [
+      ':scope > [data-apc-layout] > [data-apc-panel="threads"]',
+      ':scope > [data-apc-layout] > [data-apc-panel="inspector"]',
+    ]), {
+      display: "none",
+    })
+    expectDeclarations(rule(mobile, [':scope > [data-apc-layout] > [data-apc-panel="graph"]']), {
+      "grid-area": "workspace",
+      "grid-column": "1 / -1",
+      "inline-size": "100%",
+      "max-block-size": "var(--apc-mobile-workspace-block-size)",
+      overflow: "auto",
+      "overscroll-behavior": "contain",
+      "scroll-padding-block-end": "var(--apc-mobile-action-space)",
+    })
 
     const narrowContainer = cssBlock(
       APC_EDITOR_STYLE,
-      "@container apc-editor (max-width: 48rem)",
+      "@container apc-editor (width < 48rem)",
     )
-    expectDeclarations(rule(narrowContainer, [":scope > [data-apc-panel]"]), {
-      "grid-area": "auto",
+    expectDeclarations(rule(narrowContainer, [":scope > [data-apc-layout] > [data-apc-mobile-navigation]"]), {
+      display: "grid",
+    })
+    expectDeclarations(rule(narrowContainer, [':scope > [data-apc-layout] > [data-apc-panel="graph"]']), {
+      "grid-area": "workspace",
       "grid-column": "1 / -1",
       "inline-size": "100%",
-      "max-block-size": "none",
-      overflow: "visible",
+      overflow: "auto",
     })
+    expect(APC_EDITOR_STYLE).not.toContain("@media (width <= 48rem)")
+    expect(APC_EDITOR_STYLE).not.toContain("@media (max-width: 48rem)")
+    expect(APC_EDITOR_STYLE).not.toContain("@container apc-editor (width <= 48rem)")
+    expect(APC_EDITOR_STYLE).not.toContain("@container apc-editor (max-width: 48rem)")
+    expect(APC_EDITOR_STYLE.replace(/\s+/g, " ")).toContain(
+      ":scope .apc-stage-runs { grid-template-columns: repeat(2, minmax(0, 1fr));",
+    )
+  })
+
+  test("uses contained mobile layers, safe-area actions, and readable graph columns", () => {
+    const mobile = cssBlock(APC_EDITOR_STYLE, "@media (width < 48rem)")
+    expectDeclarations(rule(mobile, [
+      ':scope > [data-apc-layout][data-apc-mobile-pane="navigation"] > [data-apc-mobile-layer="drawer"]',
+      ':scope > [data-apc-layout][data-apc-mobile-pane="configuration"] > [data-apc-mobile-layer="sheet"]',
+    ]), {
+      position: "fixed",
+      "z-index": "var(--apc-layer-mobile-surface)",
+      display: "grid",
+      overflow: "auto",
+      "overscroll-behavior": "contain",
+    })
+    const normalizedMobile = mobile.replace(/\s+/g, " ")
+    expect(normalizedMobile).toContain(
+      'data-apc-mobile-layer="drawer"] { inset-block: 0; inset-inline-start: 0; inline-size: min(88vw, 22rem); max-block-size: 100dvh; padding-block-start: max(.75rem, env(safe-area-inset-top)); padding-block-end: max(.75rem, env(safe-area-inset-bottom)); padding-inline-start: max(.75rem, env(safe-area-inset-left)); padding-inline-end: max(.75rem, env(safe-area-inset-right));',
+    )
+    expect(normalizedMobile).toContain(
+      'data-apc-mobile-layer="sheet"] { inset-inline: 0; inset-block-end: 0; block-size: var(--apc-mobile-sheet-block-size); max-block-size: 100dvh; padding-block-start: 1rem; padding-block-end: max(.75rem, env(safe-area-inset-bottom)); padding-inline-start: max(.75rem, env(safe-area-inset-left)); padding-inline-end: max(.75rem, env(safe-area-inset-right));',
+    )
+    expectDeclarations(
+      rule(mobile, [":scope > [data-apc-layout] > [data-apc-mobile-runtime-bar]:not([hidden])"]),
+      {
+        position: "fixed",
+        "inset-inline": "0",
+        "block-size": "var(--apc-mobile-action-space)",
+        "box-sizing": "border-box",
+        "inset-block-end": "0",
+        display: "flex",
+        "align-items": "center",
+        "justify-content": "space-between",
+        "padding-block-end": "max(.625rem, env(safe-area-inset-bottom))",
+        "padding-inline-start": "max(.75rem, env(safe-area-inset-left))",
+        "padding-inline-end": "max(.75rem, env(safe-area-inset-right))",
+        background: "var(--apc-surface-raised)",
+      },
+    )
+    expectDeclarations(
+      rule(mobile, [
+        ":scope > [data-apc-layout] > [data-apc-mobile-runtime-bar] > [data-apc-mobile-runtime-status]",
+      ]),
+      {
+        overflow: "hidden",
+        "text-overflow": "ellipsis",
+        "white-space": "nowrap",
+      },
+    )
+    expect(normalizedMobile).toContain(
+      ":scope > [data-apc-layout] > [data-apc-panel] > [data-apc-mobile-close] { position: sticky; inset-block-start: 0;",
+    )
+    expect(normalizedMobile).toContain(
+      ':scope > [data-apc-layout][data-apc-mobile-pane="navigation"] > [data-apc-mobile-layer="drawer"] { inset-block: 0;',
+    )
+    expect(normalizedMobile).toContain("max-block-size: 100dvh;")
+    expect(normalizedMobile).toContain(
+      "padding-block-end: max(.75rem, env(safe-area-inset-bottom));",
+    )
+    expect(normalizedMobile).toContain(
+      ':scope > [data-apc-layout][data-apc-mobile-pane="configuration"] > [data-apc-mobile-layer="sheet"] { inset-inline: 0; inset-block-end: 0; block-size: var(--apc-mobile-sheet-block-size);',
+    )
+    expectDeclarations(rule(mobile, [':scope .apc-stage-list > .apc-card-actions']), {
+      position: "sticky",
+      "inset-block-end": "0",
+      "padding-block-end": "max(.625rem, env(safe-area-inset-bottom))",
+    })
+    expectDeclarations(rule(mobile, [":scope .apc-inspector-stop-control"]), {
+      display: "none",
+    })
+    expectDeclarations(rule(mobile, [":scope .apc-stage-runs"]), {
+      "grid-template-columns": "repeat(2, minmax(0, 1fr))",
+    })
+    expectDeclarations(
+      rule(cssBlock(APC_EDITOR_STYLE, "@media (width < 24rem)"), [":scope .apc-stage-runs"]),
+      { "grid-template-columns": "minmax(0, 1fr)" },
+    )
+    expectDeclarations(
+      rule(cssBlock(APC_EDITOR_STYLE, "@container apc-editor (width < 24rem)"), [":scope .apc-stage-runs"]),
+      { "grid-template-columns": "minmax(0, 1fr)" },
+    )
+    expect(rule(mobile, [":scope > [data-apc-layout]"]).replace(/\s+/g, " ")).toContain("overflow-x: clip;")
+    expect(APC_EDITOR_STYLE).toContain(
+      "--apc-mobile-action-space: calc(4rem + env(safe-area-inset-bottom));",
+    )
   })
 
   test("uses a fixed consent layer that blocks APC panes behind a dark scrim", () => {
@@ -224,7 +322,7 @@ describe("APC scoped styles", () => {
       "pointer-events": "auto",
     })
     expectDeclarations(
-      rule(APC_EDITOR_STYLE, [":scope:has(.apc-consent-review) > [data-apc-panel]"]),
+      rule(APC_EDITOR_STYLE, [":scope:has(.apc-consent-review) > [data-apc-layout] > [data-apc-panel]"]),
       {
         "pointer-events": "none",
         "user-select": "none",
@@ -236,9 +334,42 @@ describe("APC scoped styles", () => {
       "inset-inline-start": "50%",
       "z-index": "var(--apc-layer-dialog)",
       "max-block-size": "calc(100dvh - 2rem)",
-      overflow: "auto",
+      overflow: "hidden",
       "pointer-events": "auto",
       transform: "translate(-50%, -50%)",
+    })
+    expectDeclarations(rule(APC_EDITOR_STYLE, [":scope .apc-consent-review-body"]), {
+      "min-block-size": "0",
+      overflow: "auto",
+      "overscroll-behavior": "contain",
+    })
+    expectDeclarations(rule(APC_EDITOR_STYLE, [":scope .apc-consent-review-footer"]), {
+      "border-block-start": ".0625rem solid var(--apc-border)",
+    })
+    const mobile = cssBlock(APC_EDITOR_STYLE, "@media (width < 48rem)")
+    expectDeclarations(rule(mobile, [":scope .apc-consent-review"]), {
+      "inset-block-end": "0",
+      "inline-size": "100%",
+      "max-block-size": "calc(100dvh - .25rem)",
+      padding: "0",
+      transform: "none",
+    })
+    for (const selector of [
+      ":scope .apc-consent-review-header",
+      ":scope .apc-consent-review-body",
+      ":scope .apc-consent-review-footer",
+    ]) {
+      expectDeclarations(rule(mobile, [selector]), {
+        "padding-inline-start": "max(1rem, env(safe-area-inset-left))",
+        "padding-inline-end": "max(1rem, env(safe-area-inset-right))",
+      })
+    }
+    expectDeclarations(rule(mobile, [":scope .apc-consent-review-footer"]), {
+      "padding-block-end": "max(.75rem, env(safe-area-inset-bottom))",
+    })
+    expectDeclarations(rule(mobile, [":scope .apc-consent-review-footer"]), {
+      "padding-inline-start": "max(1rem, env(safe-area-inset-left))",
+      "padding-inline-end": "max(1rem, env(safe-area-inset-right))",
     })
   })
 
@@ -470,7 +601,7 @@ describe("APC scoped styles", () => {
     expectDeclarations(
       rule(forced, [
         ":scope",
-        ":scope > [data-apc-panel]",
+        ":scope > [data-apc-layout] > [data-apc-panel]",
         ":scope button",
         ":scope input",
         ":scope select",

@@ -345,6 +345,15 @@ describe("APC compact graph editor", () => {
   test("keeps first use explicit and offers separate graph creation actions", () => {
     const mounted = mount(firstUseSnapshot())
 
+    const creationActions = [...mounted.root.querySelectorAll<HTMLButtonElement>(
+      "[data-apc-first-use-actions=true] [data-action=create-graph]",
+    )]
+    expect(creationActions.map((action) => action.dataset.mode)).toEqual(["sequential", "parallel"])
+    expect(creationActions.map((action) => action.textContent)).toEqual([
+      t("action.createSequentialGraph"),
+      t("action.createParallelGraph"),
+    ])
+
     expect(mounted.root.querySelector("[data-apc-graph-empty=true]")).not.toBeNull()
     expect(mounted.root.querySelector('[data-mode="sequential"]')?.hasAttribute("disabled")).toBe(true)
     expect(mounted.root.querySelector('[data-mode="parallel"]')?.hasAttribute("disabled")).toBe(true)
@@ -411,6 +420,51 @@ describe("APC compact graph editor", () => {
     expect(mounted.root.querySelector("img, svg, script, iframe, object, embed")).toBeNull()
     mounted.handle.destroy()
   })
+  test("renders complete earlier-output binding summaries with source, role, and missing policy", () => {
+    const config = baseConfig("parallel")
+    const consumer = config.pipelines.parallel!.stages[1]!.runs[0]!
+    consumer.inputs = [
+      { source: "output", runId: IDS.runA, role: "system", onMissing: "fail-graph" },
+      { source: "output", runId: IDS.runB, role: "assistant", onMissing: "omit-binding" },
+    ]
+    const mounted = mount({ ...configuredSnapshot("parallel"), config })
+    const summaries = [...mounted.root.querySelectorAll<HTMLElement>("[data-apc-earlier-output-binding=true]")]
+
+    expect(summaries).toHaveLength(2)
+    expect(summaries.every((item) => item.classList.contains("apc-binding"))).toBe(true)
+    expect(summaries.map((item) => item.dataset.apcBindingKind)).toEqual(["output", "output"])
+    expect(summaries[0]?.querySelector<HTMLElement>("[data-apc-binding-source=true]")?.textContent)
+      .toBe("Researcher · Final Response")
+    expect(summaries[1]?.querySelector<HTMLElement>("[data-apc-binding-source=true]")?.textContent)
+      .toBe("Writer · Final Response")
+    expect(summaries[0]?.querySelector<HTMLElement>("[data-apc-binding-role=true]")?.textContent)
+      .toBe(`${t("binding.role")}: ${t("binding.roleSystem")}`)
+    expect(summaries[1]?.querySelector<HTMLElement>("[data-apc-binding-role=true]")?.textContent)
+      .toBe(`${t("binding.role")}: ${t("binding.roleAssistant")}`)
+    expect(summaries[0]?.querySelector<HTMLElement>("[data-apc-binding-missing=true]")?.textContent)
+      .toBe(`${t("binding.missingPolicy")}: ${t("binding.missingFailGraph")}`)
+    expect(summaries[1]?.querySelector<HTMLElement>("[data-apc-binding-missing=true]")?.textContent)
+      .toBe(`${t("binding.missingPolicy")}: ${t("binding.missingOmit")}`)
+    mounted.handle.destroy()
+  })
+
+  test("renders explicit output text for Main and thread final routes", () => {
+    const mainConfig = baseConfig("parallel")
+    mainConfig.pipelines.parallel!.finalResponse = {
+      source: "main",
+      inputs: [{ source: "output", runId: IDS.runC, onMissing: "fail-graph" }],
+    }
+    const main = mount({ ...configuredSnapshot("parallel"), config: mainConfig })
+    expect(main.root.querySelector<HTMLElement>('[data-apc-final-output=true][data-route-source="main"]')?.textContent)
+      .toBe(`${t("agentGraph.finalMain")} · ${t("graph.defaultFinalResponseName")}`)
+
+    const thread = mount(configuredSnapshot("parallel"))
+    expect(thread.root.querySelector<HTMLElement>('[data-apc-final-output=true][data-route-source="thread"]')?.textContent)
+      .toBe("Researcher · Final Response")
+    main.handle.destroy()
+    thread.handle.destroy()
+  })
+
 
   test("emits exact thread and run selections and renders selected state without inline forms", () => {
     const mounted = mount(configuredSnapshot("parallel"))
@@ -1034,6 +1088,21 @@ describe("APC compact graph editor", () => {
     expect(announcements.some((message) => message.includes("earlier-stage"))).toBe(true)
     mounted.handle.destroy()
   })
+  test("renders visible THEN cues in sequential stage order", () => {
+    const mounted = mount(configuredSnapshot("sequential"), { surface: "topology" })
+    const chain = mounted.root.querySelector<HTMLElement>("[data-apc-causal-chain=true]")
+    if (!chain) throw new Error("sequential causal chain missing")
+    const connectors = [...chain.querySelectorAll<HTMLElement>("[data-apc-sequential-connector=true]")]
+
+    expect(connectors).toHaveLength(1)
+    expect(connectors[0]?.textContent).toBe("THEN")
+    expect(connectors[0]?.getAttribute("aria-label")).toBe("THEN")
+    expect(chain.children[0]?.getAttribute("data-stage-position")).toBe("1")
+    expect(chain.children[1]).toBe(connectors[0])
+    expect(chain.children[2]?.getAttribute("data-stage-position")).toBe("2")
+    mounted.handle.destroy()
+  })
+
   test("creates, trims, validates, and caps connection slots through the rendered controls", () => {
     const mounted = mount(configuredSnapshot("parallel"))
     const section = mounted.root.querySelector<HTMLElement>("[data-apc-connection-slots=true]")

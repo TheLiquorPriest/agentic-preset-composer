@@ -999,9 +999,10 @@ function validateInput(input: AuxiliaryExecutionInput): string | undefined {
   const descriptor = descriptorSnapshot(input.resolvedHostDescriptor)
   if (descriptor === undefined) return "Resolved host descriptor is invalid"
   if (!nonEmptyText(input.expectedDispatchRevision)) return "Expected dispatch revision is required"
-  if (input.resolvedHostDescriptor.connectionDispatchRevision !== input.expectedDispatchRevision) {
-    return "Resolved descriptor dispatch revision is stale"
-  }
+  if (
+    input.dispatchSource !== "slot" &&
+    input.resolvedHostDescriptor.connectionDispatchRevision !== input.expectedDispatchRevision
+  ) return "Resolved descriptor dispatch revision is stale"
   if (input.dispatchSource !== "main" && input.dispatchSource !== "slot") return "Dispatch source is invalid"
   if (input.dispatchSource === "slot" && !nonEmptyText(input.resolvedHostDescriptor.connectionId)) {
     return "Slot connection identity is required"
@@ -1138,7 +1139,7 @@ export async function executeAuxiliaryRun(
     ...input,
     resolvedHostDescriptor: descriptor,
   }) as AuxiliaryExecutionInput
-  const runProvenance = provenance(context, boundInput)
+  let runProvenance = provenance(context, boundInput)
   if (runDeadlineAt <= runStartedAt) return cancellation(runDeadlineAt, true, { provenance: runProvenance })
 
   let cancellationTree: ExecutionCancellation | undefined
@@ -1329,11 +1330,10 @@ export async function executeAuxiliaryRun(
     }
 
     if (!quietResult.ok) {
-      const receipt = quietResult.receipt === null
-        ? undefined
-        : receiptMatches(quietResult.receipt, boundInput)
-          ? cloneAndFreeze(quietResult.receipt)
-          : undefined
+      let receipt: QuietDispatchReceiptDTO | undefined
+      if (quietResult.receipt !== null && receiptMatches(quietResult.receipt, boundInput)) {
+        receipt = cloneAndFreeze(quietResult.receipt)
+      }
       if (quietResult.receipt !== null && receipt === undefined) {
         return failed("UNTRUSTED_RECEIPT", "dispatch", "Tracked dispatch receipt did not preserve source provenance", {
           provenance: runProvenance,

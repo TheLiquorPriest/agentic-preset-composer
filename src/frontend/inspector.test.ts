@@ -425,6 +425,69 @@ describe("safe execution inspector", () => {
     expect(inspector.element.querySelector("[data-inspector-field=final-delivery] [data-status-kind=failed]")?.textContent).toContain("en:terminal.unavailable")
     inspector.destroy()
   })
+  test("renders exact Graph-fallback cause and authoritative delivery states", () => {
+    const inspector = mountInspector()
+    const renderSettlement = (
+      finalDelivery: "pending" | "delivered" | "not-delivered",
+      mainResponded?: boolean,
+    ): void => {
+      inspector.render(snapshot("completed", {
+        terminal: true,
+        outcome: { class: "graph-fallback", category: "graph" },
+        fallback: {
+          category: "graph",
+          causeCategory: "required-typed-run",
+          causeCode: "REQUIRED-FAILURE",
+          finalDelivery,
+          ...(mainResponded === undefined ? {} : { mainResponded }),
+        },
+        finalRoute: {
+          target: "main",
+          delivery: finalDelivery,
+          ...(mainResponded === undefined ? {} : { delivered: mainResponded }),
+        },
+      }))
+    }
+
+    renderSettlement("pending")
+    expect(inspector.element.querySelector("[data-inspector-field=fallback-cause-category]")?.textContent)
+      .toContain("required-typed-run")
+    expect(inspector.element.querySelector("[data-inspector-field=fallback-cause-code]")?.textContent)
+      .toContain("REQUIRED-FAILURE")
+    expect(inspector.element.querySelector("[data-inspector-field=final-delivery] [data-status-kind=pending][data-delivery-state=pending]"))
+      .not.toBeNull()
+    expect(inspector.element.querySelector("[data-inspector-field=main-fallback-result] [data-status-kind=pending][data-delivery-state=pending]"))
+      .not.toBeNull()
+
+    renderSettlement("delivered", true)
+    expect(inspector.element.querySelector("[data-inspector-field=final-delivery] [data-status-kind=completed][data-delivery-state=delivered]")?.textContent)
+      .toContain("en:terminal.ready")
+    expect(inspector.element.querySelector("[data-inspector-field=main-fallback-result] [data-status-kind=completed][data-delivery-state=delivered]")?.textContent)
+      .toContain("en:terminal.ready")
+
+    renderSettlement("not-delivered", false)
+    expect(inspector.element.querySelector("[data-inspector-field=final-delivery] [data-status-kind=failed][data-delivery-state=not-delivered]")?.textContent)
+      .toContain("en:terminal.unavailable")
+    expect(inspector.element.querySelector("[data-inspector-field=main-fallback-result] [data-status-kind=failed][data-delivery-state=not-delivered]")?.textContent)
+      .toContain("en:terminal.unavailable")
+    inspector.render(snapshot("completed", {
+      terminal: true,
+      outcome: { class: "graph-fallback", category: "graph" },
+      fallback: {
+        category: "graph",
+        causeCategory: "assembly-setup-storage-worker-transport-receipt",
+        causeCode: "FINAL_RESPONSE_PERMISSION_MISSING",
+        finalDelivery: "delivered",
+        mainResponded: true,
+      },
+      finalRoute: { target: "main", delivery: "delivered", delivered: true },
+    }))
+    expect(inspector.element.querySelector("[data-inspector-field=fallback-cause-category]")?.textContent)
+      .toContain("assembly-setup-storage-worker-transport-receipt")
+    expect(inspector.element.querySelector("[data-inspector-field=fallback-cause-code]")?.textContent)
+      .toContain("FINAL_RESPONSE_PERMISSION_MISSING")
+    inspector.destroy()
+  })
 
   test("distinguishes failed work, amber Main fallback, and explicit final delivery without output bodies", () => {
     const inspector = mountInspector()
@@ -924,6 +987,46 @@ describe("safe execution inspector", () => {
     fallback?.click()
     await Promise.resolve()
     expect(uses).toBe(1)
+    inspector.destroy()
+  })
+  test("shows View response only for delivered Main fallback and rolls back a rejected request", async () => {
+    let calls = 0
+    let rejectView: ((error: Error) => void) | undefined
+    const inspector = mountInspector({
+      onViewResponse: () => {
+        calls += 1
+        return new Promise<void>((_resolve, reject) => {
+          rejectView = reject
+        })
+      },
+    })
+    const delivered = snapshot("completed", {
+      terminal: true,
+      outcome: { class: "graph-fallback", category: "connection" },
+      fallback: { category: "connection", finalDelivery: "delivered", mainResponded: true },
+      canViewResponse: true,
+    })
+    inspector.render(delivered)
+    const view = actionButton(inspector, "view-response")
+    expect(view).not.toBeNull()
+    expect(view?.textContent).toContain("en:graph.finalResponse")
+    expect(view?.disabled).toBe(false)
+    view?.click()
+    await Promise.resolve()
+    expect(calls).toBe(1)
+    expect(actionButton(inspector, "view-response")?.disabled).toBe(true)
+    rejectView?.(new Error("drawer unavailable"))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(actionButton(inspector, "view-response")?.disabled).toBe(false)
+    expect(inspector.element.querySelector("[data-error-category=connection]")?.textContent).toContain("en:error.connection")
+    expect(inspector.element.querySelector(".apc-inspector-live-region")?.textContent).toContain("en:terminal.unavailable")
+
+    inspector.render(snapshot("completed", {
+      ...delivered,
+      canViewResponse: false,
+    }))
+    expect(actionButton(inspector, "view-response")).toBeNull()
     inspector.destroy()
   })
 

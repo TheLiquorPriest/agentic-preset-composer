@@ -1,4 +1,6 @@
 import type {
+  GenerationEndedPayloadDTO,
+  GenerationStoppedPayloadDTO,
   InterceptorContextDTO,
   InterceptorResultDTO,
   LlmMessageDTO,
@@ -33,6 +35,7 @@ import {
   createBackendEndpointRouter,
   type BackendEndpointRouter,
   type BackendEndpointDependencies,
+  type BackendViewResponseRequest,
 } from "./endpoints"
 import {
   createInterceptorRegistrationRegistry,
@@ -52,14 +55,19 @@ import { type SettledThreadOutput } from "./guidance"
 import { isThreadFinalRoutingResult, routeFinalResponse } from "./final-routing"
 import {
   MAX_ACTIVITY_BUDGET_MS,
+  MAX_ACTIVITY_TOPOLOGY_COUNT,
   MAX_ACTIVITY_USAGE_TOKENS,
   type ActivityCancellationSource,
   type ActivityErrorCategory,
-  type ActivityOutcome,
+  type ActivityFallbackCauseCategory,
+  type ActivityFinalDelivery,
   type ActivityPhase,
+  type ActivityOutcome,
   type BackendActivityInput,
   type BackendActivityResponse,
   type BackendActivityUsage,
+  type BackendSettlementProjection,
+  type BackendSettlementTopologyActivity,
 } from "../protocol/messages"
 type RuntimeActivity = Omit<BackendActivityInput, "correlationId" | "sequence">
 type ActivityUpdate = Readonly<{
@@ -70,6 +78,7 @@ type ActivityUpdate = Readonly<{
   provider?: string
   model?: string
   runStatus?: BackendActivityInput["runStatus"]
+  runErrorCategory?: ActivityErrorCategory
   stageIndex?: number
   stageCount?: number
   runIndex?: number
@@ -78,6 +87,10 @@ type ActivityUpdate = Readonly<{
   totalRuns?: number
   remainingBudgetMs?: number
   outcome?: ActivityOutcome
+  fallbackCauseCategory?: ActivityFallbackCauseCategory
+  fallbackCauseCode?: string
+  finalDelivery?: ActivityFinalDelivery
+  mainResponded?: boolean
   errorCategory?: ActivityErrorCategory
   cancellationSource?: ActivityCancellationSource
 }>
@@ -169,6 +182,27 @@ type RuntimeGlobals = { [ACTIVE_RUNTIME_KEY]?: BackendRuntime }
 const FALLBACK_CORRELATION_ID = "00000000-0000-4000-8000-000000000000"
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const MAX_CONTEXT_TEXT_BYTES = 2_048
+const ACTIVITY_CODE_PATTERN = /^[A-Z][A-Z0-9_:-]{0,63}$/
+const MAX_PENDING_FINAL_DELIVERIES = 256
+const MAX_DELIVERED_RESPONSE_CAPABILITIES = 256
+
+type FallbackProjection = Readonly<{
+  fallbackCauseCategory: ActivityFallbackCauseCategory
+  fallbackCauseCode: string
+}>
+
+function fallbackProjection(
+  cause: Readonly<{ category?: GraphFallbackCauseCategory; code?: string }>,
+): FallbackProjection {
+  const normalizedCode = typeof cause.code === "string" ? cause.code.toUpperCase() : ""
+  const fallbackCauseCode = ACTIVITY_CODE_PATTERN.test(normalizedCode) && utf8Bytes(normalizedCode) <= 128
+    ? normalizedCode
+    : "GRAPH_FALLBACK"
+  return Object.freeze({
+    fallbackCauseCategory: cause.category ?? "guidance-workspace-fallback-validation",
+    fallbackCauseCode,
+  })
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -339,6 +373,30 @@ type ActiveExecution = Readonly<{
   registrationOrder: number
   requiresFinalResponsePermission: boolean
   latestActivity: { value?: BackendActivityResponse["payload"] }
+  topologyActivity: { value: BackendSettlementTopologyActivity[] }
+}>
+type PendingFinalDelivery = Readonly<{
+  userId: string
+  presetId: string
+  executionId: string
+  traceId?: string
+  completedRuns?: number
+  totalRuns?: number
+  topology: readonly BackendSettlementTopologyActivity[]
+  fallbackCauseCategory: ActivityFallbackCauseCategory
+  fallbackCauseCode: string
+  epoch?: number
+  registrationOrder?: number
+}>
+type DeliveredResponseCapability = Readonly<{
+  userId: string
+  presetId: string
+  executionId: string
+}>
+type RuntimeSettlementProjection = BackendSettlementProjection & Readonly<{
+  userId: string
+  epoch?: number
+  registrationOrder?: number
 }>
 type RuntimeSettledThreadOutput = SettledThreadOutput & Readonly<{
   readonly errorCategory?: ActivityErrorCategory
@@ -349,6 +407,7 @@ type RuntimeSettledThreadOutput = SettledThreadOutput & Readonly<{
 type ResolvedDescriptor = Readonly<{
   descriptor: HostDispatchDescriptor
   revision: string
+  consentRevision: string
   source: "main" | "slot"
   consentConnectionId: string | null
   sourceKey: "main" | `slot:${string}`
@@ -538,11 +597,118 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     return true
   }
   let disposed = false
+  let disposing = false
   let started = false
   let readyStartupCancelled = false
   let startPromise: Promise<void> | undefined
   let disposePromise: Promise<void> | undefined
   let removeFrontendMessage: (() => void) | undefined
+  const pendingFinalDeliveries = new Map<string, PendingFinalDelivery>()
+  const deliveredResponseCapabilities = new Map<string, DeliveredResponseCapability>()
+  const settledFinalDeliveries = new Map<string, RuntimeSettlementProjection>()
+  const removeRetainedDelivery = (key: string): void => {
+    deliveredResponseCapabilities.delete(key)
+    settledFinalDeliveries.delete(key)
+  }
+  const latestExecutionOrders = new Map<string, number>()
+  const noteLatestExecutionOrder = (userId: string, presetId: string, order: number): void => {
+    const scopeKey = keyFor(userId, presetId)
+    const currentOrder = latestExecutionOrders.get(scopeKey)
+    if (currentOrder !== undefined && order <= currentOrder) return
+    latestExecutionOrders.delete(scopeKey)
+    latestExecutionOrders.set(scopeKey, order)
+    for (const [key, projection] of settledFinalDeliveries) {
+      if (projection.userId === userId && projection.presetId === presetId &&
+        (projection.registrationOrder ?? 0) < order) removeRetainedDelivery(key)
+    }
+    for (const [key, pending] of pendingFinalDeliveries) {
+      if (pending.userId === userId && pending.presetId === presetId &&
+        (pending.registrationOrder ?? 0) < order) pendingFinalDeliveries.delete(key)
+    }
+    while (latestExecutionOrders.size > 256) {
+      const oldest = latestExecutionOrders.keys().next().value
+      if (typeof oldest !== "string") break
+      latestExecutionOrders.delete(oldest)
+      for (const [key, projection] of settledFinalDeliveries) {
+        if (keyFor(projection.userId, projection.presetId) === oldest) removeRetainedDelivery(key)
+      }
+      for (const [pendingKey, pending] of pendingFinalDeliveries) {
+        if (keyFor(pending.userId, pending.presetId) === oldest) pendingFinalDeliveries.delete(pendingKey)
+      }
+    }
+  }
+  const trackPendingFinalDelivery = (projection: PendingFinalDelivery): PendingFinalDelivery | undefined => {
+    if (disposed || disposing) return undefined
+    const registrationOrder = projection.registrationOrder ?? ++executionRegistrationOrder
+    const epoch = projection.epoch ?? epochFor(projection.userId, projection.presetId)
+    noteLatestExecutionOrder(projection.userId, projection.presetId, registrationOrder)
+    const currentOrder = latestExecutionOrders.get(keyFor(projection.userId, projection.presetId))
+    if (currentOrder !== undefined && registrationOrder < currentOrder) return undefined
+    const normalized = Object.freeze({ ...projection, registrationOrder, epoch })
+    const key = executionKey(projection.userId, projection.presetId, projection.executionId)
+    const existing = pendingFinalDeliveries.get(key)
+    if (existing !== undefined) return existing
+    if (pendingFinalDeliveries.size >= MAX_PENDING_FINAL_DELIVERIES) return undefined
+    pendingFinalDeliveries.set(key, normalized)
+    return normalized
+  }
+  const rememberSettledDelivery = (projection: RuntimeSettlementProjection): void => {
+    if (disposed || disposing) return
+    const scopeKey = keyFor(projection.userId, projection.presetId)
+    const latestOrder = latestExecutionOrders.get(scopeKey)
+    if (latestOrder !== undefined && projection.registrationOrder !== latestOrder) return
+    const key = executionKey(projection.userId, projection.presetId, projection.executionId)
+    settledFinalDeliveries.set(key, projection)
+    while (settledFinalDeliveries.size > MAX_DELIVERED_RESPONSE_CAPABILITIES) {
+      const oldest = settledFinalDeliveries.keys().next().value
+      if (typeof oldest !== "string") break
+      removeRetainedDelivery(oldest)
+    }
+  }
+  const rememberDeliveredResponse = (userId: string, presetId: string, executionId: string): void => {
+    if (disposed || disposing) return
+    const key = executionKey(userId, presetId, executionId)
+    if (deliveredResponseCapabilities.has(key)) return
+    deliveredResponseCapabilities.set(key, Object.freeze({ userId, presetId, executionId }))
+    while (deliveredResponseCapabilities.size > MAX_DELIVERED_RESPONSE_CAPABILITIES) {
+      const oldest = deliveredResponseCapabilities.keys().next().value
+      if (typeof oldest !== "string") break
+      removeRetainedDelivery(oldest)
+    }
+  }
+  const viewDeliveredResponse = async (request: BackendViewResponseRequest): Promise<void> => {
+    let currentInstall: BackendViewResponseRequest["install"]
+    try {
+      currentInstall = store.getInstallPair()
+    } catch {
+      throw { code: "APC_VIEW_RESPONSE_UNAVAILABLE" }
+    }
+    const deliveryKey = executionKey(request.userId, request.presetId, request.executionId)
+    const capability = deliveredResponseCapabilities.get(deliveryKey)
+    const settledProjection = settledFinalDeliveries.get(deliveryKey)
+    if (
+      disposed ||
+      disposing ||
+      capability === undefined ||
+      settledProjection === undefined ||
+      settledProjection.finalDelivery !== "delivered" ||
+      capability.userId !== request.userId ||
+      capability.presetId !== request.presetId ||
+      capability.executionId !== request.executionId ||
+      settledProjection.userId !== request.userId ||
+      settledProjection.presetId !== request.presetId ||
+      settledProjection.executionId !== request.executionId ||
+      currentInstall.extensionInstallationId !== request.install.extensionInstallationId ||
+      currentInstall.installNonce !== request.install.installNonce
+    ) {
+      throw { code: "APC_VIEW_RESPONSE_UNAVAILABLE" }
+    }
+    try {
+      await spindle.ui.closeDrawer({ userId: request.userId })
+    } catch {
+      throw { code: "APC_VIEW_RESPONSE_FAILED" }
+    }
+  }
   let removePermissionWatcher: (() => void) | undefined
   const removeLifecycleWatchers: Array<() => void> = []
   let router: BackendEndpointRouter | undefined
@@ -550,6 +716,48 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
   const terminalExecutions = new WeakSet<ActiveExecution>()
   const replayEligibleExecutions = new WeakSet<ActiveExecution>()
   const cancellationSources = new Map<string, ActivityCancellationSource>()
+  const rememberTopologyActivity = (
+    execution: ActiveExecution,
+    activity: BackendActivityResponse["payload"],
+  ): void => {
+    if (activity.kind === "delivery-settled" || activity.stageIndex === undefined || activity.runIndex === undefined) return
+    const projected: BackendSettlementTopologyActivity = Object.freeze({
+      executionId: activity.executionId,
+      presetId: activity.presetId,
+      kind: activity.kind,
+      phase: activity.phase,
+      terminal: activity.terminal,
+      ...(activity.traceId === undefined ? {} : { traceId: activity.traceId }),
+      ...(activity.provider === undefined ? {} : { provider: activity.provider }),
+      ...(activity.model === undefined ? {} : { model: activity.model }),
+      ...(activity.runStatus === undefined ? {} : { runStatus: activity.runStatus }),
+      ...(activity.stageIndex === undefined ? {} : { stageIndex: activity.stageIndex }),
+      ...(activity.stageCount === undefined ? {} : { stageCount: activity.stageCount }),
+      ...(activity.runIndex === undefined ? {} : { runIndex: activity.runIndex }),
+      ...(activity.runCount === undefined ? {} : { runCount: activity.runCount }),
+      ...(activity.completedRuns === undefined ? {} : { completedRuns: activity.completedRuns }),
+      ...(activity.totalRuns === undefined ? {} : { totalRuns: activity.totalRuns }),
+      ...(activity.remainingBudgetMs === undefined ? {} : { remainingBudgetMs: activity.remainingBudgetMs }),
+      ...(activity.outcome === undefined ? {} : { outcome: activity.outcome }),
+      ...(activity.fallbackCauseCategory === undefined ? {} : { fallbackCauseCategory: activity.fallbackCauseCategory }),
+      ...(activity.fallbackCauseCode === undefined ? {} : { fallbackCauseCode: activity.fallbackCauseCode }),
+    })
+    const topology = execution.topologyActivity.value
+    const existingIndex = topology.findIndex(entry =>
+      entry.stageIndex === projected.stageIndex && entry.runIndex === projected.runIndex)
+    if (existingIndex >= 0) {
+      const previous = topology[existingIndex]
+      if (previous !== undefined && (
+        previous.terminal ||
+        (previous.phase === "progress" && projected.phase === "started")
+      )) return
+      topology[existingIndex] = projected
+      return
+    }
+    topology.push(projected)
+    if (topology.length > MAX_ACTIVITY_TOPOLOGY_COUNT) topology.splice(0, topology.length - MAX_ACTIVITY_TOPOLOGY_COUNT)
+  }
+
   const emitExecutionActivity = (
     execution: ActiveExecution | Readonly<{ userId: string }>,
     activity: RuntimeActivity,
@@ -576,10 +784,69 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         emitted.presetId === execution.presetId
       ) {
         execution.latestActivity.value = emitted
+        rememberTopologyActivity(execution, emitted)
       }
     } catch {
       // A disconnected frontend or malformed host label cannot affect execution.
     }
+  }
+  const settleFinalDelivery = (generationId: string, userId: string | undefined, mainResponded: boolean): void => {
+    if (disposed || disposing || typeof userId !== "string" || userId.length === 0) return
+    let pendingKey: string | undefined
+    let pending: PendingFinalDelivery | undefined
+    for (const [key, candidate] of pendingFinalDeliveries) {
+      if (candidate.executionId !== generationId) continue
+      if (candidate.userId !== userId) continue
+      if (pending !== undefined) return
+      pendingKey = key
+      pending = candidate
+    }
+    if (pending === undefined || pendingKey === undefined) return
+    pendingFinalDeliveries.delete(pendingKey)
+    const settledProjection: RuntimeSettlementProjection = Object.freeze({
+      userId: pending.userId,
+      executionId: pending.executionId,
+      presetId: pending.presetId,
+      ...(pending.traceId === undefined ? {} : { traceId: pending.traceId }),
+      ...(pending.completedRuns === undefined ? {} : { completedRuns: pending.completedRuns }),
+      ...(pending.totalRuns === undefined ? {} : { totalRuns: pending.totalRuns }),
+      ...(pending.epoch === undefined ? {} : { epoch: pending.epoch }),
+      ...(pending.registrationOrder === undefined ? {} : { registrationOrder: pending.registrationOrder }),
+      outcome: "graph-fallback",
+      fallbackCauseCategory: pending.fallbackCauseCategory,
+      fallbackCauseCode: pending.fallbackCauseCode,
+      finalDelivery: mainResponded ? "delivered" : "not-delivered",
+      mainResponded,
+      topology: pending.topology,
+    })
+    rememberSettledDelivery(settledProjection)
+    if (mainResponded) rememberDeliveredResponse(pending.userId, pending.presetId, pending.executionId)
+    emitExecutionActivity({ userId: pending.userId }, {
+      executionId: pending.executionId,
+      presetId: pending.presetId,
+      kind: "delivery-settled",
+      phase: "completed",
+      terminal: true,
+      traceId: pending.executionId,
+      outcome: "graph-fallback",
+      fallbackCauseCategory: pending.fallbackCauseCategory,
+      fallbackCauseCode: pending.fallbackCauseCode,
+      finalDelivery: mainResponded ? "delivered" : "not-delivered",
+      mainResponded,
+    })
+  }
+  const onGenerationEnded = (payload: GenerationEndedPayloadDTO, userId?: string): void => {
+    if (!isRecord(payload) || typeof payload.generationId !== "string") return
+    const hasError = Object.prototype.hasOwnProperty.call(payload, "error") && payload.error !== undefined
+    const hasResponse = !hasError && (
+      typeof payload.messageId === "string" ||
+      typeof payload.content === "string"
+    )
+    settleFinalDelivery(payload.generationId, userId, hasResponse)
+  }
+  const onGenerationStopped = (payload: GenerationStoppedPayloadDTO, userId?: string): void => {
+    if (!isRecord(payload) || typeof payload.generationId !== "string") return
+    settleFinalDelivery(payload.generationId, userId, false)
   }
   const recordFinalResponseUnavailable = (
     context: InterceptorContextDTO,
@@ -594,10 +861,19 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       category: "host-gate",
     })
     const terminalOutcome = outcome.commit()
+    const deliveryProjection = fallbackProjection(terminalOutcome.cause)
     let terminalActivityEmitted = false
     const emitTerminal = (): void => {
       if (terminalActivityEmitted) return
       terminalActivityEmitted = true
+      const pending = trackPendingFinalDelivery({
+        userId: context.userId,
+        presetId,
+        executionId: context.generationId,
+        traceId: context.generationId,
+        topology: Object.freeze([]),
+        ...deliveryProjection,
+      })
       emitExecutionActivity(
         { userId: context.userId },
         {
@@ -607,6 +883,13 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           phase: "completed",
           terminal: true,
           outcome: terminalOutcome.class,
+          ...(pending === undefined
+            ? deliveryProjection
+            : {
+                fallbackCauseCategory: pending.fallbackCauseCategory,
+                fallbackCauseCode: pending.fallbackCauseCode,
+              }),
+          ...(pending === undefined ? {} : { finalDelivery: "pending" as const }),
         },
       )
     }
@@ -695,10 +978,19 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       category: cause.category,
     })
     const terminalOutcome = outcome.commit()
+    const deliveryProjection = fallbackProjection(terminalOutcome.cause)
     let terminalActivityEmitted = false
     const emitTerminal = (): void => {
       if (terminalActivityEmitted) return
       terminalActivityEmitted = true
+      const pending = trackPendingFinalDelivery({
+        userId: capturedContext.userId,
+        presetId,
+        executionId,
+        traceId: executionId,
+        topology: Object.freeze([]),
+        ...deliveryProjection,
+      })
       emitExecutionActivity(
         { userId: capturedContext.userId },
         {
@@ -708,6 +1000,13 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           phase: "completed",
           terminal: true,
           outcome: terminalOutcome.class,
+          ...(pending === undefined
+            ? deliveryProjection
+            : {
+                fallbackCauseCategory: pending.fallbackCauseCategory,
+                fallbackCauseCode: pending.fallbackCauseCode,
+              }),
+          ...(pending === undefined ? {} : { finalDelivery: "pending" as const }),
         },
       )
     }
@@ -790,8 +1089,72 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       if (execution.userId !== userId || execution.presetId !== presetId || execution.epoch !== currentEpoch) continue
       if (selected === undefined || execution.registrationOrder > selected.registrationOrder) selected = execution
     }
+    const latestOrder = latestExecutionOrders.get(keyFor(userId, presetId))
+    if (selected !== undefined && latestOrder !== undefined && selected.registrationOrder < latestOrder) return undefined
     const activity = selected?.latestActivity.value
     return activity === undefined || activity.terminal ? undefined : activity
+  }
+  const settledDeliveryFor = (userId: string, presetId: string): BackendSettlementProjection | undefined => {
+    if (disposed || disposing) return undefined
+    const currentEpoch = epochFor(userId, presetId)
+    const scopeKey = keyFor(userId, presetId)
+    const latestOrder = latestExecutionOrders.get(scopeKey)
+    for (const execution of activeExecutions.values()) {
+      if (execution.userId !== userId || execution.presetId !== presetId || execution.epoch !== currentEpoch) continue
+      const activity = execution.latestActivity.value
+      if (activity === undefined || activity.terminal) continue
+      if (latestOrder === undefined || execution.registrationOrder >= latestOrder) return undefined
+    }
+    const pending = [...pendingFinalDeliveries.values()].reverse()
+    for (const candidate of pending) {
+      if (candidate.userId !== userId || candidate.presetId !== presetId) continue
+      if (candidate.epoch !== undefined && candidate.epoch !== currentEpoch) continue
+      if (latestOrder !== undefined && candidate.registrationOrder !== latestOrder) continue
+      return Object.freeze({
+        executionId: candidate.executionId,
+        presetId: candidate.presetId,
+        ...(candidate.traceId === undefined ? {} : { traceId: candidate.traceId }),
+        ...(candidate.completedRuns === undefined ? {} : { completedRuns: candidate.completedRuns }),
+        ...(candidate.totalRuns === undefined ? {} : { totalRuns: candidate.totalRuns }),
+        outcome: "graph-fallback" as const,
+        fallbackCauseCategory: candidate.fallbackCauseCategory,
+        fallbackCauseCode: candidate.fallbackCauseCode,
+        finalDelivery: "pending" as const,
+        mainResponded: false,
+        topology: candidate.topology,
+      })
+    }
+    const retained = [...settledFinalDeliveries.values()].reverse()
+    for (const projection of retained) {
+      if (projection.userId !== userId || projection.presetId !== presetId) continue
+      if (projection.epoch !== undefined && projection.epoch !== currentEpoch) {
+        removeRetainedDelivery(executionKey(projection.userId, projection.presetId, projection.executionId))
+        continue
+      }
+      if (latestOrder !== undefined && projection.registrationOrder !== latestOrder) {
+        removeRetainedDelivery(executionKey(projection.userId, projection.presetId, projection.executionId))
+        continue
+      }
+      const key = executionKey(projection.userId, projection.presetId, projection.executionId)
+      if (projection.finalDelivery === "delivered" && !deliveredResponseCapabilities.has(key)) {
+        removeRetainedDelivery(key)
+        continue
+      }
+      return Object.freeze({
+        executionId: projection.executionId,
+        presetId: projection.presetId,
+        ...(projection.traceId === undefined ? {} : { traceId: projection.traceId }),
+        ...(projection.completedRuns === undefined ? {} : { completedRuns: projection.completedRuns }),
+        ...(projection.totalRuns === undefined ? {} : { totalRuns: projection.totalRuns }),
+        outcome: projection.outcome,
+        fallbackCauseCategory: projection.fallbackCauseCategory,
+        fallbackCauseCode: projection.fallbackCauseCode,
+        finalDelivery: projection.finalDelivery,
+        ...(projection.mainResponded === undefined ? {} : { mainResponded: projection.mainResponded }),
+        topology: projection.topology,
+      })
+    }
+    return undefined
   }
   const abortExecution = (execution: ActiveExecution, reason: CancellationReason): void => {
     const source = cancellationSourceFor(reason)
@@ -911,6 +1274,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       return {
         descriptor: binding.descriptor,
         revision: binding.dispatchRevision,
+        consentRevision: binding.dispatchRevision,
         source: "slot",
         consentConnectionId: binding.connectionId,
         sourceKey: binding.connectionSourceKey,
@@ -925,6 +1289,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     return {
       descriptor: cloneDispatchDescriptor(context.mainDispatch.descriptor),
       revision: context.mainDispatch.connectionDispatchRevision,
+      consentRevision: context.mainDispatch.connectionDispatchRevision,
       source: "main",
       consentConnectionId: null,
       sourceKey: "main",
@@ -999,58 +1364,97 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         resolvedInput.status === "skip-run" ? "run_skipped" : "missing_input",
       )
     }
+    const preparationCancellation = rootCancellation.createRun({
+      id: `${planned.id}:preparation`,
+      timeoutMs: planned.run.timeoutMs,
+    })
+    const preparationDeadlineAt = preparationCancellation.deadlineAt
+    let preparationTimeoutNoted = false
+    const notePreparationTimeout = (): void => {
+      if (preparationTimeoutNoted) return
+      preparationTimeoutNoted = true
+      const accepted = rootCancellation.stop("child-timeout")
+      markChildTimeout(accepted)
+    }
+    const preparationCancellationRun = (reason: CancellationReason): RuntimeSettledThreadOutput => {
+      if (reason === "child-timeout") notePreparationTimeout()
+      return cancellationRun()
+    }
     let resolved: ResolvedDescriptor | undefined
     try {
-      resolved = await resolveDescriptor(context, presetId, mode, planned)
-    } catch {
-      return failedRun("failed", "dispatch_resolution_failed")
-    }
-    if (resolved === undefined) return failedRun("failed", "dispatch_unavailable")
-    if (!current()) return cancellationRun()
-    const provider = safeActivityLabel(resolved.descriptor.provider, 256)
-    const model = safeActivityLabel(resolved.descriptor.model, 320)
-    emitProgress({
-      kind: "run-dispatch",
-      phase: "progress",
-      terminal: false,
-      ...(provider === undefined ? {} : { provider }),
-      ...(model === undefined ? {} : { model }),
-    })
-
-    try {
-      const disclosure = consent.rememberDisclosure({
-        userId: context.userId,
-        presetId,
-        threadId: planned.thread.id,
-        workspaceSource: planned.thread.workspaceSource,
-        connectionSourceKey: resolved.sourceKey,
-        connectionId: resolved.consentConnectionId,
-        descriptor: resolved.descriptor,
-      })
-      await consent.authorizeExecution({
-        userId: context.userId,
-        presetId,
-        threadId: planned.thread.id,
-        workspaceSource: planned.thread.workspaceSource,
-        connectionSourceKey: resolved.sourceKey,
-        connectionId: resolved.consentConnectionId,
-        descriptor: resolved.descriptor,
-        dispatchRevision: resolved.revision,
-        disclosureVersion: disclosure.disclosureVersion,
-      })
-      replayEligibleExecutions.add(activeExecution)
-    } catch {
+      if (!preparationCancellation.isActive()) {
+        return preparationCancellationRun(preparationCancellation.reason ?? rootCancellation.reason ?? "disposed")
+      }
+      try {
+        const completed = await preparationCancellation.completion(
+          resolveDescriptor(context, presetId, mode, planned),
+        )
+        if (!completed.accepted) return preparationCancellationRun(completed.reason)
+        resolved = completed.value
+      } catch {
+        return failedRun("failed", "dispatch_resolution_failed")
+      }
+      if (resolved === undefined) return failedRun("failed", "dispatch_unavailable")
       if (!current()) return cancellationRun()
-      sequence.value += 1
-      reportError("consent", planned.id)
-      if (planned.run.required) rootCancellation.stop("required-failure")
-      appendRunTrace(context, presetId, sequence.value, "consent_required", "failed", planned.id)
-      return Object.freeze({
-        runId: planned.id,
-        threadId: planned.thread.id,
-        status: "failed" as const,
-        errorCategory: "consent" as const,
+      const provider = safeActivityLabel(resolved.descriptor.provider, 256)
+      const model = safeActivityLabel(resolved.descriptor.model, 320)
+      emitProgress({
+        kind: "run-dispatch",
+        phase: "progress",
+        terminal: false,
+        ...(provider === undefined ? {} : { provider }),
+        ...(model === undefined ? {} : { model }),
       })
+
+      if (!preparationCancellation.isActive()) {
+        return preparationCancellationRun(preparationCancellation.reason ?? rootCancellation.reason ?? "disposed")
+      }
+      try {
+        const consentDescriptor = resolved.descriptor.connectionDispatchRevision === resolved.consentRevision
+          ? resolved.descriptor
+          : Object.freeze({
+              ...resolved.descriptor,
+              connectionDispatchRevision: resolved.consentRevision,
+            })
+        const disclosure = consent.rememberDisclosure({
+          userId: context.userId,
+          presetId,
+          threadId: planned.thread.id,
+          workspaceSource: planned.thread.workspaceSource,
+          connectionSourceKey: resolved.sourceKey,
+          connectionId: resolved.consentConnectionId,
+          descriptor: consentDescriptor,
+        })
+        const completed = await preparationCancellation.completion(
+          consent.authorizeExecution({
+            userId: context.userId,
+            presetId,
+            threadId: planned.thread.id,
+            workspaceSource: planned.thread.workspaceSource,
+            connectionSourceKey: resolved.sourceKey,
+            connectionId: resolved.consentConnectionId,
+            descriptor: consentDescriptor,
+            dispatchRevision: resolved.consentRevision,
+            disclosureVersion: disclosure.disclosureVersion,
+          }),
+        )
+        if (!completed.accepted) return preparationCancellationRun(completed.reason)
+        replayEligibleExecutions.add(activeExecution)
+      } catch {
+        if (!current()) return cancellationRun()
+        sequence.value += 1
+        reportError("consent", planned.id)
+        if (planned.run.required) rootCancellation.stop("required-failure")
+        appendRunTrace(context, presetId, sequence.value, "consent_required", "failed", planned.id)
+        return Object.freeze({
+          runId: planned.id,
+          threadId: planned.thread.id,
+          status: "failed" as const,
+          errorCategory: "consent" as const,
+        })
+      }
+    } finally {
+      preparationCancellation.dispose()
     }
     if (!current()) return cancellationRun()
 
@@ -1082,7 +1486,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           : undefined,
         inputBindings: bindingsInput,
         parentSignal: rootCancellation.signal,
-        deadlineAt: rootCancellation.deadlineAt,
+        deadlineAt: preparationDeadlineAt,
         expectedDispatchRevision: resolved.revision,
         dispatchSource: resolved.source,
       }, {
@@ -1208,6 +1612,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     }
     const capturedEpoch = epochFor(capturedContext.userId, presetId)
     const registrationOrder = ++executionRegistrationOrder
+    noteLatestExecutionOrder(capturedContext.userId, presetId, registrationOrder)
     const activeExecution: ActiveExecution = Object.freeze({
       userId: capturedContext.userId,
       presetId,
@@ -1217,6 +1622,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       epoch: capturedEpoch,
       registrationOrder,
       latestActivity: {},
+      topologyActivity: { value: [] },
     })
     const activeKey = executionKey(capturedContext.userId, presetId, capturedContext.generationId)
     cancellationSources.delete(activeKey)
@@ -1352,6 +1758,11 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
         const stageIndex = planned?.stageIndex ?? settlement.stageIndex
         const runIndex = planned?.index ?? settlement.index
         const stage = plan.stages[stageIndex]
+        const runStatus = settledActivityStatus(
+          settlement.status,
+          settledResult,
+          childTimeoutWon || rootCancellation.reason === "deadline" || rootCancellation.reason === "child-timeout",
+        )
         emitExecutionActivity(activeExecution, {
           executionId: capturedContext.generationId,
           presetId,
@@ -1366,11 +1777,10 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           completedRuns,
           totalRuns,
           remainingBudgetMs: remainingBudget(rootCancellation.deadlineAt, now()),
-          runStatus: settledActivityStatus(
-            settlement.status,
-            settledResult,
-            childTimeoutWon || rootCancellation.reason === "deadline" || rootCancellation.reason === "child-timeout",
-          ),
+          runStatus,
+          ...(runStatus === "failed" || runStatus === "timed-out"
+            ? { runErrorCategory: settledResult.errorCategory ?? "unknown" }
+            : {}),
           ...(activityUsage === undefined ? {} : { usage: activityUsage }),
         })
         if (settlement.status === "rejected") {
@@ -1590,6 +2000,25 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           ? "integrity" as const
           : selectedFinalErrorCategory ?? "unknown"
         : undefined
+      const deliveryProjection = terminalOutcome.class === "graph-fallback"
+        ? fallbackProjection(terminalOutcome.cause)
+        : undefined
+      const pending = deliveryProjection === undefined ||
+        disposed ||
+        terminalExecutions.has(activeExecution)
+        ? undefined
+        : trackPendingFinalDelivery({
+            userId: capturedContext.userId,
+            presetId,
+            executionId: capturedContext.generationId,
+            traceId: capturedContext.generationId,
+            completedRuns,
+            totalRuns,
+            topology: Object.freeze([...activeExecution.topologyActivity.value]),
+            epoch: activeExecution.epoch,
+            registrationOrder: activeExecution.registrationOrder,
+            ...deliveryProjection,
+          })
       emitExecutionActivity(activeExecution, {
         executionId: capturedContext.generationId,
         presetId,
@@ -1604,6 +2033,13 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           ? { outcome: "parent-cancel" as const }
           : { outcome: terminalOutcome.class }),
         ...(cumulativeUsage === undefined ? {} : { usage: cumulativeUsage }),
+        ...(pending === undefined
+          ? deliveryProjection ?? {}
+          : {
+              fallbackCauseCategory: pending.fallbackCauseCategory,
+              fallbackCauseCode: pending.fallbackCauseCode,
+            }),
+        ...(pending === undefined ? {} : { finalDelivery: "pending" as const }),
         ...(errorCategory === undefined ? {} : { errorCategory }),
         ...(cancellationSource === undefined ? {} : { cancellationSource }),
       })
@@ -1686,6 +2122,11 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     if (startPromise === undefined && !started) readyStartupCancelled = true
     const completion = Promise.withResolvers<void>()
     disposePromise = completion.promise
+    disposing = true
+    pendingFinalDeliveries.clear()
+    deliveredResponseCapabilities.clear()
+    settledFinalDeliveries.clear()
+    latestExecutionOrders.clear()
     const run = async (): Promise<void> => {
       if (disposed) {
         completion.resolve()
@@ -1710,6 +2151,14 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           : graphFallback
             ? "graph-fallback"
             : "parent-cancel"
+        const deliveryProjection = graphFallback
+          ? fallbackProjection({
+              code: executionCancellationReason,
+              category: executionCancellationReason === "required-failure"
+                ? "required-typed-run"
+                : "timeout-deadline",
+            })
+          : undefined
         emitExecutionActivity(execution, {
           executionId: execution.executionId,
           presetId: execution.presetId,
@@ -1723,6 +2172,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
             : terminalPhase === "cancelled"
               ? { cancellationSource: executionCancellationSource }
               : {}),
+          ...(deliveryProjection ?? {}),
         })
         try {
           claimReplayTombstone(execution.userId, execution.presetId, execution.executionId)
@@ -1767,12 +2217,17 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           // Listener removal is best effort; the closed runtime remains inert.
         }
       }
+      pendingFinalDeliveries.clear()
+      deliveredResponseCapabilities.clear()
+      settledFinalDeliveries.clear()
+      latestExecutionOrders.clear()
       registry.teardown()
       router?.dispose()
       router = undefined
       activeExecutions.clear()
       epochs.clear()
       replayTombstones.clear()
+      cancellationSources.clear()
       started = false
       await Promise.allSettled([...activeInterceptorCalls])
       if (runtimeGlobals()[ACTIVE_RUNTIME_KEY] === runtime) delete runtimeGlobals()[ACTIVE_RUNTIME_KEY]
@@ -1795,6 +2250,20 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
     }
   }
 
+  const watchGenerationDelivery = (): void => {
+    try {
+      const removeEnded = spindle.on("GENERATION_ENDED", onGenerationEnded)
+      if (typeof removeEnded === "function") removeLifecycleWatchers.push(removeEnded)
+    } catch {
+      // Hosts without generation completion delivery cannot update the projection.
+    }
+    try {
+      const removeStopped = spindle.on("GENERATION_STOPPED", onGenerationStopped)
+      if (typeof removeStopped === "function") removeLifecycleWatchers.push(removeStopped)
+    } catch {
+      // Hosts without generation stop delivery cannot update the projection.
+    }
+  }
   const start = async (): Promise<void> => {
     if (disposed) throw new Error("APC backend runtime is disposed")
     if (started) return
@@ -1812,7 +2281,9 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
           cancel: async (request: Parameters<BackendEndpointDependencies["execution"]["cancel"]>[0]) =>
             cancel(request.userId, request.presetId, request.executionId, request.reason),
           currentExecution: (userId, presetId) => currentExecution(userId, presetId),
+          settledDelivery: (userId, presetId) => settledDeliveryFor(userId, presetId),
         },
+        viewResponse: { viewDeliveredResponse },
         sendToFrontend: (response, userId) => spindle.sendToFrontend(response, userId),
         onAuthorizedMutation: (userId, presetId) => { bumpEpoch(userId, presetId) },
       } as BackendEndpointDependencies)
@@ -1821,6 +2292,7 @@ export function setup(options: BackendRuntimeOptions | SpindleAPI): BackendRunti
       watchLifecycle("EXTENSION_UPDATED", "update")
       watchLifecycle("EXTENSION_UPDATE", "update")
       watchLifecycle("EXTENSION_UNLOADED", "disposed")
+      watchGenerationDelivery()
       removeFrontendMessage = spindle.onFrontendMessage(async (payload, userId) => {
         if (disposed || !started || router === undefined) return
         const activeRouter = router

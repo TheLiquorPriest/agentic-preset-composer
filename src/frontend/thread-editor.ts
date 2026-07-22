@@ -14,6 +14,7 @@ import {
   MAX_RUN_TIMEOUT_MS,
   MAX_RUNS_PER_PIPELINE,
   MAX_STAGES_PER_PIPELINE,
+  MAX_THREADS,
   MIN_RUN_TIMEOUT_MS,
 } from "../config/limits"
 import type {
@@ -95,6 +96,12 @@ export type ThreadEditorRunPositionTarget = Readonly<{
   stageName: string
 }>
 
+export type ThreadEditorRunThreadTarget = Readonly<{
+  id: string
+  name: string
+  /** False when this reusable thread is already scheduled in the selected run's stage. */
+  available?: boolean
+}>
 export type ThreadEditorRunSnapshot = Readonly<{
   id: string
   threadId: string
@@ -105,6 +112,8 @@ export type ThreadEditorRunSnapshot = Readonly<{
   /** Final-route ownership keeps this run required even while other run fields remain editable. */
   requiredLocked?: boolean
   timeoutMs: number
+  /** Reusable thread candidates for this scheduled run. */
+  threadTargets?: readonly ThreadEditorRunThreadTarget[]
   positionTargets: readonly ThreadEditorRunPositionTarget[]
   /** True when binding validity removed otherwise plausible destinations. */
   positionRestricted?: boolean
@@ -153,6 +162,8 @@ export type ThreadEditorRename = Readonly<{
 }>
 
 export type ThreadEditorRunChange = Readonly<{
+  /** Reassign this scheduled run while preserving its opaque run identity. */
+  threadId?: string
   required?: boolean
   timeoutMs?: number
   position?: ThreadEditorRunPosition
@@ -250,6 +261,7 @@ const DISCLOSURE_KEYS: Readonly<Record<SafeConsentDisclosure["categories"][numbe
   model: "inspector.fieldModel",
   "input-bindings": "graph.inputs",
   "prior-stage-outputs": "binding.output",
+  "prompt-variable-values": "consent.review.promptVariables",
   "main-context": "workspace.mainContext",
 })
 
@@ -269,8 +281,24 @@ export function buildThreadWorkspaceId(
   return `${THREAD_WORKSPACE_NAMESPACE}:${assertIdentityPart(installationId, "installationId")}:preset:${assertIdentityPart(presetId, "presetId")}:thread:${assertIdentityPart(threadId, "threadId")}`
 }
 
+function stripUndefinedProperties(value: unknown, visited = new WeakSet<object>()): void {
+  if (value === null || typeof value !== "object" || visited.has(value)) return
+  visited.add(value)
+  if (Array.isArray(value)) {
+    for (const child of value) stripUndefinedProperties(child, visited)
+    return
+  }
+  const record = value as Record<string, unknown>
+  for (const key of Object.keys(record)) {
+    if (record[key] === undefined) delete record[key]
+    else stripUndefinedProperties(record[key], visited)
+  }
+}
+
 function cloneLoomValue(value: SpindleLoomBlockEditorValue): SpindleLoomBlockEditorValue {
-  return structuredClone(value)
+  const cloned = structuredClone(value)
+  stripUndefinedProperties(cloned)
+  return cloned
 }
 
 function cloneThreadValue(thread: ThreadEditorThreadSnapshot): SpindleLoomBlockEditorValue {
@@ -388,6 +416,39 @@ function validateSnapshot(snapshot: ThreadEditorSnapshot, host: SpindleHostDescr
     assertIdentityPart(run.id, "runId")
     if (snapshot.selectedThreadId === null || run.threadId !== snapshot.selectedThreadId) {
       throw new SpindleCompatibilityError("Selected run does not use the selected thread")
+    }
+    if (run.threadTargets !== undefined) {
+      if (run.threadTargets.length === 0 || run.threadTargets.length > MAX_THREADS) {
+        throw new SpindleCompatibilityError("Selected run thread target count is invalid")
+      }
+      const threadTargetIds = new Set<string>()
+      let includesCurrentThread = false
+      for (const target of run.threadTargets) {
+        const canonicalThread = snapshot.threads.find((candidate) => candidate.id === target.id)
+        if (canonicalThread === undefined || canonicalThread.name !== target.name) {
+          throw new SpindleCompatibilityError("Selected run thread target is not canonical")
+        }
+        assertIdentityPart(target.id, "runThreadTargetId")
+        if (threadTargetIds.has(target.id)) {
+          throw new SpindleCompatibilityError("Duplicate selected run thread target")
+        }
+        threadTargetIds.add(target.id)
+        if (
+          typeof target.name !== "string" ||
+          target.name.trim().length === 0 ||
+          !THREAD_ID_PATTERN.test(target.name) ||
+          characterCount(target.name) > MAX_NAME_CHARS
+        ) {
+          throw new SpindleCompatibilityError("Selected run thread target is invalid")
+        }
+        if (target.available !== undefined && typeof target.available !== "boolean") {
+          throw new SpindleCompatibilityError("Selected run thread target availability is invalid")
+        }
+        if (target.id === run.threadId) includesCurrentThread = true
+      }
+      if (!includesCurrentThread) {
+        throw new SpindleCompatibilityError("Selected run thread targets omit the current thread")
+      }
     }
     if (
       !Number.isSafeInteger(run.ordinal) ||
@@ -585,12 +646,10 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
   const reviewCloseWaiters = new Set<() => void>()
 
   type DirtyAuthority = Readonly<{
-    renderGeneration: number
     mountGeneration: number
     installationId: string
     presetId: string
     threadId: string
-    contextAuthorityGeneration: number
     workspaceSource: ApcWorkspaceSource
     connectionSlotId: string | undefined
   }>
@@ -614,12 +673,10 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const thread = snapshot.threads.find((candidate) => candidate.id === threadId)
     if (!thread) return null
     return {
-      renderGeneration,
       mountGeneration,
       installationId: snapshot.installationId,
       presetId: snapshot.presetId,
       threadId,
-      contextAuthorityGeneration: snapshot.contextAuthorityGeneration,
       workspaceSource: thread.workspaceSource,
       connectionSlotId: thread.connectionSlotId,
     }
@@ -630,12 +687,10 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     if (
       snapshot === null ||
       destroyed ||
-      renderGeneration !== authority.renderGeneration ||
       mountGeneration !== authority.mountGeneration ||
       snapshot.installationId !== authority.installationId ||
       snapshot.presetId !== authority.presetId ||
       snapshot.selectedThreadId !== authority.threadId ||
-      snapshot.contextAuthorityGeneration !== authority.contextAuthorityGeneration ||
       snapshot.readOnly ||
       snapshot.mutationLocked === true ||
       consentReviewPhaseOpen(snapshot) ||
@@ -943,9 +998,9 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const mount = (): void => {
       if (destroyed || generation !== mountGeneration || !target.isConnected) return
       loomHandle = options.loom.mountLoomBlockEditor(target, {
+        value,
         compact: true,
         readOnly: locked,
-        value,
         onChange: (next) => {
           if (
             destroyed ||
@@ -1015,6 +1070,39 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
         snapshot.selectedRun?.stageOrdinal === target.stageOrdinal &&
         snapshot.selectedRun.ordinal === target.runOrdinal
     }
+    const threadAuthorityIsCurrent = (
+      allowSynchronousRender = false,
+      target?: ThreadEditorRunThreadTarget,
+    ): boolean => {
+      const snapshot = currentSnapshot
+      if (
+        positionAuthority === null ||
+        locked ||
+        destroyed ||
+        snapshot === null ||
+        mountGeneration !== positionAuthority.mountGeneration ||
+        snapshot.installationId !== positionAuthority.installationId ||
+        snapshot.presetId !== positionAuthority.presetId ||
+        snapshot.selectedRun?.id !== positionAuthority.runId ||
+        snapshot.contextAuthorityGeneration !== positionAuthority.contextAuthorityGeneration ||
+        snapshot.consentAuthorityGeneration !== positionAuthority.consentAuthorityGeneration ||
+        snapshot.readOnly ||
+        snapshot.mutationLocked === true ||
+        consentReviewPhaseOpen(snapshot)
+      ) return false
+      if (snapshot.selectedThreadId !== positionAuthority.threadId) {
+        if (
+          !allowSynchronousRender ||
+          target === undefined ||
+          snapshot.selectedThreadId !== target.id ||
+          snapshot.selectedRun?.threadId !== target.id
+        ) return false
+      }
+      if (renderGeneration === positionAuthority.renderGeneration) return true
+      return allowSynchronousRender &&
+        target !== undefined &&
+        snapshot.selectedRun?.threadId === target.id
+    }
     const panel = document.createElement("section")
     panel.className = "apc-run-configuration"
     panel.dataset.apcRunConfiguration = "true"
@@ -1028,6 +1116,105 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       text(run.stageName),
     )
     panel.append(heading, stage)
+    const threadTargets: readonly ThreadEditorRunThreadTarget[] =
+      run.threadTargets ?? (authoritySnapshot?.threads.map((candidate) => ({
+        id: candidate.id,
+        name: candidate.name,
+      })) ?? [])
+    const threadSelect = document.createElement("select")
+    threadSelect.dataset.apcRunThread = "true"
+    threadSelect.setAttribute(
+      "aria-label",
+      options.t("graph.selectThread", { thread: thread.name }),
+    )
+    const threadAlternatives = threadTargets.filter((target) =>
+      target.id !== run.threadId && target.available !== false
+    )
+    const threadUnavailable =
+      locked || options.onRunChange === undefined || threadAlternatives.length === 0
+    threadSelect.disabled = threadUnavailable
+    let currentThreadToken = ""
+    threadTargets.forEach((target, index) => {
+      const token = `run-thread-${index + 1}`
+      const option = document.createElement("option")
+      option.value = token
+      option.textContent = target.name
+      option.disabled = target.id !== run.threadId && target.available === false
+      threadSelect.append(option)
+      if (target.id === run.threadId) currentThreadToken = token
+    })
+    threadSelect.value = currentThreadToken
+    appendLabel(panel, options.t("graph.threadNavigation"), threadSelect)
+    let threadRequestGeneration = 0
+    const restoreBlockedThread = (requestGeneration = threadRequestGeneration): void => {
+      if (
+        !threadAuthorityIsCurrent() ||
+        requestGeneration === 0 ||
+        requestGeneration !== threadRequestGeneration
+      ) return
+      if (threadSelect.isConnected) {
+        threadSelect.value = currentThreadToken
+        threadSelect.disabled = threadUnavailable
+      }
+      if (currentSnapshot?.selectedRun?.id === run.id) {
+        announce(options.t("a11y.graphReorderBlocked"))
+      }
+    }
+    const acceptThread = (
+      accepted: boolean | void,
+      target: ThreadEditorRunThreadTarget,
+      requestGeneration: number,
+      allowSynchronousRender = false,
+    ): void => {
+      if (
+        !threadAuthorityIsCurrent(allowSynchronousRender, target) ||
+        requestGeneration !== threadRequestGeneration
+      ) return
+      if (accepted === false) {
+        restoreBlockedThread(requestGeneration)
+        return
+      }
+      if (threadSelect.isConnected) threadSelect.disabled = threadUnavailable
+      if (currentSnapshot?.selectedRun?.id === run.id) {
+        announce(options.t("a11y.graphSelectionChanged"))
+      }
+    }
+    listen(threadSelect, "change", () => {
+      if (!threadAuthorityIsCurrent() || !options.onRunChange) return
+      const index = Number(threadSelect.value.slice("run-thread-".length)) - 1
+      const target = threadTargets[index]
+      if (
+        target === undefined ||
+        target.id === run.threadId ||
+        target.available === false
+      ) {
+        threadSelect.value = currentThreadToken
+        return
+      }
+      const requestGeneration = ++threadRequestGeneration
+      let result: boolean | void | Promise<boolean | void>
+      try {
+        result = options.onRunChange(run.id, { threadId: target.id })
+      } catch {
+        restoreBlockedThread(requestGeneration)
+        return
+      }
+      if (
+        result !== null &&
+        (typeof result === "object" || typeof result === "function") &&
+        "then" in result &&
+        typeof result.then === "function"
+      ) {
+        threadSelect.disabled = true
+        void Promise.resolve(result).then(
+          (accepted) => acceptThread(accepted, target, requestGeneration),
+          () => restoreBlockedThread(requestGeneration),
+        )
+        return
+      }
+      acceptThread(result === false ? false : undefined, target, requestGeneration, true)
+    })
+
     const position = document.createElement("select")
     position.dataset.apcRunPosition = "true"
     const positionUnavailable =
@@ -1547,16 +1734,97 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const review = document.createElement("section")
     review.className = "apc-consent-review"
     review.dataset.apcConsentReview = "true"
-    review.setAttribute("aria-label", options.t("consent.title"))
+    review.setAttribute("aria-label", options.t("consent.review.connectTitle", { thread: thread.name }))
     review.setAttribute("role", "dialog")
     review.setAttribute("aria-modal", "true")
     review.dataset.apcConsentResolving = String(resolutionPending)
     review.setAttribute("aria-busy", String(resolutionPending))
+
+    const reviewHeader = document.createElement("header")
+    reviewHeader.className = "apc-consent-review-header"
+    reviewHeader.dataset.apcConsentReviewHeader = "true"
     const heading = document.createElement("h3")
     heading.tabIndex = -1
     heading.dataset.apcConsentReviewHeading = "true"
-    heading.append(text(options.t("consent.title")))
-    review.append(heading)
+    heading.append(text(options.t("consent.review.connectTitle", { thread: thread.name })))
+    const description = document.createElement("p")
+    description.dataset.apcConsentReviewDescription = "true"
+    description.append(text(options.t("consent.review.connectDescription")))
+    const progress = document.createElement("ol")
+    progress.className = "apc-consent-review-progress"
+    progress.dataset.apcConsentReviewProgress = "true"
+    const connectionStep = document.createElement("li")
+    connectionStep.dataset.apcConsentReviewStep = "connection"
+    connectionStep.append(text(options.t("consent.review.connectionStep")))
+    const reviewStep = document.createElement("li")
+    reviewStep.dataset.apcConsentReviewStep = "review"
+    reviewStep.setAttribute("aria-current", "step")
+    reviewStep.append(text(options.t("consent.review.reviewStep")))
+    progress.append(connectionStep, reviewStep)
+    reviewHeader.append(heading, description, progress)
+    review.append(reviewHeader)
+
+    const reviewBody = document.createElement("div")
+    reviewBody.className = "apc-consent-review-body"
+    reviewBody.dataset.apcConsentReviewBody = "true"
+    const reviewFooter = document.createElement("footer")
+    reviewFooter.className = "apc-consent-review-footer"
+    reviewFooter.dataset.apcConsentReviewFooter = "true"
+
+    const consentMutationLocked =
+      contextMutationPending ||
+      resolutionPending ||
+      resolutionFailed ||
+      approvalPending !== null ||
+      revokePending !== null
+    const sourceField = document.createElement("fieldset")
+    sourceField.className = "apc-consent-source"
+    sourceField.dataset.apcConsentSource = "true"
+    const sourceLegend = document.createElement("legend")
+    sourceLegend.append(text(options.t("consent.review.connectionSource")))
+    sourceField.append(sourceLegend)
+    const sourceSelect = document.createElement("select")
+    sourceSelect.dataset.apcConsentSourceControl = "true"
+    sourceSelect.dataset.apcConsentSlot = "true"
+    sourceSelect.disabled =
+      locked ||
+      consentMutationLocked ||
+      options.onConnectionSlotChange === undefined
+    const mainOption = document.createElement("option")
+    mainOption.value = "consent-source-main"
+    mainOption.textContent = options.t("privacy.mainSource")
+    sourceSelect.append(mainOption)
+    let selectedSourceToken = "consent-source-main"
+    snapshot.slots.forEach((candidate, index) => {
+      const option = document.createElement("option")
+      option.value = `consent-source-slot-${index + 1}`
+      option.textContent = candidate.label
+      sourceSelect.append(option)
+      if (candidate.id === slot?.id) selectedSourceToken = option.value
+    })
+    sourceSelect.value = selectedSourceToken
+    appendLabel(sourceField, options.t("consent.review.connectionSource"), sourceSelect)
+    listen(sourceSelect, "change", () => {
+      if (
+        sourceSelect.disabled ||
+        destroyed ||
+        !options.onConnectionSlotChange ||
+        currentConsentContextKey !== consentContextKey
+      ) return
+      const index = sourceSelect.value === "consent-source-main"
+        ? -1
+        : Number(sourceSelect.value.slice("consent-source-slot-".length)) - 1
+      const nextSlot = index < 0 ? undefined : snapshot.slots[index]
+      if ((nextSlot?.id ?? undefined) === slot?.id) return
+      beginConsentContextMutation(
+        snapshot,
+        () => options.onConnectionSlotChange!(thread.id, nextSlot?.id),
+        options.t("a11y.changeThreadConnectionUpdated"),
+        (candidate) =>
+          matchesSelectedThreadContext(candidate, thread.id, thread.workspaceSource, nextSlot?.id),
+      )
+    })
+    reviewBody.append(sourceField)
 
     const details = document.createElement("dl")
     details.className = "apc-consent-details"
@@ -1567,10 +1835,41 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       options.t(thread.workspaceSource === "native-blocks" ? "workspace.nativeBlocks" : "workspace.mainContext"),
     )
     appendDefinition(details, options.t("inspector.fieldSource"), sourceLabel)
-    appendDefinition(details, options.t("inspector.fieldTarget"), destination?.label ?? options.t("validation.required"))
-    appendDefinition(details, options.t("inspector.fieldProvider"), destination?.provider ?? options.t("validation.required"))
-    appendDefinition(details, options.t("inspector.fieldModel"), destination?.model ?? options.t("validation.required"))
-    review.append(details)
+    reviewBody.append(details)
+
+    const destinationCard = document.createElement("section")
+    destinationCard.className = "apc-consent-destination"
+    destinationCard.dataset.apcConsentDestination = "true"
+    const destinationHeading = document.createElement("h4")
+    destinationHeading.append(text(options.t("consent.review.destination")))
+    const destinationAvailability = document.createElement("p")
+    const destinationAvailable =
+      resolutionFresh &&
+      !resolutionPending &&
+      !resolutionFailed &&
+      !contextMutationPending &&
+      bindingStatus === "bound" &&
+      destination !== undefined
+    destinationCard.dataset.apcConsentDestinationState = destinationAvailable ? "available" : "unavailable"
+    destinationAvailability.dataset.apcConsentDestinationAvailability = destinationAvailable ? "available" : "unavailable"
+    destinationAvailability.append(
+      text(destinationAvailable ? options.t("consent.review.available") : options.t("consent.review.unavailable")),
+    )
+    const destinationDetails = document.createElement("dl")
+    appendDefinition(destinationDetails, options.t("inspector.fieldTarget"), destination?.label ?? options.t("validation.required"))
+    appendDefinition(destinationDetails, options.t("inspector.fieldProvider"), destination?.provider ?? options.t("validation.required"))
+    appendDefinition(destinationDetails, options.t("inspector.fieldModel"), destination?.model ?? options.t("validation.required"))
+    const changeDestination = button(options.t("consent.review.change"), "apcConsentChangeDestination")
+    changeDestination.dataset.apcConsentChangeDestination = "true"
+    changeDestination.disabled = locked || consentMutationLocked
+    destinationCard.append(destinationHeading, destinationAvailability, destinationDetails, changeDestination)
+    listen(changeDestination, "click", () => {
+      if (destroyed || changeDestination.disabled) return
+      publishLocalReviewPhase(false)
+      acknowledged = false
+      if (currentSnapshot !== null) renderInternal(currentSnapshot, "consent-destination")
+    })
+    reviewBody.append(destinationCard)
 
     if (disclosure) {
       const disclosureHeading = document.createElement("h4")
@@ -1584,13 +1883,31 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
         ),
       })))
       const categories = document.createElement("ul")
+      categories.dataset.apcConsentDisclosureCategories = "true"
       for (const category of disclosure.categories) {
         const item = document.createElement("li")
+        item.dataset.apcConsentDisclosureCategory = category
         item.append(text(options.t(DISCLOSURE_KEYS[category])))
         categories.append(item)
       }
-      review.append(disclosureHeading, summary, categories)
+      reviewBody.append(disclosureHeading, summary, categories)
     }
+    const purpose = document.createElement("p")
+    purpose.dataset.apcConsentPurpose = "true"
+    purpose.append(text(options.t("consent.review.auxiliaryPurpose")))
+    const scope = document.createElement("p")
+    scope.dataset.apcConsentScope = "true"
+    scope.append(text(options.t("consent.review.scope", {
+      thread: thread.name,
+      workspace: options.t(
+        thread.workspaceSource === "native-blocks" ? "workspace.nativeBlocks" : "workspace.mainContext",
+      ),
+      source: sourceLabel,
+    })))
+    const localApproval = document.createElement("p")
+    localApproval.dataset.apcConsentLocalApproval = "true"
+    localApproval.append(text(options.t("consent.review.localApproval")))
+    reviewBody.append(purpose, scope, localApproval)
 
     const resolutionMessage = document.createElement("p")
     resolutionMessage.dataset.apcConsentResolution =
@@ -1613,7 +1930,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     } else {
       resolutionMessage.append(text(statusLabel(options.t, status)))
     }
-    review.append(resolutionMessage)
+    reviewBody.append(resolutionMessage)
 
     const acknowledge = document.createElement("input")
     acknowledge.type = "checkbox"
@@ -1631,8 +1948,13 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     acknowledge.dataset.apcConsentAcknowledge = "true"
     const acknowledgeLabel = document.createElement("label")
     acknowledgeLabel.className = "apc-checkbox-field"
-    acknowledgeLabel.append(acknowledge, text(options.t("consent.acknowledgeDisclosure")))
-    review.append(acknowledgeLabel)
+    acknowledgeLabel.append(
+      acknowledge,
+      text(options.t("consent.review.acknowledge", { thread: thread.name })),
+      text(" · "),
+      text(options.t("consent.acknowledgeDisclosure")),
+    )
+    reviewBody.append(acknowledgeLabel)
 
     const approve = button(options.t("action.approveConsent"), "apcApproveConsent")
     const ready =
@@ -1646,7 +1968,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       disclosure !== undefined &&
       options.onApproveConsent !== undefined
     approve.disabled = locked || !ready || !acknowledged || status === "approved" || approvalIsPending
-    review.append(approve)
+    reviewFooter.append(approve)
     listen(acknowledge, "change", () => {
       if (acknowledge.disabled || currentConsentContextKey !== consentContextKey) return
       acknowledged = acknowledge.checked
@@ -1696,7 +2018,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     if (status === "approved") {
       const revoke = button(options.t("action.revokeConsent"), "apcRevokeConsent")
       revoke.disabled = locked || options.onRevokeConsent === undefined || revokePending !== null
-      review.append(revoke)
+      reviewFooter.append(revoke)
       listen(revoke, "click", () => {
         if (destroyed || revoke.disabled || !options.onRevokeConsent) return
         const token = ++revokeGeneration
@@ -1765,10 +2087,26 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
     const consequence = document.createElement("p")
     consequence.dataset.apcConsentDismissalConsequence = dismissalKind
     consequence.append(text(dismissalConsequence))
-    review.append(consequence)
+    reviewBody.append(consequence)
+
+    const backToConfiguration = button(options.t("consent.review.back"), "apcConsentBack")
+    backToConfiguration.dataset.apcConsentBack = "true"
+    backToConfiguration.disabled =
+      locked ||
+      resolutionPending ||
+      contextMutationPending ||
+      approvalPending !== null ||
+      revokePending !== null
+    reviewFooter.append(backToConfiguration)
+    listen(backToConfiguration, "click", () => {
+      if (destroyed || backToConfiguration.disabled) return
+      publishLocalReviewPhase(false)
+      acknowledged = false
+      if (currentSnapshot !== null) renderInternal(currentSnapshot, "consent-source")
+    })
 
     const close = button(options.t("action.cancel"), "apcCloseConsentReview")
-    review.append(close)
+    reviewFooter.append(close)
     listen(close, "click", () => {
       if (destroyed) return
       publishLocalReviewPhase(false)
@@ -1778,7 +2116,44 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
         announce(dismissalConsequence)
       }
     })
+    review.append(reviewBody, reviewFooter)
+
+    if (parent.parentElement === null) appendBeforeWorkspace(parent)
     parent.append(review)
+    const backgroundState: Array<{
+      node: HTMLElement
+      ariaHidden: string | null
+      inert: string | null
+    }> = []
+    const containsReview = (node: HTMLElement): boolean =>
+      node === review ||
+      Array.from(node.children).some((child) => containsReview(child as HTMLElement))
+    const inertBackground = (node: HTMLElement): void => {
+      if (node === review) return
+      if (containsReview(node)) {
+        for (const child of Array.from(node.children)) inertBackground(child as HTMLElement)
+        return
+      }
+      backgroundState.push({
+        node,
+        ariaHidden: node.getAttribute("aria-hidden"),
+        inert: node.getAttribute("inert"),
+      })
+      node.setAttribute("aria-hidden", "true")
+      node.setAttribute("inert", "")
+    }
+    const supportsAttributeRemoval = typeof element.removeAttribute === "function"
+    if (supportsAttributeRemoval) {
+      for (const child of Array.from(element.children)) inertBackground(child as HTMLElement)
+      cleanupListeners.push(() => {
+        for (const { node, ariaHidden, inert } of backgroundState) {
+          if (ariaHidden === null) node.removeAttribute("aria-hidden")
+          else node.setAttribute("aria-hidden", ariaHidden)
+          if (inert === null) node.removeAttribute("inert")
+          else node.setAttribute("inert", inert)
+        }
+      })
+    }
     const trap = createFocusTrap(review, {
       document,
       restoreFocus: false,
@@ -1834,7 +2209,7 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
 
   function renderInternal(
     snapshot: ThreadEditorSnapshot,
-    focusTarget?: "consent-heading" | "consent-trigger" | "consent-approve" | "thread-heading",
+    focusTarget?: "consent-heading" | "consent-trigger" | "consent-approve" | "consent-source" | "consent-destination" | "thread-heading",
     inheritedFocusBookmark?: ThreadEditorFocusBookmark | null,
   ): void {
     if (destroyed) return
@@ -2224,6 +2599,13 @@ export function createThreadEditor(options: ThreadEditorOptions): ThreadEditorCo
       if (!reviewTrigger || reviewTrigger.disabled || !focusElement(reviewTrigger)) {
         focusElement(navigationFallback)
       }
+    } else if (focusTarget === "consent-source") {
+      const source = element.querySelector<HTMLElement>("[data-apc-connection-slot]")
+      if (!source || !focusElement(source)) focusElement(navigationFallback)
+    } else if (focusTarget === "consent-destination") {
+      const destination = element.querySelector<HTMLElement>("[data-apc-host-connection]")
+        ?? element.querySelector<HTMLElement>("[data-apc-connection-slot]")
+      if (!destination || !focusElement(destination)) focusElement(navigationFallback)
     } else if (focusTarget === "consent-approve") {
       const approve = element.querySelector<HTMLButtonElement>("[data-apc-approve-consent]")
       if (!approve || approve.disabled || !focusElement(approve)) {

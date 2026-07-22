@@ -1,6 +1,10 @@
 import type { ApcCatalogKey, ApcTranslate } from "../i18n/catalogs"
 import { truncateUtf8, utf8Bytes } from "../config/limits"
-import type { WorkspaceSource } from "../protocol/messages"
+import type {
+  ActivityFallbackCauseCategory,
+  ActivityFinalDelivery,
+  WorkspaceSource,
+} from "../protocol/messages"
 import type { OutcomeClass } from "../runtime/outcome"
 import { createLiveRegion, focusElement, type LiveRegion } from "./accessibility"
 import { listen, setAttributes, setText, type Cleanup } from "./dom"
@@ -176,13 +180,17 @@ export interface InspectorFinalRouteSnapshot {
   readonly target: "main" | "thread"
   readonly targetLabel?: string
   readonly delivered?: boolean
+  readonly delivery?: ActivityFinalDelivery
   readonly retainedCompletedRuns?: number
   readonly dispatch?: InspectorDispatchProvenance
 }
 
 export interface InspectorFallbackSnapshot {
   readonly category?: InspectorErrorCategory
-  readonly mainResponded: boolean
+  readonly causeCategory?: ActivityFallbackCauseCategory
+  readonly causeCode?: string
+  readonly finalDelivery?: ActivityFinalDelivery
+  readonly mainResponded?: boolean
 }
 
 export interface InspectorOutcomeInput {
@@ -218,6 +226,7 @@ export interface ExecutionInspectorSnapshot {
   readonly finalRoute?: InspectorFinalRouteSnapshot
   readonly fallback?: InspectorFallbackSnapshot
   readonly canUseMainFallback?: boolean
+  readonly canViewResponse?: boolean
   readonly error?: InspectorSafeError
   readonly errors?: readonly InspectorSafeError[]
 }
@@ -234,6 +243,8 @@ export interface ExecutionInspectorOptions {
   readonly onStop?: () => void | Promise<void>
   /** Explicitly changes configuration; it does not retry an execution. */
   readonly onUseMainFallback?: () => void | Promise<void>
+  /** Navigates from a delivered Main fallback back to the host chat. */
+  readonly onViewResponse?: () => void | Promise<void>
   /** Dismisses the terminal inspector view without changing execution state. */
   readonly onBackToConfiguration?: () => void
   readonly onLoadTraces?: () => void | Promise<void>
@@ -272,6 +283,16 @@ const ENDPOINT_VALUE = /\b(?:https?|wss?|ftp):\/\/[^\s<>"'`]+/giu
 const RAW_PAYLOAD = /^\s*(?:\{[\s\S]*\}|\[[\s\S]*\])\s*$/u
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/iu
 const OPAQUE_IDENTIFIER = /^(?:[0-9a-f]{24,}|[A-Za-z0-9_-]{32,})$/u
+const FALLBACK_CAUSE_CATEGORIES: readonly ActivityFallbackCauseCategory[] = [
+  "host-gate",
+  "retrieval-dispatch-consent",
+  "capacity-config-graph-prefill",
+  "assembly-setup-storage-worker-transport-receipt",
+  "timeout-deadline",
+  "required-typed-run",
+  "guidance-workspace-fallback-validation",
+]
+const SAFE_FALLBACK_CAUSE_CODE = /^[A-Z][A-Z0-9_:-]{0,63}$/
 let nextInspectorInstanceId = 0
 
 const SAFE_ERROR_MESSAGE_KEYS: Readonly<Partial<Record<ApcCatalogKey, true>>> = Object.freeze({
@@ -387,6 +408,24 @@ function optionalLabel(value: unknown, t: ApcTranslate): string | undefined {
   if (!text || text === "[redacted]" || UUID.test(text) || OPAQUE_IDENTIFIER.test(text)) return undefined
   return text || t("diagnostic.unknown")
 }
+function fallbackCauseCategory(value: unknown): ActivityFallbackCauseCategory | undefined {
+  return typeof value === "string" && FALLBACK_CAUSE_CATEGORIES.includes(value as ActivityFallbackCauseCategory)
+    ? value as ActivityFallbackCauseCategory
+    : undefined
+}
+
+function fallbackCauseCode(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    utf8Bytes(value) <= 128 &&
+    SAFE_FALLBACK_CAUSE_CODE.test(value)
+    ? value
+    : undefined
+}
+function boundedFinalDelivery(value: unknown): ActivityFinalDelivery | undefined {
+  return value === "pending" || value === "delivered" || value === "not-delivered"
+    ? value
+    : undefined
+}
 
 function finiteNonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
@@ -429,17 +468,15 @@ function appendField(documentRef: Document, parent: HTMLElement, label: string, 
   )
   parent.append(row)
 }
-
 function badge(documentRef: Document, label: string, kind: string): HTMLElement {
   const node = createElement(documentRef, "span", "apc-inspector-badge", label)
   node.dataset.badgeKind = kind
   return node
 }
-
 function statusShape(kind: string): string {
   if (kind === "completed" || kind === "success" || kind === "delivered") return "✓"
   if (kind === "running") return "●"
-  if (kind === "failed" || kind === "timed-out" || kind === "unavailable") return "×"
+  if (kind === "failed" || kind === "timed-out" || kind === "unavailable" || kind === "not-delivered") return "×"
   if (kind === "graph-fallback") return "◆"
   if (kind === "cancelled" || kind === "skipped") return "—"
   return "○"
@@ -678,6 +715,7 @@ class InspectorController implements ExecutionInspectorController {
   #localError: InspectorSafeError | undefined
   #stopRequested = false
   #fallbackPending = false
+  #viewResponsePending = false
   #tracePending = new Set<string>()
   #traceKeyByButton = new WeakMap<HTMLButtonElement, string>()
   #destroyed = false
@@ -734,6 +772,7 @@ class InspectorController implements ExecutionInspectorController {
       this.#generation += 1
       this.#stopRequested = false
       this.#fallbackPending = false
+      this.#viewResponsePending = false
       this.#tracePending.clear()
       this.#localError = undefined
       this.#wasTerminal = false
@@ -955,7 +994,7 @@ class InspectorController implements ExecutionInspectorController {
 
     const happened = createQuestionSection(this.#document, "happened", this.#options.t("inspector.outcome"))
     if (terminal) {
-      appendSubsection(this.#document, happened, this.#renderOutcome(outcome))
+      appendSubsection(this.#document, happened, this.#renderOutcome(outcome, snapshot.fallback))
     } else {
       appendStatusField(
         this.#document,
@@ -1439,12 +1478,15 @@ class InspectorController implements ExecutionInspectorController {
     return item
   }
 
-  #renderOutcome(outcome: InspectorOutcomeSnapshot): HTMLElement {
+  #renderOutcome(
+    outcome: InspectorOutcomeSnapshot,
+    fallback: InspectorFallbackSnapshot | undefined,
+  ): HTMLElement {
     const node = createSection(this.#document, "outcome", this.#options.t("inspector.outcome"))
     node.tabIndex = -1
     node.dataset.inspectorOutcome = "true"
     node.dataset.outcomeClass = outcome.class
-    node.dataset.outcomeCategory = outcome.category
+    node.dataset.outcomeCategory = errorCategory(outcome)
     const kind = outcome.class === "success"
       ? "completed"
       : outcome.class === "graph-fallback"
@@ -1468,6 +1510,26 @@ class InspectorController implements ExecutionInspectorController {
         errorMessage({ category: outcome.category }, this.#options.t),
         "fallback-cause",
       )
+      const causeCategory = fallbackCauseCategory(fallback?.causeCategory)
+      if (causeCategory !== undefined) {
+        appendField(
+          this.#document,
+          node,
+          this.#options.t("inspector.fieldReason"),
+          causeCategory,
+          "fallback-cause-category",
+        )
+      }
+      const causeCode = fallbackCauseCode(fallback?.causeCode)
+      if (causeCode !== undefined) {
+        appendField(
+          this.#document,
+          node,
+          this.#options.t("inspector.fieldReason"),
+          causeCode,
+          "fallback-cause-code",
+        )
+      }
     }
     return node
   }
@@ -1494,50 +1556,88 @@ class InspectorController implements ExecutionInspectorController {
       : optionalLabel(route?.targetLabel, this.#options.t) ??
         (route?.target === "main" ? this.#options.t("agentGraph.finalMain") : this.#options.t("agentGraph.finalThread"))
     appendField(this.#document, node, this.#options.t("inspector.finalRoute"), routeLabel, "final-route")
-    const delivered = isFallback
-      ? snapshot.fallback?.mainResponded ?? route?.delivered
-      : route?.delivered
-    const deliveryKind = delivered === true
+
+    const explicitDelivery = isFallback
+      ? boundedFinalDelivery(snapshot.fallback?.finalDelivery) ?? boundedFinalDelivery(route?.delivery)
+      : boundedFinalDelivery(route?.delivery)
+    const explicitMainResponded = typeof snapshot.fallback?.mainResponded === "boolean"
+      ? snapshot.fallback.mainResponded
+      : undefined
+    const legacyDelivered = explicitDelivery !== undefined
+      ? explicitDelivery === "delivered"
+        ? true
+        : explicitDelivery === "not-delivered"
+          ? false
+          : undefined
+      : isFallback
+        ? explicitMainResponded ?? (route?.delivered === true || route?.delivered === false ? route.delivered : undefined)
+        : route?.delivered === true || route?.delivered === false
+          ? route.delivered
+          : undefined
+    const deliveryState: ActivityFinalDelivery = explicitDelivery ??
+      (legacyDelivered === true ? "delivered" : legacyDelivered === false ? "not-delivered" : "pending")
+    const legacyDeliveryKind = deliveryState === "delivered"
       ? "completed"
-      : delivered === false
+      : deliveryState === "not-delivered"
         ? "failed"
         : terminal
           ? "pending"
           : "running"
-    const deliveryLabel = delivered === true
+    const unknownTerminalDelivery = terminal && explicitDelivery === undefined && legacyDelivered === undefined
+    const deliveryLabel = deliveryState === "delivered"
       ? this.#options.t("terminal.ready")
-      : delivered === false
+      : deliveryState === "not-delivered"
         ? this.#options.t("terminal.unavailable")
-        : terminal
+        : unknownTerminalDelivery
           ? this.#options.t("diagnostic.unknown")
           : this.#options.t("terminal.finalizing")
-    appendStatusField(
+    const deliveryStatus = appendStatusField(
       this.#document,
       node,
       this.#options.t("inspector.fieldResult"),
       deliveryLabel,
       "final-delivery",
-      deliveryKind,
+      legacyDeliveryKind,
     )
+    deliveryStatus.dataset.deliveryState = deliveryState
     if (isFallback) {
-      appendStatusField(
+      const mainResponseState: ActivityFinalDelivery | undefined = explicitMainResponded !== undefined
+        ? explicitMainResponded ? "delivered" : "not-delivered"
+        : explicitDelivery === "pending"
+          ? "pending"
+          : explicitDelivery === undefined
+            ? legacyDelivered === true ? "delivered" : legacyDelivered === false ? "not-delivered" : undefined
+            : undefined
+      const mainResponseKind = mainResponseState === "delivered"
+        ? "completed"
+        : mainResponseState === "not-delivered"
+          ? "failed"
+          : terminal
+            ? "pending"
+            : "running"
+      const mainResponseLabel = mainResponseState === "delivered"
+        ? this.#options.t("terminal.ready")
+        : mainResponseState === "not-delivered"
+          ? this.#options.t("terminal.unavailable")
+          : mainResponseState === "pending"
+            ? this.#options.t("terminal.finalizing")
+            : this.#options.t("diagnostic.unknown")
+      const mainResponseStatus = appendStatusField(
         this.#document,
         node,
         this.#options.t("fallback.main"),
-        snapshot.fallback?.mainResponded === true
-          ? this.#options.t("terminal.ready")
-          : snapshot.fallback?.mainResponded === false
-            ? this.#options.t("terminal.unavailable")
-            : this.#options.t("diagnostic.unknown"),
+        mainResponseLabel,
         "main-fallback-result",
-        snapshot.fallback?.mainResponded === true ? "completed" : snapshot.fallback?.mainResponded === false ? "failed" : "pending",
+        mainResponseKind,
       )
+      if (mainResponseState !== undefined) mainResponseStatus.dataset.deliveryState = mainResponseState
     }
     const retained = finiteNonNegative(route?.retainedCompletedRuns)
     if (retained !== undefined) {
       appendField(this.#document, node, this.#options.t("inspector.statusCompleted"), String(retained), "retained-runs")
     }
     if (snapshot.canUseMainFallback === true && this.#options.onUseMainFallback) node.append(this.#mainFallbackButton())
+    if (snapshot.canViewResponse === true && this.#options.onViewResponse) node.append(this.#viewResponseButton())
     return node
   }
 
@@ -1577,6 +1677,16 @@ class InspectorController implements ExecutionInspectorController {
     button.setAttribute("aria-label", this.#options.t("fallback.main"))
     return button
   }
+  #viewResponseButton(): HTMLButtonElement {
+    const label = this.#options.t("graph.finalResponse")
+    const button = createElement(this.#document, "button", "apc-inspector-view-response", label)
+    button.type = "button"
+    button.dataset.inspectorAction = "view-response"
+    button.disabled = this.#viewResponsePending
+    button.setAttribute("aria-label", label)
+    if (this.#viewResponsePending) button.setAttribute("aria-busy", "true")
+    return button
+  }
 
   #backToConfigurationButton(): HTMLButtonElement {
     const label = this.#options.t("action.backToConfiguration")
@@ -1606,6 +1716,7 @@ class InspectorController implements ExecutionInspectorController {
     const action = button.dataset.inspectorAction
     if (action === "stop") this.#requestStop()
     else if (action === "use-main-fallback") this.#requestMainFallback()
+    else if (action === "view-response") this.#requestViewResponse()
     else if (action === "back-to-configuration") this.#requestBackToConfiguration()
     else if (action === "load-traces") this.#requestLoadTraces()
     else if (action === "load-trace") {
@@ -1645,6 +1756,25 @@ class InspectorController implements ExecutionInspectorController {
       return
     }
     void Promise.resolve(result).catch(() => this.#settleFallbackFailure(generation))
+  }
+  #requestViewResponse(): void {
+    const snapshot = this.#snapshot
+    if (!snapshot || this.#viewResponsePending || snapshot.canViewResponse !== true || !this.#options.onViewResponse) return
+    const generation = this.#generation
+    this.#viewResponsePending = true
+    this.#localError = undefined
+    this.render(snapshot)
+    let result: void | Promise<void>
+    try {
+      result = this.#options.onViewResponse()
+    } catch {
+      this.#settleViewResponseFailure(generation)
+      return
+    }
+    void Promise.resolve(result).then(
+      () => this.#settleViewResponseSuccess(generation),
+      () => this.#settleViewResponseFailure(generation),
+    )
   }
 
   #requestBackToConfiguration(): void {
@@ -1724,6 +1854,20 @@ class InspectorController implements ExecutionInspectorController {
     this.render(this.#snapshot)
   }
 
+  #settleViewResponseSuccess(generation: number): void {
+    if (this.#destroyed || generation !== this.#generation || !this.#snapshot) return
+    this.#viewResponsePending = false
+    this.#announce(this.#options.t("terminal.ready"))
+    this.render(this.#snapshot)
+  }
+
+  #settleViewResponseFailure(generation: number): void {
+    if (this.#destroyed || generation !== this.#generation || !this.#snapshot) return
+    this.#viewResponsePending = false
+    this.#localError = { category: "connection", messageKey: "error.connection" }
+    this.#announce(this.#options.t("terminal.unavailable"))
+    this.render(this.#snapshot)
+  }
   #statusSignature(snapshot: ExecutionInspectorSnapshot): string {
     const progress = snapshot.progress
     const run = inspectedRun(snapshot)

@@ -25,6 +25,7 @@ export const MAX_ACTIVITY_PREVIEW_BYTES = TRACE_PREVIEW_BYTES
 export const MAX_SAFE_LABEL_BYTES = 320 as const
 export const MAX_ACTIVITY_STAGE_COUNT = MAX_STAGES_PER_PIPELINE
 export const MAX_ACTIVITY_RUN_COUNT = MAX_RUNS_PER_PIPELINE
+export const MAX_ACTIVITY_TOPOLOGY_COUNT = 64 as const
 export const MAX_ACTIVITY_PARALLEL_WIDTH = MAX_PARALLEL_WIDTH
 export const MAX_ACTIVITY_BUDGET_MS = GRAPH_DEADLINE_MS
 /** Per-component and cumulative activity usage bound; larger values are omitted. */
@@ -36,6 +37,16 @@ export type BackendActivityUsage = Readonly<{
   output?: number
   total?: number
 }>
+export type ActivityFallbackCauseCategory =
+  | "host-gate"
+  | "retrieval-dispatch-consent"
+  | "capacity-config-graph-prefill"
+  | "assembly-setup-storage-worker-transport-receipt"
+  | "timeout-deadline"
+  | "required-typed-run"
+  | "guidance-workspace-fallback-validation"
+export type GraphFallbackCauseCategory = ActivityFallbackCauseCategory
+export type ActivityFinalDelivery = "pending" | "delivered" | "not-delivered"
 
 const ACTIVITY_RUN_STATUSES = ["pending", "running", "completed", "failed", "cancelled", "timed-out", "skipped"] as const
 
@@ -114,8 +125,8 @@ export type ConsentDisclosureCategory =
   | "model"
   | "input-bindings"
   | "prior-stage-outputs"
+  | "prompt-variable-values"
   | "main-context"
-
 export type SafeDestination = Readonly<{
   label: string
   provider: string
@@ -238,6 +249,17 @@ export type FrontendCancelExecutionIntent = Readonly<{
     reason?: "user" | "stop" | "replacement"
   }>
 }>
+export type FrontendViewResponseIntent = Readonly<{
+  version: ProtocolVersion
+  type: "view_response"
+  correlationId: string
+  payload: Readonly<{
+    presetId: string
+    executionId: string
+  }>
+}>
+
+ 
 
 export type FrontendIntent =
   | FrontendListConnectionsIntent
@@ -250,6 +272,7 @@ export type FrontendIntent =
   | FrontendListTracesIntent
   | FrontendGetTraceIntent
   | FrontendCancelExecutionIntent
+  | FrontendViewResponseIntent
 
 export type BackendErrorResponse = Readonly<{
   version: ProtocolVersion
@@ -315,6 +338,7 @@ export type BackendHydrationResponse = Readonly<{
     bindings: readonly SafeBindingView[]
     consents: readonly SafeConsentView[]
     execution?: BackendActivityPayload
+    settledDelivery?: BackendSettlementProjection
   }>
 }>
 export type TraceEvent = Readonly<{
@@ -381,6 +405,17 @@ export type BackendCancellationResponse = Readonly<{
     cancellationSource: "user" | "stop" | "replacement"
   }>
 }>
+export type BackendViewResponseResponse = Readonly<{
+  version: ProtocolVersion
+  type: "view_response"
+  correlationId: string
+  sequence: number
+  payload: Readonly<{
+    presetId: string
+    executionId: string
+  }>
+}>
+
 
 export type BackendActivityInput = Readonly<{
   correlationId: string
@@ -394,6 +429,7 @@ export type BackendActivityInput = Readonly<{
   provider?: string
   model?: string
   runStatus?: ActivityRunStatus
+  runErrorCategory?: ActivityErrorCategory
   usage?: BackendActivityUsage
   stageIndex?: number
   stageCount?: number
@@ -403,6 +439,10 @@ export type BackendActivityInput = Readonly<{
   totalRuns?: number
   remainingBudgetMs?: number
   outcome?: ActivityOutcome
+  fallbackCauseCategory?: ActivityFallbackCauseCategory
+  fallbackCauseCode?: string
+  finalDelivery?: ActivityFinalDelivery
+  mainResponded?: boolean
   errorCategory?: ActivityErrorCategory
   errorMessageKey?: string
   cancellationSource?: ActivityCancellationSource
@@ -410,6 +450,42 @@ export type BackendActivityInput = Readonly<{
 
 export type BackendActivityPayload = Readonly<Omit<BackendActivityInput, "correlationId" | "sequence"> & {
   terminal: boolean
+}>
+
+export type BackendSettlementTopologyActivity = Readonly<{
+  executionId: string
+  presetId: string
+  kind: string
+  phase: ActivityPhase
+  terminal: boolean
+  traceId?: string
+  provider?: string
+  model?: string
+  runStatus?: ActivityRunStatus
+  stageIndex?: number
+  stageCount?: number
+  runIndex?: number
+  runCount?: number
+  completedRuns?: number
+  totalRuns?: number
+  remainingBudgetMs?: number
+  outcome?: ActivityOutcome
+  fallbackCauseCategory?: ActivityFallbackCauseCategory
+  fallbackCauseCode?: string
+}>
+
+export type BackendSettlementProjection = Readonly<{
+  executionId: string
+  presetId: string
+  traceId?: string
+  completedRuns?: number
+  totalRuns?: number
+  outcome: "graph-fallback"
+  fallbackCauseCategory: ActivityFallbackCauseCategory
+  fallbackCauseCode: string
+  finalDelivery: ActivityFinalDelivery
+  mainResponded?: boolean
+  topology: readonly BackendSettlementTopologyActivity[]
 }>
 
 export type BackendActivityResponse = Readonly<{
@@ -428,6 +504,7 @@ export type BackendResponse =
   | BackendHydrationResponse
   | BackendCancellationResponse
   | BackendTraceResponse
+  | BackendViewResponseResponse
   | BackendActivityResponse
 
 export type BackendMessage = BackendResponse
@@ -502,6 +579,26 @@ export function createBackendActivityResponse(input: BackendActivityInput): Back
     "optional-local",
     "success",
   ] as const)
+  const fallbackCauseCategory = activityEnum(input.fallbackCauseCategory, "fallbackCauseCategory", [
+    "host-gate",
+    "retrieval-dispatch-consent",
+    "capacity-config-graph-prefill",
+    "assembly-setup-storage-worker-transport-receipt",
+    "timeout-deadline",
+    "required-typed-run",
+    "guidance-workspace-fallback-validation",
+  ] as const)
+  const fallbackCauseCode = input.fallbackCauseCode === undefined
+    ? undefined
+    : activityLabel(input.fallbackCauseCode, "fallbackCauseCode", 128)
+  if (fallbackCauseCode !== undefined && !SAFE_CODE_PATTERN.test(fallbackCauseCode)) {
+    throw new RangeError("fallback cause code is invalid")
+  }
+  const finalDelivery = activityEnum(input.finalDelivery, "finalDelivery", ["pending", "delivered", "not-delivered"] as const)
+  if (input.mainResponded !== undefined && typeof input.mainResponded !== "boolean") {
+    throw new RangeError("mainResponded must be a boolean")
+  }
+  const mainResponded = input.mainResponded
   const errorCategory = activityEnum(input.errorCategory, "errorCategory", [
     "integrity",
     "dispatch",
@@ -558,6 +655,55 @@ export function createBackendActivityResponse(input: BackendActivityInput): Back
   const provider = input.provider === undefined ? undefined : activityLabel(input.provider, "provider")
   const model = input.model === undefined ? undefined : activityLabel(input.model, "model")
   const runStatus = activityEnum(input.runStatus, "runStatus", ACTIVITY_RUN_STATUSES)
+  const runErrorCategory = activityEnum(input.runErrorCategory, "runErrorCategory", [
+    "integrity",
+    "dispatch",
+    "consent",
+    "capacity",
+    "config",
+    "assembly",
+    "provider",
+    "tool",
+    "timeout",
+    "unknown",
+  ] as const)
+  if (
+    runErrorCategory !== undefined &&
+    (kind !== "run-settled" ||
+      phase !== "progress" ||
+      input.terminal ||
+      (runStatus !== "failed" && runStatus !== "timed-out"))
+  ) {
+    throw new RangeError("run error category is only valid on failed run settlements")
+  }
+  if ((fallbackCauseCategory === undefined) !== (fallbackCauseCode === undefined)) {
+    throw new RangeError("fallback cause category and code must be supplied together")
+  }
+  if (
+    (fallbackCauseCategory !== undefined || fallbackCauseCode !== undefined) &&
+    (!input.terminal || outcome !== "graph-fallback")
+  ) {
+    throw new RangeError("fallback cause is only valid on terminal Graph-fallback activity")
+  }
+  if (finalDelivery !== undefined) {
+    if (!input.terminal || outcome !== "graph-fallback") {
+      throw new RangeError("final delivery is only valid on terminal Graph-fallback activity")
+    }
+    if (fallbackCauseCategory === undefined || fallbackCauseCode === undefined) {
+      throw new RangeError("final delivery requires a bounded fallback cause")
+    }
+    if (finalDelivery === "pending" && mainResponded !== undefined) {
+      throw new RangeError("pending final delivery cannot report Main response state")
+    }
+    if (finalDelivery === "delivered" && mainResponded !== true) {
+      throw new RangeError("delivered final response requires Main response")
+    }
+    if (finalDelivery === "not-delivered" && mainResponded !== false) {
+      throw new RangeError("not-delivered final response requires no Main response")
+    }
+  } else if (mainResponded !== undefined) {
+    throw new RangeError("Main response state requires final delivery")
+  }
   const usage = activityUsage(input.usage)
   const stageIndex = activityCount(input.stageIndex, "stageIndex", MAX_ACTIVITY_STAGE_COUNT - 1)
   const stageCount = activityCount(input.stageCount, "stageCount", MAX_ACTIVITY_STAGE_COUNT)
@@ -583,6 +729,7 @@ export function createBackendActivityResponse(input: BackendActivityInput): Back
     terminal: input.terminal,
     ...(traceId === undefined ? {} : { traceId }),
     ...(runStatus === undefined ? {} : { runStatus }),
+    ...(runErrorCategory === undefined ? {} : { runErrorCategory }),
     ...(usage === undefined ? {} : { usage }),
     ...(provider === undefined ? {} : { provider }),
     ...(model === undefined ? {} : { model }),
@@ -594,6 +741,10 @@ export function createBackendActivityResponse(input: BackendActivityInput): Back
     ...(totalRuns === undefined ? {} : { totalRuns }),
     ...(remainingBudgetMs === undefined ? {} : { remainingBudgetMs }),
     ...(outcome === undefined ? {} : { outcome }),
+    ...(fallbackCauseCategory === undefined ? {} : { fallbackCauseCategory }),
+    ...(fallbackCauseCode === undefined ? {} : { fallbackCauseCode }),
+    ...(finalDelivery === undefined ? {} : { finalDelivery }),
+    ...(mainResponded === undefined ? {} : { mainResponded }),
     ...(errorCategory === undefined ? {} : { errorCategory }),
     ...(errorMessageKey === undefined ? {} : { errorMessageKey }),
     ...(cancellationSource === undefined ? {} : { cancellationSource }),
@@ -985,6 +1136,18 @@ export function decodeFrontendIntent(value: unknown): FrontendIntent {
         payload: Object.freeze(output),
       })
     }
+    case "view_response": {
+      exactKeys(payload, ["presetId", "executionId"], "$.payload")
+      return Object.freeze({
+        version: PROTOCOL_VERSION,
+        type: "view_response",
+        correlationId,
+        payload: Object.freeze({
+          presetId: idValue(payload.presetId, "$.payload.presetId"),
+          executionId: idValue(payload.executionId, "$.payload.executionId"),
+        }),
+      })
+    }
     default:
       return fail(`unknown frontend message type ${type}`, "$.type")
   }
@@ -1132,7 +1295,18 @@ function safeDisclosure(value: JsonValue, path: string, workspaceSource: Workspa
     const parsed = enumValue<ConsentDisclosureCategory>(
       category,
       `${path}.categories[${index}]`,
-      ["thread", "workspace", "source", "destination", "provider", "model", "input-bindings", "prior-stage-outputs", "main-context"],
+      [
+        "thread",
+        "workspace",
+        "source",
+        "destination",
+        "provider",
+        "model",
+        "input-bindings",
+        "prior-stage-outputs",
+        "prompt-variable-values",
+        "main-context",
+      ],
     )
     if (seen.has(parsed)) return fail("duplicate disclosure category", `${path}.categories[${index}]`)
     seen.add(parsed)
@@ -1140,7 +1314,7 @@ function safeDisclosure(value: JsonValue, path: string, workspaceSource: Workspa
   }
   const base: readonly ConsentDisclosureCategory[] = ["thread", "workspace", "source", "destination", "provider", "model"]
   const extras: readonly ConsentDisclosureCategory[] = workspaceSource === "native-blocks"
-    ? ["input-bindings", "prior-stage-outputs"]
+    ? ["input-bindings", "prior-stage-outputs", "prompt-variable-values"]
     : ["main-context", "input-bindings", "prior-stage-outputs"]
   const expected = [...base, ...extras]
   if (seen.size !== expected.length || expected.some(category => !seen.has(category))) {
@@ -1265,6 +1439,7 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
     "provider",
     "model",
     "runStatus",
+    "runErrorCategory",
     "usage",
     "stageIndex",
     "stageCount",
@@ -1274,6 +1449,10 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
     "totalRuns",
     "remainingBudgetMs",
     "outcome",
+    "fallbackCauseCategory",
+    "fallbackCauseCode",
+    "finalDelivery",
+    "mainResponded",
     "errorCategory",
     "errorMessageKey",
     "cancellationSource",
@@ -1293,6 +1472,7 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
     terminal: boolean
     traceId?: string
     runStatus?: ActivityRunStatus
+    runErrorCategory?: ActivityErrorCategory
     usage?: BackendActivityUsage
     provider?: string
     model?: string
@@ -1304,6 +1484,10 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
     completedRuns?: number
     remainingBudgetMs?: number
     outcome?: ActivityOutcome
+    fallbackCauseCategory?: ActivityFallbackCauseCategory
+    fallbackCauseCode?: string
+    finalDelivery?: ActivityFinalDelivery
+    mainResponded?: boolean
     errorCategory?: ActivityErrorCategory
     errorMessageKey?: string
     cancellationSource?: ActivityCancellationSource
@@ -1315,6 +1499,13 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
     terminal,
   }
   if (has(payload, "runStatus")) output.runStatus = enumValue<ActivityRunStatus>(payload.runStatus, `${path}.runStatus`, ACTIVITY_RUN_STATUSES)
+  if (has(payload, "runErrorCategory")) {
+    output.runErrorCategory = enumValue<ActivityErrorCategory>(
+      payload.runErrorCategory,
+      `${path}.runErrorCategory`,
+      ["integrity", "dispatch", "consent", "capacity", "config", "assembly", "provider", "tool", "timeout", "unknown"],
+    )
+  }
   if (has(payload, "usage")) output.usage = parseActivityUsage(payload.usage, `${path}.usage`)
   if (has(payload, "traceId")) output.traceId = idValue(payload.traceId, `${path}.traceId`)
   if (has(payload, "provider")) output.provider = stringValue(payload.provider, `${path}.provider`, { maxBytes: 320, label: true })
@@ -1331,6 +1522,35 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
       ["integrity-fatal", "parent-cancel", "selected-final-failure", "graph-fallback", "optional-local", "success"],
     )
   }
+  if (has(payload, "fallbackCauseCategory")) {
+    output.fallbackCauseCategory = enumValue<ActivityFallbackCauseCategory>(
+      payload.fallbackCauseCategory,
+      `${path}.fallbackCauseCategory`,
+      [
+        "host-gate",
+        "retrieval-dispatch-consent",
+        "capacity-config-graph-prefill",
+        "assembly-setup-storage-worker-transport-receipt",
+        "timeout-deadline",
+        "required-typed-run",
+        "guidance-workspace-fallback-validation",
+      ],
+    )
+  }
+  if (has(payload, "fallbackCauseCode")) {
+    output.fallbackCauseCode = stringValue(payload.fallbackCauseCode, `${path}.fallbackCauseCode`, {
+      maxBytes: 128,
+      pattern: SAFE_CODE_PATTERN,
+    })
+  }
+  if (has(payload, "finalDelivery")) {
+    output.finalDelivery = enumValue<ActivityFinalDelivery>(
+      payload.finalDelivery,
+      `${path}.finalDelivery`,
+      ["pending", "delivered", "not-delivered"],
+    )
+  }
+  if (has(payload, "mainResponded")) output.mainResponded = booleanValue(payload.mainResponded, `${path}.mainResponded`)
   if (terminal && output.outcome === undefined) return fail("terminal activity requires an outcome", `${path}.outcome`)
   if (!terminal && output.outcome !== undefined) return fail("non-terminal activity cannot have an outcome", `${path}.outcome`)
   if (has(payload, "errorCategory")) {
@@ -1345,6 +1565,43 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
       maxBytes: 128,
       pattern: SAFE_CODE_PATTERN,
     })
+  }
+  if (
+    output.runErrorCategory !== undefined &&
+    (output.kind !== "run-settled" ||
+      phase !== "progress" ||
+      terminal ||
+      (output.runStatus !== "failed" && output.runStatus !== "timed-out"))
+  ) {
+    return fail("run error category is only valid on failed run settlements", `${path}.runErrorCategory`)
+  }
+  if ((output.fallbackCauseCategory === undefined) !== (output.fallbackCauseCode === undefined)) {
+    return fail("fallback cause category and code must be supplied together", path)
+  }
+  if (
+    (output.fallbackCauseCategory !== undefined || output.fallbackCauseCode !== undefined) &&
+    (!terminal || output.outcome !== "graph-fallback")
+  ) {
+    return fail("fallback cause is only valid on terminal Graph-fallback activity", path)
+  }
+  if (output.finalDelivery !== undefined) {
+    if (!terminal || output.outcome !== "graph-fallback") {
+      return fail("final delivery is only valid on terminal Graph-fallback activity", `${path}.finalDelivery`)
+    }
+    if (output.fallbackCauseCategory === undefined || output.fallbackCauseCode === undefined) {
+      return fail("final delivery requires a bounded fallback cause", `${path}.finalDelivery`)
+    }
+    if (output.finalDelivery === "pending" && output.mainResponded !== undefined) {
+      return fail("pending final delivery cannot report Main response state", `${path}.mainResponded`)
+    }
+    if (output.finalDelivery === "delivered" && output.mainResponded !== true) {
+      return fail("delivered final response requires Main response", `${path}.mainResponded`)
+    }
+    if (output.finalDelivery === "not-delivered" && output.mainResponded !== false) {
+      return fail("not-delivered final response requires no Main response", `${path}.mainResponded`)
+    }
+  } else if (output.mainResponded !== undefined) {
+    return fail("Main response state requires final delivery", `${path}.mainResponded`)
   }
   if (phase === "failed" && output.errorCategory === undefined) return fail("failed activity requires an error category", `${path}.errorCategory`)
   if (phase !== "failed" && output.errorCategory !== undefined) return fail("error category is only valid for failed activity", `${path}.errorCategory`)
@@ -1383,6 +1640,151 @@ function parseActivityPayload(payload: JsonObject, path: string): BackendActivit
   }
   return Object.freeze(output)
 }
+function parseSettlementTopologyActivity(value: JsonValue, path: string): BackendSettlementTopologyActivity {
+  const payload = asRecord(value, path)
+  optionalKeys(payload, [
+    "executionId",
+    "presetId",
+    "kind",
+    "phase",
+    "terminal",
+    "traceId",
+    "provider",
+    "model",
+    "runStatus",
+    "stageIndex",
+    "stageCount",
+    "runIndex",
+    "runCount",
+    "completedRuns",
+    "totalRuns",
+    "remainingBudgetMs",
+    "outcome",
+    "fallbackCauseCategory",
+    "fallbackCauseCode",
+  ], path)
+  for (const key of ["usage", "runErrorCategory", "finalDelivery", "mainResponded", "errorCategory", "errorMessageKey", "cancellationSource"] as const) {
+    if (has(payload, key)) return fail(`settlement topology cannot retain ${key}`, `${path}.${key}`)
+  }
+  const activity = parseActivityPayload(payload, path)
+  if (activity.kind === "delivery-settled") return fail("settlement topology cannot contain delivery-settled activity", `${path}.kind`)
+  return Object.freeze({
+    executionId: activity.executionId,
+    presetId: activity.presetId,
+    kind: activity.kind,
+    phase: activity.phase,
+    terminal: activity.terminal,
+    ...(activity.traceId === undefined ? {} : { traceId: activity.traceId }),
+    ...(activity.provider === undefined ? {} : { provider: activity.provider }),
+    ...(activity.model === undefined ? {} : { model: activity.model }),
+    ...(activity.runStatus === undefined ? {} : { runStatus: activity.runStatus }),
+    ...(activity.stageIndex === undefined ? {} : { stageIndex: activity.stageIndex }),
+    ...(activity.stageCount === undefined ? {} : { stageCount: activity.stageCount }),
+    ...(activity.runIndex === undefined ? {} : { runIndex: activity.runIndex }),
+    ...(activity.runCount === undefined ? {} : { runCount: activity.runCount }),
+    ...(activity.completedRuns === undefined ? {} : { completedRuns: activity.completedRuns }),
+    ...(activity.totalRuns === undefined ? {} : { totalRuns: activity.totalRuns }),
+    ...(activity.remainingBudgetMs === undefined ? {} : { remainingBudgetMs: activity.remainingBudgetMs }),
+    ...(activity.outcome === undefined ? {} : { outcome: activity.outcome }),
+    ...(activity.fallbackCauseCategory === undefined ? {} : { fallbackCauseCategory: activity.fallbackCauseCategory }),
+    ...(activity.fallbackCauseCode === undefined ? {} : { fallbackCauseCode: activity.fallbackCauseCode }),
+  })
+}
+
+function parseSettlementProjection(
+  value: JsonValue,
+  path: string,
+  expectedPresetId: string,
+): BackendSettlementProjection {
+  const payload = asRecord(value, path)
+  optionalKeys(payload, [
+    "executionId",
+    "presetId",
+    "traceId",
+    "completedRuns",
+    "totalRuns",
+    "outcome",
+    "fallbackCauseCategory",
+    "fallbackCauseCode",
+    "finalDelivery",
+    "mainResponded",
+    "topology",
+  ], path)
+  for (const key of [
+    "executionId",
+    "presetId",
+    "outcome",
+    "fallbackCauseCategory",
+    "fallbackCauseCode",
+    "finalDelivery",
+    "mainResponded",
+    "topology",
+  ] as const) {
+    if (!has(payload, key)) return fail(`missing field ${key}`, `${path}.${key}`)
+  }
+  const presetId = idValue(payload.presetId, `${path}.presetId`)
+  if (presetId !== expectedPresetId) return fail("settled delivery preset does not match hydration preset", `${path}.presetId`)
+  const executionId = idValue(payload.executionId, `${path}.executionId`)
+  const outcome = enumValue<"graph-fallback">(payload.outcome, `${path}.outcome`, ["graph-fallback"])
+  const fallbackCauseCategory = enumValue<ActivityFallbackCauseCategory>(
+    payload.fallbackCauseCategory,
+    `${path}.fallbackCauseCategory`,
+    [
+      "host-gate",
+      "retrieval-dispatch-consent",
+      "capacity-config-graph-prefill",
+      "assembly-setup-storage-worker-transport-receipt",
+      "timeout-deadline",
+      "required-typed-run",
+      "guidance-workspace-fallback-validation",
+    ],
+  )
+  const fallbackCauseCode = stringValue(payload.fallbackCauseCode, `${path}.fallbackCauseCode`, {
+    maxBytes: 128,
+    pattern: SAFE_CODE_PATTERN,
+  })
+  const finalDelivery = enumValue<ActivityFinalDelivery>(
+    payload.finalDelivery,
+    `${path}.finalDelivery`,
+    ["pending", "delivered", "not-delivered"],
+  )
+  const mainResponded = has(payload, "mainResponded")
+    ? booleanValue(payload.mainResponded, `${path}.mainResponded`)
+    : undefined
+  if (finalDelivery !== "pending" && mainResponded !== (finalDelivery === "delivered")) {
+    return fail("settled delivery response state does not match final delivery", `${path}.mainResponded`)
+  }
+  const topologyValues = jsonArray(payload.topology, `${path}.topology`)
+  if (topologyValues.length > MAX_ACTIVITY_TOPOLOGY_COUNT) {
+    return fail("too many settlement topology activities", `${path}.topology`)
+  }
+  const topology = topologyValues.map((entry, index) => {
+    const activity = parseSettlementTopologyActivity(entry, `${path}.topology[${index}]`)
+    if (activity.executionId !== executionId || activity.presetId !== presetId) {
+      return fail("settlement topology identity does not match projection", `${path}.topology[${index}]`)
+    }
+    return activity
+  })
+  const completedRuns = optionalActivityCount(payload, "completedRuns", path)
+  const totalRuns = optionalActivityCount(payload, "totalRuns", path)
+  if (completedRuns !== undefined && totalRuns !== undefined && completedRuns > totalRuns) {
+    return fail("completedRuns must not exceed totalRuns", `${path}.completedRuns`)
+  }
+  return Object.freeze({
+    executionId,
+    presetId,
+    ...(has(payload, "traceId") ? { traceId: idValue(payload.traceId, `${path}.traceId`) } : {}),
+    ...(completedRuns === undefined ? {} : { completedRuns }),
+    ...(totalRuns === undefined ? {} : { totalRuns }),
+    outcome,
+    fallbackCauseCategory,
+    fallbackCauseCode,
+    finalDelivery,
+    ...(mainResponded === undefined ? {} : { mainResponded }),
+    topology: Object.freeze(topology),
+  })
+}
+
 
 export function decodeBackendResponse(value: unknown): BackendResponse {
   const root = decodeRoot(value)
@@ -1511,7 +1913,7 @@ export function decodeBackendResponse(value: unknown): BackendResponse {
   if (type === "hydration") {
     const parsed = parseSequenceRoot(root, type)
     const payload = parsed.payload
-    optionalKeys(payload, ["presetId", "bindings", "consents", "execution"], "$.payload")
+    optionalKeys(payload, ["presetId", "bindings", "consents", "execution", "settledDelivery"], "$.payload")
     for (const key of ["presetId", "bindings", "consents"] as const) {
       if (!has(payload, key)) return fail(`missing field ${key}`, `$.payload.${key}`)
     }
@@ -1529,6 +1931,9 @@ export function decodeBackendResponse(value: unknown): BackendResponse {
     if (execution !== undefined && execution.terminal) {
       return fail("hydrated execution must be non-terminal", "$.payload.execution.terminal")
     }
+    const settledDelivery = has(payload, "settledDelivery")
+      ? parseSettlementProjection(payload.settledDelivery, "$.payload.settledDelivery", presetId)
+      : undefined
     return Object.freeze({
       version: PROTOCOL_VERSION,
       type: "hydration",
@@ -1539,6 +1944,7 @@ export function decodeBackendResponse(value: unknown): BackendResponse {
         bindings: Object.freeze(bindings.map((binding, index) => safeBindingView(binding, `$.payload.bindings[${index}]`))),
         consents: Object.freeze(consents.map((consent, index) => safeConsentView(consent, `$.payload.consents[${index}]`))),
         ...(execution === undefined ? {} : { execution }),
+        ...(settledDelivery === undefined ? {} : { settledDelivery }),
       }),
     })
   }
@@ -1564,6 +1970,21 @@ export function decodeBackendResponse(value: unknown): BackendResponse {
           "$.payload.cancellationSource",
           ["user", "stop", "replacement"],
         ),
+      }),
+    })
+  }
+  if (type === "view_response") {
+    const parsed = parseSequenceRoot(root, type)
+    const payload = parsed.payload
+    exactKeys(payload, ["presetId", "executionId"], "$.payload")
+    return Object.freeze({
+      version: PROTOCOL_VERSION,
+      type: "view_response",
+      correlationId: parsed.correlationId,
+      sequence: parsed.sequence,
+      payload: Object.freeze({
+        presetId: idValue(payload.presetId, "$.payload.presetId"),
+        executionId: idValue(payload.executionId, "$.payload.executionId"),
       }),
     })
   }

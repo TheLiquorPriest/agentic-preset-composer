@@ -11,8 +11,13 @@ class TestClock implements CancellationClock {
   nowValue = 0
   #nextHandle = 1
   #timers = new Map<number, { readonly dueAt: number; readonly callback: () => void }>()
+  #queuedNowValues: number[] = []
 
-  now = (): number => this.nowValue
+  now = (): number => {
+    const queued = this.#queuedNowValues.shift()
+    if (queued !== undefined) this.nowValue = queued
+    return this.nowValue
+  }
 
   setTimeout = (callback: () => void, delayMs: number): unknown => {
     const handle = this.#nextHandle++
@@ -40,6 +45,12 @@ class TestClock implements CancellationClock {
       this.#timers.delete(nextHandle)
       timer?.callback()
     }
+  }
+  elapseWithoutTimers = (elapsedMs: number): void => {
+    this.nowValue += elapsedMs
+  }
+  queueNowValues = (...values: number[]): void => {
+    this.#queuedNowValues.push(...values)
   }
 
   pendingTimers = (): number => this.#timers.size
@@ -182,6 +193,128 @@ describe("execution cancellation tree", () => {
     expectEmpty(execution.resourceSnapshot())
     expect(clock.pendingTimers()).toBe(0)
   })
+
+  test("rejects overdue settlements before a delayed timer callback runs", async () => {
+    const clock = new TestClock()
+    const execution = graph(clock)
+    const fulfilledRun = execution.createRun({ timeoutMs: 1_000 })
+    const rejectedRun = execution.createRun({ timeoutMs: 1_000 })
+    let resolveLate: ((value: string) => void) | undefined
+    let rejectLate: ((error: Error) => void) | undefined
+    const fulfilled = fulfilledRun.completion(new Promise<string>((resolve) => {
+      resolveLate = resolve
+    }))
+    const rejected = rejectedRun.completion(new Promise<string>((_resolve, reject) => {
+      rejectLate = reject
+    }))
+
+    clock.elapseWithoutTimers(1_000)
+    resolveLate?.("overdue provider response")
+    rejectLate?.(new Error("overdue provider failure"))
+
+    expect(await fulfilled).toEqual({ accepted: false, reason: "child-timeout" })
+    expect(await rejected).toEqual({ accepted: false, reason: "child-timeout" })
+    expect(fulfilledRun.tryCommit(() => "fulfilled mutation")).toEqual({ accepted: false, reason: "child-timeout" })
+    expect(rejectedRun.tryCommit(() => "rejected mutation")).toEqual({ accepted: false, reason: "child-timeout" })
+    expectEmpty(fulfilledRun.resourceSnapshot())
+    expectEmpty(rejectedRun.resourceSnapshot())
+    expect(execution.isActive()).toBe(true)
+    execution.dispose()
+    expectEmpty(execution.resourceSnapshot())
+    expect(clock.pendingTimers()).toBe(0)
+  })
+  test("enforces the root deadline before a delayed timer callback runs", () => {
+    const clock = new TestClock()
+    const host = new AbortController()
+    const execution = createExecutionCancellation({
+      hostSignal: host.signal,
+      deadlineAt: 1_000,
+      clock,
+    })
+    let run: RunCancellation | undefined
+    execution.signal.addEventListener("abort", () => run?.dispose(), { once: true })
+    run = execution.createRun({ timeoutMs: 5_000 })
+    if (run === undefined) throw new Error("root deadline run was not created")
+
+    expect(execution.isActive()).toBe(true)
+    expect(run.isActive()).toBe(true)
+    clock.elapseWithoutTimers(1_000)
+
+    expect(execution.isActive()).toBe(false)
+    expect(execution.reason).toBe("deadline")
+    expect(execution.signal.aborted).toBe(true)
+    expect(execution.signal.reason).toBe("deadline")
+    expect(run.isActive()).toBe(false)
+    expect(run.reason).toBe("deadline")
+    expect(run.signal.aborted).toBe(true)
+    expect(run.tryCommit(() => "late mutation")).toEqual({ accepted: false, reason: "deadline" })
+    expectEmpty(run.resourceSnapshot())
+    expectEmpty(execution.resourceSnapshot())
+    expect(clock.pendingTimers()).toBe(0)
+
+    host.abort("late host abort")
+    expect(execution.stop("stop")).toBe(false)
+    execution.dispose()
+    expect(execution.reason).toBe("deadline")
+    const lateRun = execution.createRun({ timeoutMs: 1_000 })
+    expect(lateRun.isActive()).toBe(false)
+    expect(lateRun.reason).toBe("deadline")
+    expectEmpty(lateRun.resourceSnapshot())
+    expectEmpty(execution.resourceSnapshot())
+  })
+  test("lets the expired root deadline arbitrate every terminal entry point", () => {
+    for (const terminal of ["stop", "host-abort", "dispose"] as const) {
+      const clock = new TestClock()
+      const host = new AbortController()
+      const execution = createExecutionCancellation({
+        hostSignal: host.signal,
+        deadlineAt: 1_000,
+        clock,
+      })
+      const run = execution.createRun({ timeoutMs: 5_000 })
+      clock.elapseWithoutTimers(1_000)
+
+      if (terminal === "stop") execution.stop("stop")
+      else if (terminal === "host-abort") host.abort("late host abort")
+      else execution.dispose()
+
+      expect(execution.isActive()).toBe(false)
+      expect(execution.reason).toBe("deadline")
+      expect(execution.signal.reason).toBe("deadline")
+      expect(run.isActive()).toBe(false)
+      expect(run.reason).toBe("deadline")
+      expect(run.signal.reason).toBe("deadline")
+      expectEmpty(run.resourceSnapshot())
+      expectEmpty(execution.resourceSnapshot())
+      expect(clock.pendingTimers()).toBe(0)
+      execution.dispose()
+      expect(execution.reason).toBe("deadline")
+    }
+  })
+
+  test("classifies a child created on the root boundary under root authority", () => {
+    const clock = new TestClock()
+    const execution = createExecutionCancellation({
+      hostSignal: new AbortController().signal,
+      deadlineAt: 1_000,
+      clock,
+    })
+    clock.elapseWithoutTimers(999)
+    clock.queueNowValues(999, 999, 1_000)
+
+    const run = execution.createRun({ timeoutMs: 5_000 })
+
+    expect(execution.isActive()).toBe(false)
+    expect(execution.reason).toBe("deadline")
+    expect(run.isActive()).toBe(false)
+    expect(run.reason).toBe("deadline")
+    expect(run.signal.reason).toBe("deadline")
+    expectEmpty(run.resourceSnapshot())
+    expectEmpty(execution.resourceSnapshot())
+    expect(clock.pendingTimers()).toBe(0)
+  })
+
+
 
   test("normal terminal cleanup leaves no retained cancellation resources", async () => {
     const clock = new TestClock()
